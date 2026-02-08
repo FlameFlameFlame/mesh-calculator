@@ -1,0 +1,16 @@
+inputs:
+  boundary: test_data/boundary.geojson
+  elevation: test_data/elevation.tif
+  roads: test_data/roads.geojson
+  target_sites: test_data/sites.geojson
+outputs:
+  coverage: test_data/output/coverage.geojson
+  report: test_data/output/report.json
+  towers: test_data/output/towers.geojson
+parameters:
+  frequency_hz: 868000000
+  h3_resolution: 8
+  mast_height_m: 28
+  max_nodes_per_road: 5
+  max_visibility_m: 70000
+  tower_separation_m: 5000
