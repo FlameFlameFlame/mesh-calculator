@@ -1,0 +1,41 @@
+# Example configuration for mesh-calculator
+#
+# This file shows how to configure the mesh network optimizer
+# for connecting sites (cities) via hierarchical priorities.
+
+parameters:
+  # H3 grid resolution (8 = ~0.7 km² per cell)
+  h3_resolution: 8
+
+  # Maximum line-of-sight distance (meters)
+  max_visibility_m: 70000  # 70 km
+
+  # Minimum separation between towers (meters)
+  tower_separation_m: 5000  # 5 km
+
+  # Tower mast height (meters)
+  mast_height_m: 28
+
+  # Radio frequency (Hz)
+  frequency_hz: 868000000  # 868 MHz
+
+  # Maximum hops within a cluster
+  hop_limit: 7
+
+  # Maximum nodes per road segment
+  max_nodes_per_road: 10
+
+inputs:
+  # Required inputs
+  boundary: data/armenia_boundary.geojson
+  elevation: data/armenia_elevation.tif
+  roads: data/armenia_roads.geojson
+  target_sites: data/armenia_sites.geojson
+
+  # Optional: existing towers to incorporate
+  # existing_towers: data/existing_towers.geojson
+
+outputs:
+  towers: output/towers.geojson
+  coverage: output/coverage.geojson
+  report: output/report.json

@@ -1,0 +1,65 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [
+            -74.05,
+            40.025
+          ],
+          [
+            -73.95,
+            40.025
+          ]
+        ]
+      },
+      "properties": {
+        "name": "Road 1",
+        "type": "primary"
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [
+            -74.05,
+            39.975
+          ],
+          [
+            -73.95,
+            39.975
+          ]
+        ]
+      },
+      "properties": {
+        "name": "Road 2",
+        "type": "primary"
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [
+            -74.0,
+            40.025
+          ],
+          [
+            -74.0,
+            39.975
+          ]
+        ]
+      },
+      "properties": {
+        "name": "Road 3",
+        "type": "secondary"
+      }
+    }
+  ]
+}

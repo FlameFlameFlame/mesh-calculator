@@ -1,0 +1,127 @@
+"""
+Unit tests for data exporters.
+"""
+import json
+import os
+import tempfile
+import unittest
+
+from ..network.graph import Tower, VisibilityGraph, MeshSurface
+from ..core.grid import H3Cell
+from ..core.config import MeshConfig
+from ..data.exporters import export_visibility_edges_geojson
+
+
+def _make_surface_with_edges():
+    """Create a MeshSurface with 3 towers and 2 visibility edges."""
+    config = MeshConfig()
+    # Use fake h3 indices (they won't be resolved, we just need dict keys)
+    cells = {
+        "8828c00001fffff": H3Cell("8828c00001fffff", 40.0, 44.0, 500.0, has_road=True),
+        "8828c00003fffff": H3Cell("8828c00003fffff", 40.1, 44.1, 600.0, has_road=True),
+        "8828c00005fffff": H3Cell("8828c00005fffff", 40.2, 44.2, 550.0, has_road=True),
+    }
+    surface = MeshSurface(cells, config)
+
+    # Manually place towers (bypass place_tower to avoid h3 lookups)
+    t1 = Tower(1, "8828c00001fffff", 40.0, 44.0, "seed")
+    t2 = Tower(2, "8828c00003fffff", 40.1, 44.1, "route")
+    t3 = Tower(3, "8828c00005fffff", 40.2, 44.2, "corridor")
+    surface.towers = {1: t1, 2: t2, 3: t3}
+
+    surface.visibility_graph = VisibilityGraph()
+    surface.visibility_graph.add_tower(t1)
+    surface.visibility_graph.add_tower(t2)
+    surface.visibility_graph.add_tower(t3)
+    surface.visibility_graph.add_visibility_edge(1, 2, distance_m=12000.0, clearance_m=15.5, path_loss_db=120.3)
+    surface.visibility_graph.add_visibility_edge(2, 3, distance_m=8000.0, clearance_m=22.0, path_loss_db=115.1)
+
+    return surface
+
+
+class TestExportVisibilityEdges(unittest.TestCase):
+    """Test visibility edges GeoJSON export."""
+
+    def test_feature_count(self):
+        """Export produces one feature per edge."""
+        surface = _make_surface_with_edges()
+        with tempfile.NamedTemporaryFile(suffix=".geojson", delete=False) as f:
+            path = f.name
+        try:
+            export_visibility_edges_geojson(surface, path)
+            with open(path) as f:
+                data = json.load(f)
+            self.assertEqual(data["type"], "FeatureCollection")
+            self.assertEqual(len(data["features"]), 2)
+        finally:
+            os.unlink(path)
+
+    def test_linestring_geometry(self):
+        """Each feature is a LineString with two coordinate pairs."""
+        surface = _make_surface_with_edges()
+        with tempfile.NamedTemporaryFile(suffix=".geojson", delete=False) as f:
+            path = f.name
+        try:
+            export_visibility_edges_geojson(surface, path)
+            with open(path) as f:
+                data = json.load(f)
+            for feat in data["features"]:
+                self.assertEqual(feat["type"], "Feature")
+                self.assertEqual(feat["geometry"]["type"], "LineString")
+                self.assertEqual(len(feat["geometry"]["coordinates"]), 2)
+        finally:
+            os.unlink(path)
+
+    def test_coordinate_order_lon_lat(self):
+        """Coordinates are in GeoJSON [lon, lat] order."""
+        surface = _make_surface_with_edges()
+        with tempfile.NamedTemporaryFile(suffix=".geojson", delete=False) as f:
+            path = f.name
+        try:
+            export_visibility_edges_geojson(surface, path)
+            with open(path) as f:
+                data = json.load(f)
+            # Find edge 1->2
+            feat = data["features"][0]
+            coords = feat["geometry"]["coordinates"]
+            # Tower 1: lat=40.0, lon=44.0 → [44.0, 40.0]
+            self.assertAlmostEqual(coords[0][0], 44.0)
+            self.assertAlmostEqual(coords[0][1], 40.0)
+        finally:
+            os.unlink(path)
+
+    def test_properties(self):
+        """Edge properties include source_id, target_id, distance_m, clearance_m, path_loss_db."""
+        surface = _make_surface_with_edges()
+        with tempfile.NamedTemporaryFile(suffix=".geojson", delete=False) as f:
+            path = f.name
+        try:
+            export_visibility_edges_geojson(surface, path)
+            with open(path) as f:
+                data = json.load(f)
+            props = data["features"][0]["properties"]
+            self.assertIn("source_id", props)
+            self.assertIn("target_id", props)
+            self.assertIn("distance_m", props)
+            self.assertIn("clearance_m", props)
+            self.assertIn("path_loss_db", props)
+            self.assertAlmostEqual(props["distance_m"], 12000.0)
+            self.assertAlmostEqual(props["clearance_m"], 15.5)
+            self.assertAlmostEqual(props["path_loss_db"], 120.3)
+        finally:
+            os.unlink(path)
+
+    def test_empty_graph(self):
+        """Export works with no edges."""
+        config = MeshConfig()
+        cells = {"8828c00001fffff": H3Cell("8828c00001fffff", 40.0, 44.0, 500.0)}
+        surface = MeshSurface(cells, config)
+        with tempfile.NamedTemporaryFile(suffix=".geojson", delete=False) as f:
+            path = f.name
+        try:
+            export_visibility_edges_geojson(surface, path)
+            with open(path) as f:
+                data = json.load(f)
+            self.assertEqual(len(data["features"]), 0)
+        finally:
+            os.unlink(path)
