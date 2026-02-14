@@ -10,7 +10,7 @@ import structlog
 from ..logging_config import setup_logging
 from ..utils.perf import PerfTimer
 from ..data.loaders import load_config
-from ..data.sites import load_sites
+from ..data.sites import load_sites, snap_sites_to_roads
 from ..data.cache import LOSCache
 from ..data.exporters import (
     export_towers_geojson, export_coverage_geojson,
@@ -82,6 +82,10 @@ def main(config: str, output: str, verbose: bool, quiet: bool):
     logger.info("[4/9] Generating H3 grid")
     with PerfTimer("generate_h3_grid"):
         cells = generate_road_grid(boundary, roads_gdf, elevation_provider, cfg.parameters)
+
+    # Snap sites to nearest road cell
+    logger.info("[4.5/9] Snapping sites to road cells")
+    snap_sites_to_roads(sites, cells)
 
     # Create mesh surface
     logger.info("[5/9] Creating mesh surface")
