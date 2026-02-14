@@ -60,7 +60,8 @@ def place_nodes_along_corridor(
                 break
 
             # Check LOS
-            if has_los(current_h3, next_h3, cells, config, cache):
+            if has_los(current_h3, next_h3, cells, config, cache,
+                       elevation_provider=surface.elevation_provider):
                 furthest_visible_idx = next_idx
                 furthest_visible_h3 = next_h3
             else:
@@ -86,7 +87,8 @@ def place_nodes_along_corridor(
         logger.debug("Optimizing node count",
                      current=len(placed_nodes), limit=config.max_nodes_per_road)
         placed_nodes = optimize_node_selection(
-            placed_nodes, config.max_nodes_per_road, cells, config, cache
+            placed_nodes, config.max_nodes_per_road, cells, config, cache,
+            elevation_provider=surface.elevation_provider,
         )
         logger.debug("After optimization", count=len(placed_nodes))
 
@@ -98,7 +100,8 @@ def optimize_node_selection(
     max_nodes: int,
     cells: Dict[str, H3Cell],
     config: MeshConfig,
-    cache: LOSCache = None
+    cache: LOSCache = None,
+    elevation_provider=None,
 ) -> List[str]:
     """
     Select best subset of nodes respecting limit while maintaining connectivity.
@@ -136,7 +139,8 @@ def optimize_node_selection(
         # Count how many other candidates this node can see
         visible_count = 0
         for other in candidates:
-            if other != node and has_los(node, other, cells, config, cache):
+            if other != node and has_los(node, other, cells, config, cache,
+                                            elevation_provider=elevation_provider):
                 visible_count += 1
 
         score += visible_count

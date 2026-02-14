@@ -130,16 +130,20 @@ class MeshSurface:
     Main mesh surface containing grid, towers, and visibility graph.
     """
 
-    def __init__(self, cells: Dict[str, H3Cell], config: MeshConfig):
+    def __init__(self, cells: Dict[str, H3Cell], config: MeshConfig,
+                 elevation_provider=None):
         """
         Initialize mesh surface.
 
         Args:
             cells: Dictionary of H3 cells
             config: Mesh configuration
+            elevation_provider: Optional ElevationProvider for terrain lookups
+                outside the road grid (used by Fresnel clearance checks)
         """
         self.cells = cells
         self.config = config
+        self.elevation_provider = elevation_provider
         self.towers: Dict[int, Tower] = {}
         self.tower_by_h3: Dict[str, Tower] = {}
         self.visibility_graph = VisibilityGraph()
@@ -200,7 +204,8 @@ class MeshSurface:
             for tower2 in tower_list[i+1:]:
                 # Check if LOS exists
                 if has_los(tower1.h3_index, tower2.h3_index,
-                          self.cells, self.config, cache):
+                          self.cells, self.config, cache,
+                          elevation_provider=self.elevation_provider):
                     from ..core.geometry import h3_distance
                     distance = h3_distance(tower1.h3_index, tower2.h3_index)
 

@@ -86,7 +86,8 @@ def main(config: str, output: str, verbose: bool, quiet: bool):
     # Create mesh surface
     logger.info("[5/9] Creating mesh surface")
     with PerfTimer("create_mesh_surface"):
-        surface = MeshSurface(cells, cfg.parameters)
+        surface = MeshSurface(cells, cfg.parameters,
+                              elevation_provider=elevation_provider)
     logger.info("Mesh surface created", cells=len(surface.cells))
 
     # Initialize LOS cache
