@@ -219,6 +219,63 @@ class MeshSurface:
 
         logger.info("Visibility edges added", count=edges_added)
 
+    def compute_cell_coverage(self, cache: LOSCache = None):
+        """Compute per-cell coverage metrics from placed towers.
+
+        For each cell, checks LOS to every tower within max_visibility_m
+        and updates: visible_tower_count, distance_to_closest_tower,
+        clearance (best), and path_loss (best).
+        """
+        from ..core.geometry import h3_distance
+
+        tower_list = list(self.towers.values())
+        if not tower_list:
+            return
+
+        max_dist = self.config.max_visibility_m
+        updated = 0
+
+        for cell in self.cells.values():
+            best_distance = float('inf')
+            best_clearance = None
+            best_path_loss = None
+            visible_count = 0
+
+            for tower in tower_list:
+                if tower.h3_index == cell.h3_index:
+                    # Cell has a tower — distance 0, always visible
+                    visible_count += 1
+                    best_distance = 0.0
+                    best_clearance = float('inf')
+                    best_path_loss = 0.0
+                    continue
+
+                dist = h3_distance(cell.h3_index, tower.h3_index)
+                if dist > max_dist:
+                    continue
+
+                result = compute_los(
+                    cell.h3_index, tower.h3_index,
+                    self.cells, self.config, cache,
+                    elevation_provider=self.elevation_provider,
+                )
+                if result.is_visible:
+                    visible_count += 1
+                    if result.distance_m < best_distance:
+                        best_distance = result.distance_m
+                        best_clearance = result.clearance_m
+                        best_path_loss = result.path_loss_db
+
+            cell.visible_tower_count = visible_count
+            if best_distance < float('inf'):
+                cell.distance_to_closest_tower = best_distance
+                cell.clearance = best_clearance
+                cell.path_loss = best_path_loss
+                updated += 1
+
+        logger.info("Cell coverage computed",
+                    cells_with_coverage=updated, total_cells=len(self.cells))
+
     def get_tower_clusters(self) -> Dict[int, int]:
         """
         Get tower clustering (connected components).

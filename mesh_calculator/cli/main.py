@@ -121,6 +121,11 @@ def main(config: str, output: str, verbose: bool, quiet: bool):
                 towers=surface.visibility_graph.tower_count(),
                 edges=surface.visibility_graph.edge_count())
 
+    # Compute per-cell coverage metrics
+    logger.info("[9.5/10] Computing cell coverage")
+    with PerfTimer("cell_coverage"):
+        surface.compute_cell_coverage(los_cache)
+
     # Export results — use YAML output paths when configured, else --output dir
     logger.info("[10/10] Exporting results")
     with PerfTimer("export_results"):
