@@ -20,7 +20,8 @@ def compute_fresnel_clearance(
     h3_src: str,
     h3_dst: str,
     cells: Dict[str, H3Cell],
-    config: MeshConfig
+    config: MeshConfig,
+    elevation_provider=None,
 ) -> Tuple[float, float, float, float]:
     """
     Calculate minimum Fresnel clearance between two H3 cells.
@@ -84,8 +85,13 @@ def compute_fresnel_clearance(
     worst_d2 = total_distance / 2
 
     for cell_h3 in path_cells:
-        # Skip if cell not in our grid
-        if cell_h3 not in cells:
+        # Get terrain elevation: from grid if available, else from provider
+        if cell_h3 in cells:
+            terrain_elevation = cells[cell_h3].elevation
+        elif elevation_provider is not None:
+            cell_lat, cell_lon = h3.cell_to_latlng(cell_h3)
+            terrain_elevation = elevation_provider.get_elevation(cell_lat, cell_lon)
+        else:
             continue
 
         # Calculate fractional position along line
@@ -109,9 +115,6 @@ def compute_fresnel_clearance(
         else:
             fresnel_radius = 0.0
 
-        # Terrain elevation at this point
-        terrain_elevation = cells[cell_h3].elevation
-
         # Clearance = line altitude - (terrain + earth curvature + Fresnel zone)
         # Positive clearance = clear path
         # Negative clearance = obstructed
@@ -130,7 +133,8 @@ def has_line_of_sight(
     h3_src: str,
     h3_dst: str,
     cells: Dict[str, H3Cell],
-    config: MeshConfig
+    config: MeshConfig,
+    elevation_provider=None,
 ) -> bool:
     """
     Check if two cells have line-of-sight (LOS).
@@ -150,7 +154,10 @@ def has_line_of_sight(
         return False
 
     # Calculate clearance
-    clearance, _, _, _ = compute_fresnel_clearance(h3_src, h3_dst, cells, config)
+    clearance, _, _, _ = compute_fresnel_clearance(
+        h3_src, h3_dst, cells, config,
+        elevation_provider=elevation_provider,
+    )
 
     # LOS exists if clearance is positive
     return clearance > 0

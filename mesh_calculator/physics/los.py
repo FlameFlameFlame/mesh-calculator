@@ -16,7 +16,8 @@ def compute_los(
     h3_dst: str,
     cells: Dict[str, H3Cell],
     config: MeshConfig,
-    cache: LOSCache = None
+    cache: LOSCache = None,
+    elevation_provider=None,
 ) -> LOSResult:
     """
     Compute complete LOS result including clearance and path loss.
@@ -61,7 +62,8 @@ def compute_los(
 
     # Compute Fresnel clearance
     clearance, distance_m, d1, d2 = compute_fresnel_clearance(
-        h3_src, h3_dst, cells, config
+        h3_src, h3_dst, cells, config,
+        elevation_provider=elevation_provider,
     )
 
     # Compute path loss
@@ -94,7 +96,8 @@ def has_los(
     h3_dst: str,
     cells: Dict[str, H3Cell],
     config: MeshConfig,
-    cache: LOSCache = None
+    cache: LOSCache = None,
+    elevation_provider=None,
 ) -> bool:
     """
     Quick check if two cells have line-of-sight.
@@ -109,5 +112,8 @@ def has_los(
     Returns:
         True if LOS exists, False otherwise
     """
-    result = compute_los(h3_src, h3_dst, cells, config, cache)
+    result = compute_los(
+        h3_src, h3_dst, cells, config, cache,
+        elevation_provider=elevation_provider,
+    )
     return result.is_visible
