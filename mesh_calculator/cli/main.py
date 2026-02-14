@@ -108,12 +108,20 @@ def main(config: str, output: str, verbose: bool, quiet: bool):
                 edges=routing_graph.number_of_edges())
 
     # Connect sites by priority hierarchy
-    logger.info("[8/9] Connecting sites by priority")
+    logger.info("[8/10] Connecting sites by priority")
     with PerfTimer("connect_sites"):
         connect_sites_by_priority(sites, surface, routing_graph, los_cache)
 
+    # Compute visibility edges between all towers
+    logger.info("[9/10] Computing visibility edges")
+    with PerfTimer("visibility_edges"):
+        surface.update_visibility_edges(los_cache)
+    logger.info("Visibility graph built",
+                towers=surface.visibility_graph.tower_count(),
+                edges=surface.visibility_graph.edge_count())
+
     # Export results
-    logger.info("[9/9] Exporting results")
+    logger.info("[10/10] Exporting results")
     with PerfTimer("export_results"):
         towers_path = os.path.join(output, 'towers.geojson')
         export_towers_geojson(surface, towers_path)

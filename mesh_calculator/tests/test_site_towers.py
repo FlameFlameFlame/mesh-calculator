@@ -1,8 +1,10 @@
 """
 Tests for Fix #11: Place tower at every site location.
+Tests for Fix #7: update_visibility_edges wiring.
 
 Every site must have a tower placed at its h3_index with source='site',
 even if the site is a lone P1 site or all corridor searches fail.
+After tower placement, update_visibility_edges must compute LOS edges.
 """
 import unittest
 from unittest.mock import patch, MagicMock
@@ -11,6 +13,7 @@ import networkx as nx
 from mesh_calculator.core.config import MeshConfig
 from mesh_calculator.core.grid import H3Cell
 from mesh_calculator.data.sites import Site
+from mesh_calculator.data.cache import LOSCache
 from mesh_calculator.network.graph import MeshSurface
 from mesh_calculator.optimization.hierarchical import connect_sites_by_priority
 
@@ -92,3 +95,56 @@ class TestSiteTowersPlaced(unittest.TestCase):
 
         # Should have exactly 2 towers, not more
         self.assertEqual(len(surface.towers), 2)
+
+
+# ---------- Fix #7: Visibility Edges ----------
+
+class TestVisibilityEdgesWiring(unittest.TestCase):
+    """Fix #7: update_visibility_edges adds edges between LOS-connected towers."""
+
+    @patch('mesh_calculator.network.graph.has_los')
+    @patch('mesh_calculator.core.geometry.h3_distance')
+    def test_edges_added_between_visible_towers(
+        self, mock_distance, mock_los
+    ):
+        """After placing towers, update_visibility_edges adds edges."""
+        cells = make_cells(['a', 'b', 'c'])
+        config = MeshConfig()
+        surface = MeshSurface(cells, config)
+
+        surface.place_tower('a', source='site')
+        surface.place_tower('b', source='site')
+        surface.place_tower('c', source='site')
+
+        mock_los.return_value = True
+        mock_distance.return_value = 5000.0
+
+        surface.update_visibility_edges()
+
+        self.assertGreater(
+            surface.visibility_graph.edge_count(), 0,
+            "Visibility graph should have edges after update")
+
+    @patch('mesh_calculator.network.graph.has_los')
+    @patch('mesh_calculator.core.geometry.h3_distance')
+    def test_clusters_reflect_connectivity(
+        self, mock_distance, mock_los
+    ):
+        """Connected towers form clusters, not singletons."""
+        cells = make_cells(['a', 'b', 'c'])
+        config = MeshConfig()
+        surface = MeshSurface(cells, config)
+
+        surface.place_tower('a', source='site')
+        surface.place_tower('b', source='site')
+        surface.place_tower('c', source='site')
+
+        mock_los.return_value = True
+        mock_distance.return_value = 5000.0
+
+        surface.update_visibility_edges()
+
+        clusters = surface.get_tower_clusters()
+        num_clusters = len(set(clusters.values()))
+        self.assertEqual(num_clusters, 1,
+                         "All 3 towers with mutual LOS should form 1 cluster")
