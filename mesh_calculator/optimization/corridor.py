@@ -59,6 +59,13 @@ def place_nodes_along_corridor(
             if distance > config.max_visibility_m:
                 break
 
+            # Skip cells too close (tower separation), unless endpoint
+            is_endpoint = (next_idx == len(corridor) - 1)
+            if (not is_endpoint
+                    and config.tower_separation_m > 0
+                    and distance < config.tower_separation_m):
+                continue
+
             # Check LOS — continue scanning even if this cell fails
             if has_los(current_h3, next_h3, cells, config, cache,
                        elevation_provider=surface.elevation_provider):
@@ -98,6 +105,17 @@ def place_nodes_along_corridor(
             elevation_provider=surface.elevation_provider,
         )
         logger.debug("After optimization", count=len(placed_nodes))
+
+    # Validate hop limit
+    hop_count = len(placed_nodes) - 1
+    if hop_count > config.hop_limit:
+        logger.warning(
+            "Corridor exceeds hop limit",
+            hops=hop_count,
+            limit=config.hop_limit,
+            start=corridor[0],
+            end=corridor[-1],
+        )
 
     return placed_nodes
 
