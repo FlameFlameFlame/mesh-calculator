@@ -47,6 +47,15 @@ def connect_sites_by_priority(
 
     logger.info("Connecting sites by priority hierarchy", site_count=len(sites))
 
+    # Place a tower at every site location (guarantees infrastructure)
+    for site in sites:
+        if site.h3_index in surface.cells:
+            surface.place_tower(site.h3_index, source='site')
+            logger.info("Placed site tower", site=site.name, h3=site.h3_index)
+        else:
+            logger.warning("Site cell not in grid, cannot place tower",
+                           site=site.name, h3=site.h3_index)
+
     # Group sites by priority
     sites_by_priority = group_sites_by_priority(sites)
     priority_levels = sorted(sites_by_priority.keys())
