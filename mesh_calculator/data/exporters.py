@@ -86,7 +86,10 @@ def export_coverage_geojson(surface: MeshSurface, output_path: str):
                 'visible_tower_count': cell.visible_tower_count,
                 'distance_to_closest_tower': cell.distance_to_closest_tower
                     if cell.distance_to_closest_tower != float('inf') else None,
-                'clearance': cell.clearance,
+                'clearance': cell.clearance
+                    if cell.clearance is not None
+                    and cell.clearance != float('inf')
+                    else None,
                 'path_loss': cell.path_loss
             }
         }
