@@ -44,39 +44,46 @@ def place_nodes_along_corridor(
     current_h3 = corridor[0]
     current_idx = 0
 
-    while current_idx < len(corridor) - 1:
-        # Try to reach as far as possible with LOS
-        furthest_visible_idx = current_idx + 1
-        furthest_visible_h3 = corridor[furthest_visible_idx]
+    from ..core.geometry import h3_distance
 
-        # Look ahead to find furthest visible cell
-        for next_idx in range(current_idx + 2, len(corridor)):
+    while current_idx < len(corridor) - 1:
+        furthest_visible_idx = None
+
+        # Scan ALL forward cells within max_visibility (Fix #2: start from +1,
+        # Fix #3: don't break on first LOS failure)
+        for next_idx in range(current_idx + 1, len(corridor)):
             next_h3 = corridor[next_idx]
 
             # Check distance constraint
-            from ..core.geometry import h3_distance
             distance = h3_distance(current_h3, next_h3)
             if distance > config.max_visibility_m:
                 break
 
-            # Check LOS
+            # Check LOS — continue scanning even if this cell fails
             if has_los(current_h3, next_h3, cells, config, cache,
                        elevation_provider=surface.elevation_provider):
                 furthest_visible_idx = next_idx
-                furthest_visible_h3 = next_h3
-            else:
-                # Can't see further, stop looking
-                break
 
-        # Place node at furthest visible point
-        if furthest_visible_h3 not in placed_nodes:
-            placed_nodes.append(furthest_visible_h3)
+        if furthest_visible_idx is not None:
+            # Place node at furthest visible cell
+            furthest_h3 = corridor[furthest_visible_idx]
+            if furthest_h3 not in placed_nodes:
+                placed_nodes.append(furthest_h3)
+            current_h3 = furthest_h3
+            current_idx = furthest_visible_idx
+        else:
+            # No visible cell — forced advance by one (Fix #4: log warning)
+            current_idx += 1
+            current_h3 = corridor[current_idx]
+            if current_h3 not in placed_nodes:
+                placed_nodes.append(current_h3)
+            logger.warning(
+                "No LOS to any forward cell, forced advance",
+                current=corridor[current_idx - 1],
+                next=current_h3,
+            )
 
-        # Move to next position
-        current_h3 = furthest_visible_h3
-        current_idx = furthest_visible_idx
-
-    # Ensure end node is included
+    # Safety net: ensure end node is included
     if corridor[-1] not in placed_nodes:
         placed_nodes.append(corridor[-1])
 
