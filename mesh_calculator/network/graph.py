@@ -246,7 +246,8 @@ class MeshSurface:
                     # Cell has a tower — distance 0, always visible
                     visible_count += 1
                     best_distance = 0.0
-                    best_clearance = float('inf')
+                    if best_clearance is None:
+                        best_clearance = 0.0
                     best_path_loss = 0.0
                     continue
 
