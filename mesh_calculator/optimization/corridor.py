@@ -113,55 +113,76 @@ def optimize_node_selection(
     """
     Select best subset of nodes respecting limit while maintaining connectivity.
 
+    Iteratively removes the lowest-scored node whose neighbors can still see
+    each other (Fix #5: preserves corridor order, Fix #6: maintains chain
+    connectivity).
+
     Args:
-        nodes: List of H3 cell indices
+        nodes: List of H3 cell indices (in corridor order)
         max_nodes: Maximum number of nodes allowed
         cells: Dictionary of H3 cells
         config: Mesh configuration
         cache: Optional LOS cache
+        elevation_provider: Optional elevation provider for terrain lookups
 
     Returns:
-        Optimized list of H3 indices
+        Optimized list of H3 indices (in corridor order, chain-connected)
     """
     if len(nodes) <= max_nodes:
         return nodes
 
-    # Always keep start and end
-    essential = [nodes[0], nodes[-1]]
-    candidates = nodes[1:-1]
-
     if max_nodes <= 2:
-        return essential
+        return [nodes[0], nodes[-1]]
 
-    # Score each candidate node
-    scores = []
-    for node in candidates:
+    # Pre-compute scores for intermediate nodes
+    intermediates = nodes[1:-1]
+    node_scores = {}
+    for node in intermediates:
         score = 0.0
 
-        # Prefer high elevation (better LOS)
         cell = cells.get(node)
         if cell:
             score += cell.elevation / 100.0
 
-        # Count how many other candidates this node can see
         visible_count = 0
-        for other in candidates:
+        for other in intermediates:
             if other != node and has_los(node, other, cells, config, cache,
-                                            elevation_provider=elevation_provider):
+                                        elevation_provider=elevation_provider):
                 visible_count += 1
 
         score += visible_count
+        node_scores[node] = score
 
-        scores.append((score, node))
+    # Iteratively remove lowest-scored node that doesn't break connectivity
+    result = list(nodes)
+    while len(result) > max_nodes:
+        best_to_remove_idx = None
+        best_remove_score = float('inf')
 
-    # Sort by score (highest first)
-    scores.sort(reverse=True, key=lambda x: x[0])
+        for i in range(1, len(result) - 1):
+            node = result[i]
+            prev_node = result[i - 1]
+            next_node = result[i + 1]
 
-    # Select top (max_nodes - 2) candidates
-    selected = [n for _, n in scores[:max_nodes-2]]
+            # Can remove only if prev and next have LOS
+            if has_los(prev_node, next_node, cells, config, cache,
+                       elevation_provider=elevation_provider):
+                if node_scores.get(node, 0) < best_remove_score:
+                    best_remove_score = node_scores.get(node, 0)
+                    best_to_remove_idx = i
 
-    # Return start + selected + end
-    return [nodes[0]] + selected + [nodes[-1]]
+        if best_to_remove_idx is not None:
+            removed = result.pop(best_to_remove_idx)
+            logger.debug("Removed node during optimization",
+                         node=removed, score=best_remove_score)
+        else:
+            # Can't remove any more without breaking connectivity
+            logger.warning(
+                "Cannot reduce to target without breaking connectivity",
+                current=len(result), target=max_nodes)
+            break
+
+    return result
 
 
 def install_nodes(
