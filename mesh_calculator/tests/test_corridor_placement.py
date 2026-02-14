@@ -58,6 +58,7 @@ class TestFallbackNextCellLOS(unittest.TestCase):
             mast_height_m=10.0,
             max_visibility_m=70000.0,
             max_nodes_per_road=100,
+            tower_separation_m=0.0,
         )
 
     @patch('mesh_calculator.optimization.corridor.has_los')
@@ -133,6 +134,7 @@ class TestGreedyScanContinuesPastFailure(unittest.TestCase):
             mast_height_m=10.0,
             max_visibility_m=70000.0,
             max_nodes_per_road=100,
+            tower_separation_m=0.0,
         )
 
     @patch('mesh_calculator.optimization.corridor.has_los')
@@ -236,6 +238,7 @@ class TestEndpointLOSVerification(unittest.TestCase):
             mast_height_m=10.0,
             max_visibility_m=70000.0,
             max_nodes_per_road=100,
+            tower_separation_m=0.0,
         )
 
     @patch('mesh_calculator.optimization.corridor.has_los')
