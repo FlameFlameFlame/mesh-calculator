@@ -170,3 +170,61 @@ class TestVisibilityEdgesWiring(unittest.TestCase):
         self.assertAlmostEqual(data['clearance_m'], 22.5)
         self.assertAlmostEqual(data['path_loss_db'], 115.3)
         self.assertAlmostEqual(data['distance_m'], 8000.0)
+
+
+# ---------- Cell Coverage ----------
+
+class TestCellCoverage(unittest.TestCase):
+    """compute_cell_coverage populates visible_tower_count and related fields."""
+
+    @patch('mesh_calculator.network.graph.compute_los')
+    @patch('mesh_calculator.core.geometry.h3_distance')
+    def test_visible_tower_count_populated(self, mock_distance, mock_compute_los):
+        """Cells near visible towers get visible_tower_count > 0."""
+        cells = make_cells(['t1', 't2', 'c1'])
+        config = MeshConfig()
+        surface = MeshSurface(cells, config)
+
+        surface.place_tower('t1', source='site')
+        surface.place_tower('t2', source='site')
+
+        mock_distance.return_value = 5000.0
+        mock_compute_los.return_value = LOSResult(
+            clearance_m=10.0, path_loss_db=110.0,
+            distance_m=5000.0, is_visible=True,
+        )
+
+        surface.compute_cell_coverage()
+
+        # Tower cells see themselves + the other tower
+        self.assertEqual(cells['t1'].visible_tower_count, 2)
+        self.assertEqual(cells['t2'].visible_tower_count, 2)
+        # Non-tower cell sees both towers
+        self.assertEqual(cells['c1'].visible_tower_count, 2)
+        self.assertAlmostEqual(cells['c1'].distance_to_closest_tower, 5000.0)
+        self.assertAlmostEqual(cells['c1'].path_loss, 110.0)
+        self.assertAlmostEqual(cells['c1'].clearance, 10.0)
+
+    @patch('mesh_calculator.network.graph.compute_los')
+    @patch('mesh_calculator.core.geometry.h3_distance')
+    def test_no_los_leaves_zero(self, mock_distance, mock_compute_los):
+        """Cells with no LOS to any tower keep visible_tower_count=0."""
+        cells = make_cells(['t1', 'c1'])
+        config = MeshConfig()
+        surface = MeshSurface(cells, config)
+
+        surface.place_tower('t1', source='site')
+
+        mock_distance.return_value = 5000.0
+        mock_compute_los.return_value = LOSResult(
+            clearance_m=-5.0, path_loss_db=999.0,
+            distance_m=5000.0, is_visible=False,
+        )
+
+        surface.compute_cell_coverage()
+
+        # Tower cell sees itself (distance 0, no LOS check needed)
+        self.assertEqual(cells['t1'].visible_tower_count, 1)
+        # Non-tower cell has no LOS
+        self.assertEqual(cells['c1'].visible_tower_count, 0)
+        self.assertEqual(cells['c1'].distance_to_closest_tower, float('inf'))
