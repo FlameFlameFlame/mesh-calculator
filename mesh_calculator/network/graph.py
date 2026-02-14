@@ -10,7 +10,7 @@ import structlog
 from ..core.grid import H3Cell
 from ..core.config import MeshConfig
 from ..data.cache import LOSCache
-from ..physics.los import has_los
+from ..physics.los import compute_los
 
 logger = structlog.get_logger(__name__)
 
@@ -202,17 +202,18 @@ class MeshSurface:
 
         for i, tower1 in enumerate(tower_list):
             for tower2 in tower_list[i+1:]:
-                # Check if LOS exists
-                if has_los(tower1.h3_index, tower2.h3_index,
-                          self.cells, self.config, cache,
-                          elevation_provider=self.elevation_provider):
-                    from ..core.geometry import h3_distance
-                    distance = h3_distance(tower1.h3_index, tower2.h3_index)
-
+                result = compute_los(
+                    tower1.h3_index, tower2.h3_index,
+                    self.cells, self.config, cache,
+                    elevation_provider=self.elevation_provider,
+                )
+                if result.is_visible:
                     self.visibility_graph.add_visibility_edge(
                         tower1.tower_id,
                         tower2.tower_id,
-                        distance_m=distance
+                        distance_m=result.distance_m,
+                        clearance_m=result.clearance_m,
+                        path_loss_db=result.path_loss_db,
                     )
                     edges_added += 1
 

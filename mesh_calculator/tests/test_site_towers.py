@@ -13,7 +13,7 @@ import networkx as nx
 from mesh_calculator.core.config import MeshConfig
 from mesh_calculator.core.grid import H3Cell
 from mesh_calculator.data.sites import Site
-from mesh_calculator.data.cache import LOSCache
+from mesh_calculator.data.cache import LOSCache, LOSResult
 from mesh_calculator.network.graph import MeshSurface
 from mesh_calculator.optimization.hierarchical import connect_sites_by_priority
 
@@ -102,11 +102,8 @@ class TestSiteTowersPlaced(unittest.TestCase):
 class TestVisibilityEdgesWiring(unittest.TestCase):
     """Fix #7: update_visibility_edges adds edges between LOS-connected towers."""
 
-    @patch('mesh_calculator.network.graph.has_los')
-    @patch('mesh_calculator.core.geometry.h3_distance')
-    def test_edges_added_between_visible_towers(
-        self, mock_distance, mock_los
-    ):
+    @patch('mesh_calculator.network.graph.compute_los')
+    def test_edges_added_between_visible_towers(self, mock_compute_los):
         """After placing towers, update_visibility_edges adds edges."""
         cells = make_cells(['a', 'b', 'c'])
         config = MeshConfig()
@@ -116,8 +113,10 @@ class TestVisibilityEdgesWiring(unittest.TestCase):
         surface.place_tower('b', source='site')
         surface.place_tower('c', source='site')
 
-        mock_los.return_value = True
-        mock_distance.return_value = 5000.0
+        mock_compute_los.return_value = LOSResult(
+            clearance_m=15.0, path_loss_db=120.0,
+            distance_m=5000.0, is_visible=True,
+        )
 
         surface.update_visibility_edges()
 
@@ -125,11 +124,8 @@ class TestVisibilityEdgesWiring(unittest.TestCase):
             surface.visibility_graph.edge_count(), 0,
             "Visibility graph should have edges after update")
 
-    @patch('mesh_calculator.network.graph.has_los')
-    @patch('mesh_calculator.core.geometry.h3_distance')
-    def test_clusters_reflect_connectivity(
-        self, mock_distance, mock_los
-    ):
+    @patch('mesh_calculator.network.graph.compute_los')
+    def test_clusters_reflect_connectivity(self, mock_compute_los):
         """Connected towers form clusters, not singletons."""
         cells = make_cells(['a', 'b', 'c'])
         config = MeshConfig()
@@ -139,8 +135,10 @@ class TestVisibilityEdgesWiring(unittest.TestCase):
         surface.place_tower('b', source='site')
         surface.place_tower('c', source='site')
 
-        mock_los.return_value = True
-        mock_distance.return_value = 5000.0
+        mock_compute_los.return_value = LOSResult(
+            clearance_m=15.0, path_loss_db=120.0,
+            distance_m=5000.0, is_visible=True,
+        )
 
         surface.update_visibility_edges()
 
@@ -148,3 +146,27 @@ class TestVisibilityEdgesWiring(unittest.TestCase):
         num_clusters = len(set(clusters.values()))
         self.assertEqual(num_clusters, 1,
                          "All 3 towers with mutual LOS should form 1 cluster")
+
+    @patch('mesh_calculator.network.graph.compute_los')
+    def test_edges_store_clearance_and_path_loss(self, mock_compute_los):
+        """Visibility edges include clearance_m and path_loss_db."""
+        cells = make_cells(['a', 'b'])
+        config = MeshConfig()
+        surface = MeshSurface(cells, config)
+
+        surface.place_tower('a', source='site')
+        surface.place_tower('b', source='site')
+
+        mock_compute_los.return_value = LOSResult(
+            clearance_m=22.5, path_loss_db=115.3,
+            distance_m=8000.0, is_visible=True,
+        )
+
+        surface.update_visibility_edges()
+
+        edges = list(surface.visibility_graph.graph.edges(data=True))
+        self.assertEqual(len(edges), 1)
+        data = edges[0][2]
+        self.assertAlmostEqual(data['clearance_m'], 22.5)
+        self.assertAlmostEqual(data['path_loss_db'], 115.3)
+        self.assertAlmostEqual(data['distance_m'], 8000.0)

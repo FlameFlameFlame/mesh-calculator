@@ -10,6 +10,7 @@ import structlog
 from ..logging_config import setup_logging
 from ..utils.perf import PerfTimer
 from ..data.loaders import load_config
+from ..core.config import OutputPaths
 from ..data.sites import load_sites, snap_sites_to_roads
 from ..data.cache import LOSCache
 from ..data.exporters import (
@@ -120,19 +121,24 @@ def main(config: str, output: str, verbose: bool, quiet: bool):
                 towers=surface.visibility_graph.tower_count(),
                 edges=surface.visibility_graph.edge_count())
 
-    # Export results
+    # Export results — use YAML output paths when configured, else --output dir
     logger.info("[10/10] Exporting results")
     with PerfTimer("export_results"):
-        towers_path = os.path.join(output, 'towers.geojson')
+        _defaults = OutputPaths()
+        out = cfg.outputs
+
+        towers_path = out.towers if out.towers != _defaults.towers else os.path.join(output, 'towers.geojson')
+        coverage_path = out.coverage if out.coverage != _defaults.coverage else os.path.join(output, 'coverage.geojson')
+        report_path = out.report if out.report != _defaults.report else os.path.join(output, 'report.json')
+        edges_path = out.visibility_edges if out.visibility_edges != _defaults.visibility_edges else os.path.join(output, 'visibility_edges.geojson')
+
+        # Ensure output directories exist
+        for p in (towers_path, coverage_path, report_path, edges_path):
+            os.makedirs(os.path.dirname(os.path.abspath(p)), exist_ok=True)
+
         export_towers_geojson(surface, towers_path)
-
-        coverage_path = os.path.join(output, 'coverage.geojson')
         export_coverage_geojson(surface, coverage_path)
-
-        report_path = os.path.join(output, 'report.json')
         generate_report(surface, report_path)
-
-        edges_path = os.path.join(output, 'visibility_edges.geojson')
         export_visibility_edges_geojson(surface, edges_path)
 
     # Log cache stats
@@ -146,7 +152,8 @@ def main(config: str, output: str, verbose: bool, quiet: bool):
 
     logger.info("Optimization complete",
                 towers_placed=len(surface.towers),
-                output_dir=output)
+                towers_path=towers_path,
+                edges_path=edges_path)
 
 
 if __name__ == '__main__':
