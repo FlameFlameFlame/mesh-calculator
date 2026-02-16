@@ -54,6 +54,7 @@ class InputPaths:
     roads: str  # GeoJSON road network
     target_sites: str  # GeoJSON sites with priorities
     existing_towers: Optional[str] = None  # Optional seed towers
+    city_boundaries: Optional[str] = None  # City boundary polygons
 
 
 @dataclass
