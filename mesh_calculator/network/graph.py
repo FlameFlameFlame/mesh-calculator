@@ -1,9 +1,14 @@
 """
 Network graph representation for towers and visibility.
 """
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Dict, Set
+
 import networkx as nx
+import numpy as np
+from scipy.spatial import cKDTree
 
 import structlog
 
@@ -13,6 +18,9 @@ from ..data.cache import LOSCache
 from ..physics.los import compute_los
 
 logger = structlog.get_logger(__name__)
+
+# Earth radius for approximate Cartesian conversion (meters)
+_EARTH_R = 6_371_000
 
 
 @dataclass
@@ -192,28 +200,72 @@ class MeshSurface:
         """
         Update visibility edges between all towers.
 
+        Uses a KDTree spatial index to skip pairs beyond max_visibility_m,
+        then computes LOS in parallel for candidate pairs.
+
         Args:
             cache: Optional LOS cache
         """
-        logger.info("Updating visibility edges", towers=len(self.towers))
-
         tower_list = list(self.towers.values())
-        edges_added = 0
+        n = len(tower_list)
+        logger.info("Updating visibility edges", towers=n)
 
-        for i, tower1 in enumerate(tower_list):
-            for tower2 in tower_list[i+1:]:
-                result = compute_los(
-                    tower1.h3_index, tower2.h3_index,
-                    self.cells, self.config, cache,
-                    elevation_provider=self.elevation_provider,
-                )
-                if result.is_visible:
+        if n < 2:
+            return
+
+        # Build KDTree from tower coords for fast proximity queries
+        lats = np.array([t.lat for t in tower_list])
+        lons = np.array([t.lon for t in tower_list])
+        lats_rad = np.radians(lats)
+        lons_rad = np.radians(lons)
+        cos_lat = np.cos(lats_rad)
+        xyz = np.column_stack([
+            cos_lat * np.cos(lons_rad),
+            cos_lat * np.sin(lons_rad),
+            np.sin(lats_rad),
+        ]) * _EARTH_R
+        tree = cKDTree(xyz)
+
+        max_dist = self.config.max_visibility_m
+        candidate_pairs = tree.query_pairs(r=max_dist, output_type='ndarray')
+        logger.info("Visibility candidates after spatial filter",
+                     total_pairs=n * (n - 1) // 2,
+                     candidate_pairs=len(candidate_pairs))
+
+        # Compute LOS in parallel for candidate pairs
+        cells = self.cells
+        config = self.config
+        elev = self.elevation_provider
+
+        def _check_pair(idx_pair):
+            i, j = idx_pair
+            t1, t2 = tower_list[i], tower_list[j]
+            result = compute_los(
+                t1.h3_index, t2.h3_index,
+                cells, config, cache,
+                elevation_provider=elev,
+            )
+            if result.is_visible:
+                return (t1.tower_id, t2.tower_id,
+                        result.distance_m, result.clearance_m,
+                        result.path_loss_db)
+            return None
+
+        edges_added = 0
+        max_workers = os.cpu_count() or 4
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_check_pair, pair)
+                       for pair in candidate_pairs]
+            for future in as_completed(futures):
+                edge = future.result()
+                if edge is not None:
+                    tid1, tid2, dist, clearance, ploss = edge
                     self.visibility_graph.add_visibility_edge(
-                        tower1.tower_id,
-                        tower2.tower_id,
-                        distance_m=result.distance_m,
-                        clearance_m=result.clearance_m,
-                        path_loss_db=result.path_loss_db,
+                        tid1, tid2,
+                        distance_m=dist,
+                        clearance_m=clearance,
+                        path_loss_db=ploss,
                     )
                     edges_added += 1
 
@@ -222,60 +274,116 @@ class MeshSurface:
     def compute_cell_coverage(self, cache: LOSCache = None):
         """Compute per-cell coverage metrics from placed towers.
 
-        For each cell, checks LOS to every tower within max_visibility_m
-        and updates: visible_tower_count, distance_to_closest_tower,
-        clearance (best), and path_loss (best).
+        Uses a KDTree to find towers within max_visibility_m for each cell,
+        then checks LOS in parallel. Updates: visible_tower_count,
+        distance_to_closest_tower, clearance (best), and path_loss (best).
         """
-        from ..core.geometry import h3_distance
-
         tower_list = list(self.towers.values())
         if not tower_list:
             return
 
         max_dist = self.config.max_visibility_m
+        cells = self.cells
+        config = self.config
+        elev = self.elevation_provider
+
+        # Build KDTree from tower positions
+        t_lats = np.array([t.lat for t in tower_list])
+        t_lons = np.array([t.lon for t in tower_list])
+        t_lats_rad = np.radians(t_lats)
+        t_lons_rad = np.radians(t_lons)
+        t_cos_lat = np.cos(t_lats_rad)
+        tower_xyz = np.column_stack([
+            t_cos_lat * np.cos(t_lons_rad),
+            t_cos_lat * np.sin(t_lons_rad),
+            np.sin(t_lats_rad),
+        ]) * _EARTH_R
+        tower_tree = cKDTree(tower_xyz)
+
+        # Map tower h3_index → index for fast lookup
+        tower_h3_set = {t.h3_index for t in tower_list}
+
+        # Build cell coordinates for batch query
+        cell_list = list(cells.values())
+        c_lats = np.array([c.lat for c in cell_list])
+        c_lons = np.array([c.lon for c in cell_list])
+        c_lats_rad = np.radians(c_lats)
+        c_lons_rad = np.radians(c_lons)
+        c_cos_lat = np.cos(c_lats_rad)
+        cell_xyz = np.column_stack([
+            c_cos_lat * np.cos(c_lons_rad),
+            c_cos_lat * np.sin(c_lons_rad),
+            np.sin(c_lats_rad),
+        ]) * _EARTH_R
+
+        # For each cell, find nearby tower indices
+        nearby = tower_tree.query_ball_point(cell_xyz, r=max_dist)
+
+        # Build (cell_idx, tower_idx) pairs that need LOS checks
+        los_pairs = []
+        # Track cells that have a tower on them (distance=0, always visible)
+        cells_with_own_tower = set()
+        for ci, cell in enumerate(cell_list):
+            if cell.h3_index in tower_h3_set:
+                cells_with_own_tower.add(ci)
+            for ti in nearby[ci]:
+                t = tower_list[ti]
+                if t.h3_index == cell.h3_index:
+                    continue  # handled separately
+                los_pairs.append((ci, ti))
+
+        logger.info("Cell coverage: %d cells, %d towers, %d LOS checks",
+                    len(cell_list), len(tower_list), len(los_pairs))
+
+        # Compute LOS in parallel
+        def _check_cell_tower(pair):
+            ci, ti = pair
+            c = cell_list[ci]
+            t = tower_list[ti]
+            result = compute_los(
+                c.h3_index, t.h3_index,
+                cells, config, cache,
+                elevation_provider=elev,
+            )
+            if result.is_visible:
+                return (ci, result.distance_m,
+                        result.clearance_m, result.path_loss_db)
+            return None
+
+        # Accumulate per-cell results
+        cell_results = {}  # ci → (visible_count, best_dist, best_clear, best_ploss)
+        for ci in cells_with_own_tower:
+            cell_results[ci] = [1, 0.0, 0.0, 0.0]
+
+        max_workers = os.cpu_count() or 4
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_check_cell_tower, p) for p in los_pairs]
+            for future in as_completed(futures):
+                res = future.result()
+                if res is None:
+                    continue
+                ci, dist_m, clear_m, ploss_db = res
+                if ci not in cell_results:
+                    cell_results[ci] = [0, float('inf'), None, None]
+                entry = cell_results[ci]
+                entry[0] += 1
+                if dist_m < entry[1]:
+                    entry[1] = dist_m
+                    entry[2] = clear_m
+                    entry[3] = ploss_db
+
+        # Apply results to cells
         updated = 0
-
-        for cell in self.cells.values():
-            best_distance = float('inf')
-            best_clearance = None
-            best_path_loss = None
-            visible_count = 0
-
-            for tower in tower_list:
-                if tower.h3_index == cell.h3_index:
-                    # Cell has a tower — distance 0, always visible
-                    visible_count += 1
-                    best_distance = 0.0
-                    if best_clearance is None:
-                        best_clearance = 0.0
-                    best_path_loss = 0.0
-                    continue
-
-                dist = h3_distance(cell.h3_index, tower.h3_index)
-                if dist > max_dist:
-                    continue
-
-                result = compute_los(
-                    cell.h3_index, tower.h3_index,
-                    self.cells, self.config, cache,
-                    elevation_provider=self.elevation_provider,
-                )
-                if result.is_visible:
-                    visible_count += 1
-                    if result.distance_m < best_distance:
-                        best_distance = result.distance_m
-                        best_clearance = result.clearance_m
-                        best_path_loss = result.path_loss_db
-
-            cell.visible_tower_count = visible_count
-            if best_distance < float('inf'):
-                cell.distance_to_closest_tower = best_distance
-                cell.clearance = best_clearance
-                cell.path_loss = best_path_loss
-                updated += 1
+        for ci, (count, dist, clearance, ploss) in cell_results.items():
+            cell = cell_list[ci]
+            cell.visible_tower_count = count
+            cell.distance_to_closest_tower = dist
+            cell.clearance = clearance
+            cell.path_loss = ploss
+            updated += 1
 
         logger.info("Cell coverage computed",
-                    cells_with_coverage=updated, total_cells=len(self.cells))
+                    cells_with_coverage=updated, total_cells=len(cell_list))
 
     def get_tower_clusters(self) -> Dict[int, int]:
         """
