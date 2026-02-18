@@ -20,7 +20,8 @@ def compute_los_batch(
     cells: Dict[str, H3Cell],
     config: MeshConfig,
     cache: LOSCache = None,
-    max_workers: int = None
+    max_workers: int = None,
+    elevation_provider=None,
 ) -> Dict[Tuple[str, str], LOSResult]:
     """
     Compute LOS for multiple cell pairs in parallel.
@@ -31,6 +32,7 @@ def compute_los_batch(
         config: Mesh configuration
         cache: Optional LOS cache
         max_workers: Number of worker threads (default: CPU count)
+        elevation_provider: Optional elevation provider for off-grid cells
 
     Returns:
         Dictionary mapping (h3_src, h3_dst) to LOSResult
@@ -43,7 +45,8 @@ def compute_los_batch(
     # Worker function
     def compute_pair(pair: Tuple[str, str]) -> Tuple[Tuple[str, str], LOSResult]:
         h3_src, h3_dst = pair
-        result = compute_los(h3_src, h3_dst, cells, config, cache)
+        result = compute_los(h3_src, h3_dst, cells, config, cache,
+                             elevation_provider=elevation_provider)
         return (pair, result)
 
     # Process in parallel
@@ -66,7 +69,8 @@ def compute_los_batch_progress(
     config: MeshConfig,
     cache: LOSCache = None,
     max_workers: int = None,
-    progress_interval: int = 100
+    progress_interval: int = 100,
+    elevation_provider=None,
 ) -> Dict[Tuple[str, str], LOSResult]:
     """
     Compute LOS for multiple cell pairs with progress reporting.
@@ -78,6 +82,7 @@ def compute_los_batch_progress(
         cache: Optional LOS cache
         max_workers: Number of worker threads (default: CPU count)
         progress_interval: Report progress every N completions
+        elevation_provider: Optional elevation provider for off-grid cells
 
     Returns:
         Dictionary mapping (h3_src, h3_dst) to LOSResult
@@ -93,7 +98,8 @@ def compute_los_batch_progress(
     # Worker function
     def compute_pair(pair: Tuple[str, str]) -> Tuple[Tuple[str, str], LOSResult]:
         h3_src, h3_dst = pair
-        result = compute_los(h3_src, h3_dst, cells, config, cache)
+        result = compute_los(h3_src, h3_dst, cells, config, cache,
+                             elevation_provider=elevation_provider)
         return (pair, result)
 
     # Process in parallel with progress
