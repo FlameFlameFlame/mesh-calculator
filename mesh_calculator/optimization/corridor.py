@@ -39,10 +39,14 @@ def _walk_segment(
     while current_idx < len(segment) - 1:
         furthest_visible_idx = None
 
-        # Find the farthest reachable index within max_visibility_m
+        # Find the farthest reachable index within max_visibility_m.
+        # Cache distances so the backward scan can reuse them without recomputing.
+        distances: dict = {}
         max_reachable_idx = current_idx
         for next_idx in range(current_idx + 1, len(segment)):
-            if h3_distance(current_h3, segment[next_idx]) > config.max_visibility_m:
+            d = h3_distance(current_h3, segment[next_idx])
+            distances[next_idx] = d
+            if d > config.max_visibility_m:
                 break
             max_reachable_idx = next_idx
 
@@ -50,7 +54,7 @@ def _walk_segment(
         # visible, so we stop immediately (O(1) vs O(n) forward scan)
         for next_idx in range(max_reachable_idx, current_idx, -1):
             next_h3 = segment[next_idx]
-            distance = h3_distance(current_h3, next_h3)
+            distance = distances.get(next_idx) or h3_distance(current_h3, next_h3)
 
             is_endpoint = (next_idx == len(segment) - 1)
             if (not is_endpoint

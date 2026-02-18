@@ -2,9 +2,9 @@
 Geometric utilities for mesh calculator.
 """
 import math
+import functools
 from typing import Tuple
 import h3
-from shapely.geometry import Point, LineString
 from pyproj import Geod
 
 
@@ -27,6 +27,7 @@ def great_circle_distance(lat1: float, lon1: float, lat2: float, lon2: float) ->
     return distance
 
 
+@functools.lru_cache(maxsize=None)
 def h3_to_lat_lon(h3_index: str) -> Tuple[float, float]:
     """
     Convert H3 index to latitude/longitude.
@@ -55,9 +56,13 @@ def lat_lon_to_h3(lat: float, lon: float, resolution: int) -> str:
     return h3.latlng_to_cell(lat, lon, resolution)
 
 
+@functools.lru_cache(maxsize=None)
 def calculate_line_fraction(point_h3: str, start_h3: str, end_h3: str) -> float:
     """
     Calculate fractional position of a point along a line between start and end.
+
+    Uses planar dot-product projection (equivalent to the previous Shapely
+    implementation but avoids Shapely object creation overhead).
 
     Args:
         point_h3: H3 cell index of point
@@ -67,22 +72,16 @@ def calculate_line_fraction(point_h3: str, start_h3: str, end_h3: str) -> float:
     Returns:
         Fraction from 0.0 (at start) to 1.0 (at end)
     """
-    # Get coordinates
-    point_lat, point_lon = h3_to_lat_lon(point_h3)
-    start_lat, start_lon = h3_to_lat_lon(start_h3)
-    end_lat, end_lon = h3_to_lat_lon(end_h3)
-
-    # Create line geometry
-    line = LineString([(start_lon, start_lat), (end_lon, end_lat)])
-    point = Point(point_lon, point_lat)
-
-    # Project point onto line and get fraction
-    # Note: Shapely uses simple planar projection, which is approximate
-    # but sufficient for our needs given small cell sizes
-    fraction = line.project(point, normalized=True)
-
-    # Clamp to [0, 1]
-    return max(0.0, min(1.0, fraction))
+    pl, plo = h3_to_lat_lon(point_h3)
+    sl, slo = h3_to_lat_lon(start_h3)
+    el, elo = h3_to_lat_lon(end_h3)
+    dx = elo - slo
+    dy = el - sl
+    denom = dx * dx + dy * dy
+    if denom < 1e-12:
+        return 0.0
+    frac = ((plo - slo) * dx + (pl - sl) * dy) / denom
+    return max(0.0, min(1.0, frac))
 
 
 def h3_distance(h3_a: str, h3_b: str) -> float:
