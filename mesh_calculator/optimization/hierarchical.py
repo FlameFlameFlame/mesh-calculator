@@ -7,6 +7,7 @@ Implements the core algorithm:
 """
 import itertools
 from typing import List
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import networkx as nx
 
 import structlog
@@ -78,8 +79,10 @@ def connect_sites_by_priority(
         logger.info("Connecting priority level",
                     priority=priority, sites=len(current_level_sites))
 
+        # Step 1: Sequential — determine targets + find corridors
+        # (must preserve connected_sites order for correct find_nearest_site results)
+        planned = []
         for site in current_level_sites:
-            # Find nearest higher-priority site
             nearest_site = find_nearest_site(site, connected_sites)
 
             if nearest_site is None:
@@ -90,24 +93,33 @@ def connect_sites_by_priority(
                         site=site.name, site_priority=priority,
                         target=nearest_site.name, target_priority=nearest_site.priority)
 
-            # Find corridor
             corridor = find_road_corridor(site.h3_index, nearest_site.h3_index, routing_graph)
+            planned.append((site, nearest_site, corridor))
+            connected_sites.append(site)
 
-            if corridor:
-                # Place nodes along corridor
-                nodes = place_nodes_along_corridor(corridor, surface, cache)
+        if not planned:
+            continue
 
-                # Install towers
+        # Step 2: Parallel — compute node placement along each corridor
+        def _compute_nodes(item):
+            site, nearest_site, corridor = item
+            if not corridor:
+                return None, site.name, nearest_site.name, 0
+            nodes = place_nodes_along_corridor(corridor, surface, cache)
+            return nodes, site.name, nearest_site.name, len(corridor)
+
+        with ThreadPoolExecutor() as executor:
+            node_results = list(executor.map(_compute_nodes, planned))
+
+        # Step 3: Serial — install towers
+        for nodes, site_name, target_name, corridor_len in node_results:
+            if nodes:
                 install_nodes(nodes, surface, source=f'priority_{priority}')
-
-                # Mark this site as connected
-                connected_sites.append(site)
-
                 logger.info("Corridor established",
-                            corridor_cells=len(corridor), nodes_placed=len(nodes))
+                            site=site_name, target=target_name,
+                            corridor_cells=corridor_len, nodes_placed=len(nodes))
             else:
-                logger.warning("No corridor found",
-                               site=site.name, target=nearest_site.name)
+                logger.warning("No corridor found", site=site_name, target=target_name)
 
     logger.info("Hierarchical connectivity complete",
                 towers_placed=len(surface.towers))
@@ -139,26 +151,31 @@ def connect_priority1_mesh(
     pairs = list(itertools.combinations(priority1_sites, 2))
     logger.info("Connections to establish", total=len(pairs))
 
-    for i, (site1, site2) in enumerate(pairs, 1):
-        logger.info("Connecting pair",
-                    pair=f"{i}/{len(pairs)}",
-                    site1=site1.name, site2=site2.name)
-
-        # Find corridor
+    # Parallel — find corridors and place nodes concurrently
+    # (surface reads are safe; install_nodes is deferred to serial phase)
+    def _process_pair(args):
+        site1, site2 = args
         corridor = find_road_corridor(site1.h3_index, site2.h3_index, routing_graph)
+        if not corridor:
+            return None, site1.name, site2.name, 0
+        nodes = place_nodes_along_corridor(corridor, surface, cache)
+        return nodes, site1.name, site2.name, len(corridor)
 
-        if corridor:
-            # Place nodes along corridor
-            nodes = place_nodes_along_corridor(corridor, surface, cache)
+    results = []
+    with ThreadPoolExecutor() as executor:
+        futures = {executor.submit(_process_pair, (s1, s2)): (s1, s2) for s1, s2 in pairs}
+        for future in as_completed(futures):
+            results.append(future.result())
 
-            # Install towers
+    # Serial installation — fast, negligible time
+    for nodes, name1, name2, corridor_len in results:
+        if nodes:
             install_nodes(nodes, surface, source='priority_1')
-
             logger.info("Corridor established",
-                        corridor_cells=len(corridor), nodes_placed=len(nodes))
+                        site1=name1, site2=name2,
+                        corridor_cells=corridor_len, nodes_placed=len(nodes))
         else:
-            logger.warning("No corridor found",
-                           site1=site1.name, site2=site2.name)
+            logger.warning("No corridor found", site1=name1, site2=name2)
 
     logger.info("Priority 1 mesh complete",
                 towers_placed=len(surface.towers))

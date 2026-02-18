@@ -3,9 +3,9 @@ Fresnel zone clearance calculation with earth curvature.
 
 Based on h3_visibility_clearance.sql from the original implementation.
 """
-import math
 from typing import Dict, Tuple
 import h3
+import numpy as np
 
 import structlog
 
@@ -89,67 +89,59 @@ def compute_fresnel_clearance(
         if path_cells[-1] != h3_dst:
             path_cells.append(h3_dst)
 
-    # Precompute src/dst coordinates and direction vector for inlined fraction math
+    # Precompute src/dst coordinates and direction vector for fraction math
     src_lat, src_lon = src_cell.lat, src_cell.lon
     dst_lat, dst_lon = dst_cell.lat, dst_cell.lon
     _dx = dst_lon - src_lon
     _dy = dst_lat - src_lat
     _denom = _dx * _dx + _dy * _dy
 
-    # Calculate clearance at each intermediate point
-    worst_clearance = float('inf')
-    worst_d1 = total_distance / 2
-    worst_d2 = total_distance / 2
-
+    # Data-collection loop — unavoidable (dict lookups + H3 calls)
+    lats_list, lons_list, elevs_list = [], [], []
     for cell_h3 in path_cells:
-        # Get terrain elevation and cell coordinates
         if cell_h3 in cells:
             c = cells[cell_h3]
-            cell_lat, cell_lon = c.lat, c.lon
-            terrain_elevation = c.elevation
+            lats_list.append(c.lat)
+            lons_list.append(c.lon)
+            elevs_list.append(c.elevation)
         elif elevation_provider is not None:
             cell_lat, cell_lon = h3.cell_to_latlng(cell_h3)
-            terrain_elevation = elevation_provider.get_elevation(cell_lat, cell_lon)
-        else:
-            continue
+            lats_list.append(cell_lat)
+            lons_list.append(cell_lon)
+            elevs_list.append(elevation_provider.get_elevation(cell_lat, cell_lon))
 
-        # Inline fraction — dot-product projection, no Shapely, no function call
-        if _denom > 1e-12:
-            frac = ((cell_lon - src_lon) * _dx + (cell_lat - src_lat) * _dy) / _denom
-            frac = max(0.0, min(1.0, frac))
-        else:
-            frac = 0.0
+    if not lats_list:
+        return (float('inf'), total_distance, total_distance / 2, total_distance / 2)
 
-        # Distances to this point
-        d1 = total_distance * frac
-        d2 = total_distance * (1 - frac)
+    # Numpy-vectorized math — replaces per-cell Python arithmetic
+    lats = np.array(lats_list, dtype=np.float64)
+    lons = np.array(lons_list, dtype=np.float64)
+    elevs = np.array(elevs_list, dtype=np.float64)
 
-        # Ideal line altitude at this fraction
-        line_altitude = src_height + (dst_height - src_height) * frac
+    if _denom > 1e-12:
+        fracs = np.clip(
+            ((lons - src_lon) * _dx + (lats - src_lat) * _dy) / _denom,
+            0.0, 1.0
+        )
+    else:
+        fracs = np.zeros(len(lats))
 
-        # Earth curvature term
-        # Accounts for the fact that earth curves away from the line
-        earth_curvature = (d1 * d2) / (2 * effective_radius)
+    d1s = total_distance * fracs
+    d2s = total_distance - d1s
+    line_alts = src_height + (dst_height - src_height) * fracs
+    earth_curvs = (d1s * d2s) / (2 * effective_radius)
+    valid = (d1s > 0) & (d2s > 0)
+    fresnel_rs = np.where(
+        valid,
+        np.sqrt(np.maximum(wavelength * d1s * d2s / total_distance, 0.0)),
+        0.0
+    )
+    # Clearance = line altitude - (terrain + earth curvature + Fresnel zone)
+    clearances = line_alts - (elevs + earth_curvs + fresnel_rs)
 
-        # First Fresnel zone radius at this point
-        # F1 = sqrt(wavelength * d1 * d2 / total_distance)
-        if d1 > 0 and d2 > 0:
-            fresnel_radius = math.sqrt(wavelength * d1 * d2 / total_distance)
-        else:
-            fresnel_radius = 0.0
-
-        # Clearance = line altitude - (terrain + earth curvature + Fresnel zone)
-        # Positive clearance = clear path
-        # Negative clearance = obstructed
-        clearance = line_altitude - (terrain_elevation + earth_curvature + fresnel_radius)
-
-        # Track worst clearance
-        if clearance < worst_clearance:
-            worst_clearance = clearance
-            worst_d1 = d1
-            worst_d2 = d2
-
-    return (worst_clearance, total_distance, worst_d1, worst_d2)
+    worst_idx = int(np.argmin(clearances))
+    return (float(clearances[worst_idx]), total_distance,
+            float(d1s[worst_idx]), float(d2s[worst_idx]))
 
 
 def has_line_of_sight(
