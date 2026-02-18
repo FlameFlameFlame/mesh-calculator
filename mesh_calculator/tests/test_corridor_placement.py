@@ -102,22 +102,25 @@ class TestFallbackNextCellLOS(unittest.TestCase):
     def test_los_checked_for_immediate_neighbor(
         self, mock_distance, mock_los
     ):
-        """Verify has_los IS called for the immediate next cell (cell_1)."""
+        """Backward scan: farthest cell is checked first; immediate neighbor
+        is only checked when all farther cells fail LOS."""
         corridor = make_corridor(4)
         cells = make_cells(4)
         surface = MeshSurface(cells, self.config)
         mock_distance.return_value = 1000.0
-        mock_los.return_value = True
+        # Only the immediate next cell (cell_1) has LOS — all farther cells fail.
+        mock_los.side_effect = make_los_func({
+            ("cell_0", "cell_3"): False,
+            ("cell_0", "cell_2"): False,
+            ("cell_0", "cell_1"): True,
+            ("cell_1", "cell_3"): True,
+        })
 
-        place_nodes_along_corridor(corridor, surface)
+        nodes = place_nodes_along_corridor(corridor, surface)
 
-        # Check that has_los was called with (cell_0, cell_1, ...)
-        call_pairs = [
-            (call.args[0], call.args[1])
-            for call in mock_los.call_args_list
-        ]
-        self.assertIn(("cell_0", "cell_1"), call_pairs,
-            "has_los must be called for the immediate next cell")
+        # cell_1 must be chosen (it's the only hop with LOS from cell_0)
+        self.assertIn("cell_1", nodes,
+            "cell_1 must be placed when it is the only cell with LOS from cell_0")
 
 
 # ---------- Fix #3 ----------
