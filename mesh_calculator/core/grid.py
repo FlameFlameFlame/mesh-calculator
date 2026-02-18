@@ -108,9 +108,11 @@ def load_roads(roads_path: str) -> gpd.GeoDataFrame:
 def _sample_line_to_h3(line, resolution: int) -> Set[str]:
     """Sample points along a LineString and return H3 cells."""
     cells = set()
-    # Get edge length for this resolution to determine sample spacing
-    # Use a spacing smaller than cell edge length to avoid gaps
-    sample_spacing = 0.001  # ~110m at equator, enough for res 8 (~460m edge)
+    # Adapt sample spacing to H3 resolution so we never skip cells.
+    # Use half the average hex edge length (in degrees) as spacing.
+    edge_m = h3.average_hexagon_edge_length(resolution, unit='m')
+    # Convert meters to approximate degrees (1 deg ~ 111320 m)
+    sample_spacing = (edge_m * 0.5) / 111320.0
     length = line.length
     if length == 0:
         return cells

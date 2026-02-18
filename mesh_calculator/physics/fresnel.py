@@ -71,13 +71,23 @@ def compute_fresnel_clearance(
     # Effective earth radius (accounts for radio refraction)
     effective_radius = config.effective_earth_radius_m
 
-    # Sample all cells along the path
+    # Sample cells along the path, capped at FRESNEL_MAX_SAMPLES to avoid
+    # excessive elevation lookups at fine H3 resolutions (e.g. res 11 = 29m cells
+    # → 172 intermediate cells per 5km link). Terrain features blocking LOS are
+    # typically ≥100m wide, so subsampling to ~50 points is physically adequate.
+    _FRESNEL_MAX_SAMPLES = 50
     try:
         path_cells = list(h3.grid_path_cells(h3_src, h3_dst))
     except Exception as e:
         logger.warning("Failed to get path cells", error=str(e))
-        # Fallback: just check endpoints
         path_cells = [h3_src, h3_dst]
+
+    if len(path_cells) > _FRESNEL_MAX_SAMPLES:
+        step = max(1, len(path_cells) // _FRESNEL_MAX_SAMPLES)
+        path_cells = path_cells[::step]
+        # Always include the destination cell
+        if path_cells[-1] != h3_dst:
+            path_cells.append(h3_dst)
 
     # Calculate clearance at each intermediate point
     worst_clearance = float('inf')

@@ -15,6 +15,78 @@ from ..network.graph import MeshSurface
 logger = structlog.get_logger(__name__)
 
 
+def _walk_segment(
+    segment: List[str],
+    surface: MeshSurface,
+    cache: LOSCache = None
+) -> List[str]:
+    """
+    Walk a corridor segment and place towers ensuring LOS connectivity.
+    Returns list of H3 indices (including both endpoints).
+    """
+    if not segment or len(segment) < 2:
+        return list(segment)
+
+    config = surface.config
+    cells = surface.cells
+
+    from ..core.geometry import h3_distance
+
+    placed_nodes = [segment[0]]
+    current_h3 = segment[0]
+    current_idx = 0
+
+    while current_idx < len(segment) - 1:
+        furthest_visible_idx = None
+
+        # Find the farthest reachable index within max_visibility_m
+        max_reachable_idx = current_idx
+        for next_idx in range(current_idx + 1, len(segment)):
+            if h3_distance(current_h3, segment[next_idx]) > config.max_visibility_m:
+                break
+            max_reachable_idx = next_idx
+
+        # Scan backwards from farthest reachable cell — first LOS hit is furthest
+        # visible, so we stop immediately (O(1) vs O(n) forward scan)
+        for next_idx in range(max_reachable_idx, current_idx, -1):
+            next_h3 = segment[next_idx]
+            distance = h3_distance(current_h3, next_h3)
+
+            is_endpoint = (next_idx == len(segment) - 1)
+            if (not is_endpoint
+                    and config.tower_separation_m > 0
+                    and distance < config.tower_separation_m):
+                continue
+
+            if has_los(current_h3, next_h3, cells, config, cache,
+                       elevation_provider=surface.elevation_provider):
+                furthest_visible_idx = next_idx
+                break  # first hit from the far end = furthest visible cell
+
+        if furthest_visible_idx is not None:
+            furthest_h3 = segment[furthest_visible_idx]
+            if furthest_h3 not in placed_nodes:
+                placed_nodes.append(furthest_h3)
+            current_h3 = furthest_h3
+            current_idx = furthest_visible_idx
+        else:
+            # No visible cell — forced advance by one
+            current_idx += 1
+            current_h3 = segment[current_idx]
+            if current_h3 not in placed_nodes:
+                placed_nodes.append(current_h3)
+            logger.warning(
+                "No LOS to any forward cell, forced advance",
+                current=segment[current_idx - 1],
+                next=current_h3,
+            )
+
+    if segment[-1] not in placed_nodes:
+        placed_nodes.append(segment[-1])
+
+    return placed_nodes
+
+
 def place_nodes_along_corridor(
     corridor: List[str],
     surface: MeshSurface,
@@ -22,6 +94,11 @@ def place_nodes_along_corridor(
 ) -> List[str]:
     """
     Place nodes along a corridor ensuring LOS connectivity.
+
+    Existing towers that fall on the corridor are reused as free relay
+    points — the corridor is split at each such tower and each segment
+    is processed independently, so no new tower is placed where one
+    already exists.
 
     Args:
         corridor: List of H3 cell indices forming the corridor
@@ -34,67 +111,43 @@ def place_nodes_along_corridor(
     if not corridor or len(corridor) < 2:
         return []
 
-    config = surface.config
-    cells = surface.cells
-
     logger.debug("Placing nodes along corridor", corridor_cells=len(corridor))
 
-    # Start with first cell
-    placed_nodes = [corridor[0]]
-    current_h3 = corridor[0]
-    current_idx = 0
+    # Find existing towers on this corridor and use them as free waypoints.
+    # Split the corridor into segments separated by existing towers.
+    existing_tower_indices = [
+        i for i, h3_idx in enumerate(corridor)
+        if h3_idx in surface.tower_by_h3
+    ]
 
-    from ..core.geometry import h3_distance
+    if existing_tower_indices:
+        logger.debug("Reusing existing towers as waypoints",
+                     count=len(existing_tower_indices))
 
-    while current_idx < len(corridor) - 1:
-        furthest_visible_idx = None
+    # Build segment boundaries: [0, t1, t2, ..., last]
+    boundaries = [0] + existing_tower_indices
+    if boundaries[-1] != len(corridor) - 1:
+        boundaries.append(len(corridor) - 1)
 
-        # Scan ALL forward cells within max_visibility (Fix #2: start from +1,
-        # Fix #3: don't break on first LOS failure)
-        for next_idx in range(current_idx + 1, len(corridor)):
-            next_h3 = corridor[next_idx]
+    all_nodes: List[str] = []
+    seen: set = set()
 
-            # Check distance constraint
-            distance = h3_distance(current_h3, next_h3)
-            if distance > config.max_visibility_m:
-                break
+    for bi in range(len(boundaries) - 1):
+        seg_start = boundaries[bi]
+        seg_end = boundaries[bi + 1]
+        segment = corridor[seg_start:seg_end + 1]
+        seg_nodes = _walk_segment(segment, surface, cache)
+        for n in seg_nodes:
+            if n not in seen:
+                seen.add(n)
+                all_nodes.append(n)
 
-            # Skip cells too close (tower separation), unless endpoint
-            is_endpoint = (next_idx == len(corridor) - 1)
-            if (not is_endpoint
-                    and config.tower_separation_m > 0
-                    and distance < config.tower_separation_m):
-                continue
-
-            # Check LOS — continue scanning even if this cell fails
-            if has_los(current_h3, next_h3, cells, config, cache,
-                       elevation_provider=surface.elevation_provider):
-                furthest_visible_idx = next_idx
-
-        if furthest_visible_idx is not None:
-            # Place node at furthest visible cell
-            furthest_h3 = corridor[furthest_visible_idx]
-            if furthest_h3 not in placed_nodes:
-                placed_nodes.append(furthest_h3)
-            current_h3 = furthest_h3
-            current_idx = furthest_visible_idx
-        else:
-            # No visible cell — forced advance by one (Fix #4: log warning)
-            current_idx += 1
-            current_h3 = corridor[current_idx]
-            if current_h3 not in placed_nodes:
-                placed_nodes.append(current_h3)
-            logger.warning(
-                "No LOS to any forward cell, forced advance",
-                current=corridor[current_idx - 1],
-                next=current_h3,
-            )
-
-    # Safety net: ensure end node is included
-    if corridor[-1] not in placed_nodes:
-        placed_nodes.append(corridor[-1])
+    placed_nodes = all_nodes
 
     logger.debug("Nodes placed along corridor", count=len(placed_nodes))
+
+    config = surface.config
+    cells = surface.cells
 
     # Check if we need to optimize for node limit
     if len(placed_nodes) > config.max_nodes_per_road:
