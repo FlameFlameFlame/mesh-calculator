@@ -11,7 +11,7 @@ import structlog
 
 from ..core.grid import H3Cell
 from ..core.config import MeshConfig
-from ..core.geometry import h3_distance, calculate_line_fraction
+from ..core.geometry import h3_distance
 
 logger = structlog.get_logger(__name__)
 
@@ -89,23 +89,36 @@ def compute_fresnel_clearance(
         if path_cells[-1] != h3_dst:
             path_cells.append(h3_dst)
 
+    # Precompute src/dst coordinates and direction vector for inlined fraction math
+    src_lat, src_lon = src_cell.lat, src_cell.lon
+    dst_lat, dst_lon = dst_cell.lat, dst_cell.lon
+    _dx = dst_lon - src_lon
+    _dy = dst_lat - src_lat
+    _denom = _dx * _dx + _dy * _dy
+
     # Calculate clearance at each intermediate point
     worst_clearance = float('inf')
     worst_d1 = total_distance / 2
     worst_d2 = total_distance / 2
 
     for cell_h3 in path_cells:
-        # Get terrain elevation: from grid if available, else from provider
+        # Get terrain elevation and cell coordinates
         if cell_h3 in cells:
-            terrain_elevation = cells[cell_h3].elevation
+            c = cells[cell_h3]
+            cell_lat, cell_lon = c.lat, c.lon
+            terrain_elevation = c.elevation
         elif elevation_provider is not None:
             cell_lat, cell_lon = h3.cell_to_latlng(cell_h3)
             terrain_elevation = elevation_provider.get_elevation(cell_lat, cell_lon)
         else:
             continue
 
-        # Calculate fractional position along line
-        frac = calculate_line_fraction(cell_h3, h3_src, h3_dst)
+        # Inline fraction — dot-product projection, no Shapely, no function call
+        if _denom > 1e-12:
+            frac = ((cell_lon - src_lon) * _dx + (cell_lat - src_lat) * _dy) / _denom
+            frac = max(0.0, min(1.0, frac))
+        else:
+            frac = 0.0
 
         # Distances to this point
         d1 = total_distance * frac
