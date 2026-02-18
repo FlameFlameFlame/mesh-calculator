@@ -27,6 +27,7 @@ class ElevationProvider:
         Args:
             tif_path: Path to GeoTIFF elevation file
         """
+        self.dataset = None
         self.dataset = rasterio.open(tif_path)
         self.transform = self.dataset.transform
         self._cache = {}
@@ -108,7 +109,7 @@ class ElevationProvider:
 
     def close(self):
         """Close the rasterio dataset."""
-        if self.dataset:
+        if getattr(self, 'dataset', None):
             self.dataset.close()
 
     def __enter__(self):
