@@ -146,13 +146,19 @@ def snap_sites_to_roads(sites: List[Site], cells: Dict) -> None:
         logger.warning("No road cells available for site snapping")
         return
 
+    # Prefer cells outside city boundaries; fall back to all road cells if none remain
+    eligible_cells = [c for c in road_cells if not c.is_in_unfit_area] or road_cells
+    if len(eligible_cells) < len(road_cells):
+        logger.info("Site snapping: excluding unfit (city-boundary) cells",
+                    eligible=len(eligible_cells), total=len(road_cells))
+
     for site in sites:
         if site.h3_index in cells:
             continue
 
         best_cell = None
         best_dist = float('inf')
-        for cell in road_cells:
+        for cell in eligible_cells:
             dist = great_circle_distance(site.lat, site.lon, cell.lat, cell.lon)
             if dist < best_dist:
                 best_dist = dist
