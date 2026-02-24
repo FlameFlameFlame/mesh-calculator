@@ -42,18 +42,29 @@ def build_routing_graph(
 
     # Add edges between neighboring cells
     edges_added = 0
+    k_ring = getattr(config, 'routing_k_ring', 2)
     for h3_idx in road_cells:
-        # Get immediate neighbors (k=1 ring)
-        neighbors = h3.grid_ring(h3_idx, 1)
+        # Use grid_disk to find all cells within k_ring hops
+        neighbors = set(h3.grid_disk(h3_idx, k_ring)) - {h3_idx}
 
         for neighbor in neighbors:
             if neighbor in G.nodes():
-                # Calculate edge cost
+                # Scale cost by grid distance so k=2 connections cost more
+                grid_dist = h3.grid_distance(h3_idx, neighbor)
                 cost = calculate_edge_cost(h3_idx, neighbor, cells, roads_gdf, config)
-                G.add_edge(h3_idx, neighbor, cost=cost)
+                G.add_edge(h3_idx, neighbor, cost=cost * grid_dist)
                 edges_added += 1
 
     logger.debug("Routing graph edges added", count=edges_added)
+
+    num_components = nx.number_weakly_connected_components(G)
+    logger.info("Routing graph connectivity", components=num_components)
+    if num_components > 1:
+        logger.warning(
+            "Routing graph is disconnected — corridors between components will fail",
+            components=num_components,
+            hint="Check h3_resolution and road data coverage between sites",
+        )
 
     return G
 

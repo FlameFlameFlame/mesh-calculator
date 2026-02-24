@@ -23,6 +23,7 @@ class MeshConfig:
     # Network topology parameters
     hop_limit: int = 7  # Maximum hops within a cluster
     max_nodes_per_road: int = 10  # Maximum nodes per road segment
+    routing_k_ring: int = 2  # k-ring radius for routing graph neighbor search
 
     # Physical constants
     earth_radius_m: float = 6371000.0  # Earth radius in meters
@@ -65,6 +66,17 @@ class OutputPaths:
     coverage: str = "output/coverage.geojson"
     report: str = "output/report.json"
     visibility_edges: str = "output/visibility_edges.geojson"
+
+
+@dataclass
+class RouteSpec:
+    """Specification for a single user-chosen route to process."""
+
+    route_id: str
+    features: list  # GeoJSON feature dicts for this route
+    site1: dict     # {name, lat, lon}
+    site2: dict     # {name, lat, lon}
+    max_towers: int = 10  # per-route tower limit
 
 
 @dataclass
