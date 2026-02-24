@@ -36,6 +36,8 @@ def export_towers_geojson(surface: MeshSurface, output_path: str):
                 'tower_id': tower.tower_id,
                 'h3_index': tower.h3_index,
                 'source': tower.source,
+                'route_id': tower.source,
+                'city_link': getattr(tower, 'city_link', False),
                 'lat': tower.lat,
                 'lon': tower.lon
             }

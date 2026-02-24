@@ -60,6 +60,7 @@ class H3Cell:
     path_loss: Optional[float] = None
     visible_tower_count: int = 0
     distance_to_closest_tower: float = float('inf')
+    closest_tower_id: Optional[int] = None
 
 
 def load_boundary(boundary_path: str) -> Polygon:
@@ -160,7 +161,8 @@ def generate_road_grid(
     boundary: Polygon,
     roads_gdf: gpd.GeoDataFrame,
     elevation_provider: ElevationProvider,
-    config: MeshConfig
+    config: MeshConfig,
+    city_polygons: list = None,
 ) -> Dict[str, H3Cell]:
     """
     Generate H3 grid containing only cells within boundary and on roads.
@@ -170,6 +172,9 @@ def generate_road_grid(
         roads_gdf: GeoDataFrame with road network
         elevation_provider: Elevation data provider
         config: Mesh configuration
+        city_polygons: Optional list of Shapely polygons representing city
+            boundaries. Cells whose centroid falls inside any of these
+            polygons will have ``is_in_unfit_area`` set to True.
 
     Returns:
         Dictionary mapping H3 indices to H3Cell objects
@@ -211,6 +216,18 @@ def generate_road_grid(
         if (i + 1) % 1000 == 0:
             logger.debug("Cell processing progress",
                          processed=i + 1, total=len(valid_cells))
+
+    # Mark cells that fall inside city polygons as unfit for site snapping
+    if city_polygons:
+        from shapely.geometry import Point
+        unfit_count = 0
+        for cell in cells_dict.values():
+            pt = Point(cell.lon, cell.lat)
+            if any(pt.within(poly) for poly in city_polygons):
+                cell.is_in_unfit_area = True
+                unfit_count += 1
+        logger.info("Cells marked as unfit (inside city boundaries)",
+                    count=unfit_count)
 
     logger.info("Grid generation complete", cells=len(cells_dict))
     return cells_dict

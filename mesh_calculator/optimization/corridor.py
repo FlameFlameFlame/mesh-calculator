@@ -91,6 +91,60 @@ def _walk_segment(
     return placed_nodes
 
 
+def _fill_visibility_gaps(
+    selected: List[str],
+    candidates: List[str],
+    max_vis_m: float,
+) -> List[str]:
+    """
+    Insert relay nodes from ``candidates`` to fill any gap between consecutive
+    selected nodes that exceeds ``max_vis_m``.
+
+    Uses great-circle distance only (no LOS check) as a lightweight
+    connectivity guarantee — the goal is to ensure no two consecutive towers
+    are further apart than the radio horizon, so the downstream LOS step has
+    a chance to build edges.
+
+    Args:
+        selected: Ordered list of H3 indices to check.
+        candidates: Pool of H3 indices eligible for insertion.
+        max_vis_m: Maximum allowed distance between consecutive nodes (metres).
+
+    Returns:
+        New ordered list with gap-filling nodes inserted where needed.
+    """
+    from ..core.geometry import h3_distance as _dist
+
+    result = list(selected)
+    changed = True
+    while changed:
+        changed = False
+        for i in range(len(result) - 1):
+            gap = _dist(result[i], result[i + 1])
+            if gap <= max_vis_m:
+                continue
+            # Find the candidate that minimises the larger of the two sub-gaps
+            pool = [n for n in candidates if n not in result]
+            if not pool:
+                break
+            best = min(
+                pool,
+                key=lambda n: max(_dist(result[i], n), _dist(n, result[i + 1])),
+            )
+            sub_gap = max(_dist(result[i], best), _dist(best, result[i + 1]))
+            if sub_gap <= max_vis_m:
+                result.insert(i + 1, best)
+                logger.warning(
+                    "Inserted gap-fill relay node",
+                    gap_m=round(gap),
+                    sub_gap_m=round(sub_gap),
+                    node=best,
+                )
+                changed = True
+                break  # restart scan after insertion
+    return result
+
+
 def place_nodes_along_corridor(
     corridor: List[str],
     surface: MeshSurface,
@@ -146,12 +200,12 @@ def place_nodes_along_corridor(
                 seen.add(n)
                 all_nodes.append(n)
 
-    placed_nodes = all_nodes
-
-    logger.debug("Nodes placed along corridor", count=len(placed_nodes))
+    logger.debug("Nodes placed along corridor", count=len(all_nodes))
 
     config = surface.config
     cells = surface.cells
+
+    placed_nodes = all_nodes
 
     # Check if we need to optimize for node limit
     if len(placed_nodes) > config.max_nodes_per_road:
@@ -162,6 +216,12 @@ def place_nodes_along_corridor(
             elevation_provider=surface.elevation_provider,
         )
         logger.debug("After optimization", count=len(placed_nodes))
+
+    # Gap-fill: ensure no consecutive pair exceeds max_visibility_m
+    pre_fill_count = len(placed_nodes)
+    placed_nodes = _fill_visibility_gaps(placed_nodes, all_nodes, config.max_visibility_m)
+    if len(placed_nodes) > pre_fill_count:
+        logger.debug("After gap-fill", count=len(placed_nodes))
 
     # Validate hop limit
     hop_count = len(placed_nodes) - 1

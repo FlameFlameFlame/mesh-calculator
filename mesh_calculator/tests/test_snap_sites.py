@@ -65,6 +65,45 @@ class TestSnapSitesToRoads(unittest.TestCase):
 
         self.assertEqual(site.h3_index, 'near_cell')
 
+    def test_unfit_cells_excluded_from_snapping(self):
+        """Site should not snap to a cell marked is_in_unfit_area when a fit cell exists."""
+        cells = {
+            'city_cell': H3Cell(
+                h3_index='city_cell', lat=40.001, lon=44.001,
+                elevation=100.0, has_road=True, is_in_boundary=True,
+                is_in_unfit_area=True,
+            ),
+            'road_cell': H3Cell(
+                h3_index='road_cell', lat=40.05, lon=44.05,
+                elevation=100.0, has_road=True, is_in_boundary=True,
+                is_in_unfit_area=False,
+            ),
+        }
+        site = Site(name='Gyumri', lat=40.0, lon=44.0, priority=1,
+                    h3_index='off_road')
+
+        snap_sites_to_roads([site], cells)
+
+        self.assertEqual(site.h3_index, 'road_cell',
+                         "Site should snap to fit cell, not the city-boundary cell")
+
+    def test_falls_back_to_unfit_when_no_fit_cells(self):
+        """If all road cells are unfit, fall back to snapping among all road cells."""
+        cells = {
+            'city_cell': H3Cell(
+                h3_index='city_cell', lat=40.001, lon=44.001,
+                elevation=100.0, has_road=True, is_in_boundary=True,
+                is_in_unfit_area=True,
+            ),
+        }
+        site = Site(name='Isolated', lat=40.0, lon=44.0, priority=1,
+                    h3_index='off_road')
+
+        snap_sites_to_roads([site], cells)
+
+        self.assertEqual(site.h3_index, 'city_cell',
+                         "Should fall back to unfit cell when no fit alternative exists")
+
     def test_no_road_cells_leaves_unchanged(self):
         """If no road cells exist, log warning and leave h3_index as-is."""
         cells = {}

@@ -79,10 +79,20 @@ def main(config: str, output: str, verbose: bool, quiet: bool):
         elevation_provider = ElevationProvider(cfg.inputs.elevation)
     logger.info("Elevation provider initialized")
 
+    # Load city boundary polygons (optional)
+    city_polygons = []
+    if cfg.inputs and cfg.inputs.city_boundaries:
+        import geopandas as gpd
+        logger.info("Loading city boundaries", path=cfg.inputs.city_boundaries)
+        cb_gdf = gpd.read_file(cfg.inputs.city_boundaries)
+        city_polygons = list(cb_gdf.geometry)
+        logger.info("City boundaries loaded", count=len(city_polygons))
+
     # Generate H3 grid (only cells with roads)
     logger.info("[4/9] Generating H3 grid")
     with PerfTimer("generate_h3_grid"):
-        cells = generate_road_grid(boundary, roads_gdf, elevation_provider, cfg.parameters)
+        cells = generate_road_grid(boundary, roads_gdf, elevation_provider,
+                                   cfg.parameters, city_polygons=city_polygons)
 
     # Snap sites to nearest road cell
     logger.info("[4.5/9] Snapping sites to road cells")

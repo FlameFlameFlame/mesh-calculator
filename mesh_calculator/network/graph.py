@@ -39,6 +39,7 @@ class Tower:
     lat: float
     lon: float
     source: str
+    city_link: bool = False
 
 
 class VisibilityGraph:
@@ -346,14 +347,18 @@ class MeshSurface:
                 elevation_provider=elev,
             )
             if result.is_visible:
-                return (ci, result.distance_m,
+                return (ci, ti, result.distance_m,
                         result.clearance_m, result.path_loss_db)
             return None
 
         # Accumulate per-cell results
-        cell_results = {}  # ci → (visible_count, best_dist, best_clear, best_ploss)
+        # ci → [visible_count, best_dist, best_clear, best_ploss, best_tower_id]
+        cell_results = {}
         for ci in cells_with_own_tower:
-            cell_results[ci] = [1, 0.0, 0.0, 0.0]
+            cell = cell_list[ci]
+            own_tower = self.tower_by_h3.get(cell.h3_index)
+            own_id = own_tower.tower_id if own_tower else None
+            cell_results[ci] = [1, 0.0, 0.0, 0.0, own_id]
 
         max_workers = os.cpu_count() or 4
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -362,24 +367,26 @@ class MeshSurface:
                 res = future.result()
                 if res is None:
                     continue
-                ci, dist_m, clear_m, ploss_db = res
+                ci, ti, dist_m, clear_m, ploss_db = res
                 if ci not in cell_results:
-                    cell_results[ci] = [0, float('inf'), None, None]
+                    cell_results[ci] = [0, float('inf'), None, None, None]
                 entry = cell_results[ci]
                 entry[0] += 1
                 if dist_m < entry[1]:
                     entry[1] = dist_m
                     entry[2] = clear_m
                     entry[3] = ploss_db
+                    entry[4] = tower_list[ti].tower_id
 
         # Apply results to cells
         updated = 0
-        for ci, (count, dist, clearance, ploss) in cell_results.items():
+        for ci, (count, dist, clearance, ploss, closest_tid) in cell_results.items():
             cell = cell_list[ci]
             cell.visible_tower_count = count
             cell.distance_to_closest_tower = dist
             cell.clearance = clearance
             cell.path_loss = ploss
+            cell.closest_tower_id = closest_tid
             updated += 1
 
         logger.info("Cell coverage computed",
