@@ -1,6 +1,7 @@
 """
 Elevation data handling with caching for mesh calculator.
 """
+import threading
 from typing import Optional, Tuple
 import rasterio
 from rasterio.transform import rowcol
@@ -32,6 +33,7 @@ class ElevationProvider:
         self.transform = self.dataset.transform
         self._cache = {}
         self._data = None  # Lazy-load full array if needed
+        self._lock = threading.Lock()
 
     def get_elevation(self, lat: float, lon: float) -> float:
         """
@@ -55,9 +57,11 @@ class ElevationProvider:
                 # Check bounds
                 if (0 <= row < self.dataset.height and
                     0 <= col < self.dataset.width):
-                    # Read single pixel value
+                    # Read single pixel value — rasterio datasets are not
+                    # thread-safe, so serialize reads with a lock.
                     window = rasterio.windows.Window(col, row, 1, 1)
-                    elevation = self.dataset.read(1, window=window)[0, 0]
+                    with self._lock:
+                        elevation = self.dataset.read(1, window=window)[0, 0]
 
                     # Handle nodata values
                     if self.dataset.nodata is not None and elevation == self.dataset.nodata:
