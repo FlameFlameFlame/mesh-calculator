@@ -167,17 +167,18 @@ class TestChainConnectivity(unittest.TestCase):
                 f"LOS gap between consecutive nodes {result[i]} and {result[i+1]}")
 
     @patch('mesh_calculator.optimization.corridor.has_los')
-    def test_all_nodes_kept_when_none_removable(self, mock_los):
-        """When every node is a critical bridge, can't reduce — keep all.
+    def test_force_reduces_to_limit_when_no_los_safe_removal(self, mock_los):
+        """When every node is a critical bridge, force-remove to reach the hard limit.
 
         5 nodes → target 3. Only consecutive pairs have LOS.
-        No middle node can be removed without breaking chain.
+        No middle node can be safely removed without breaking the LOS chain,
+        so the lowest-scored nodes are removed unconditionally.
         """
         elevations = [100, 200, 100, 300, 100]
         cells = make_cells_with_elevations(elevations)
         nodes = [f"cell_{i}" for i in range(5)]
 
-        # Only consecutive pairs have LOS
+        # Only consecutive pairs have LOS — no skip-one LOS
         los_pairs = {
             ("cell_0", "cell_1"): True,
             ("cell_1", "cell_2"): True,
@@ -190,18 +191,12 @@ class TestChainConnectivity(unittest.TestCase):
             nodes, max_nodes=3, cells=cells, config=self.config
         )
 
-        # Can't remove any → all 5 nodes returned (over limit but connected)
-        self.assertEqual(len(result), 5,
-            "Can't reduce when every node is a critical bridge — keep all")
-
-        # Chain must still be connected
-        for i in range(len(result) - 1):
-            pair_los = los_pairs.get(
-                (result[i], result[i+1]),
-                los_pairs.get((result[i+1], result[i]), False)
-            )
-            self.assertTrue(pair_los,
-                f"Chain broken between {result[i]} and {result[i+1]}")
+        # Hard limit must be enforced even though LOS chain breaks
+        self.assertEqual(len(result), 3,
+            "Force-removal must reduce to the hard max_nodes limit")
+        # Endpoints are always preserved
+        self.assertEqual(result[0], "cell_0", "Start node must be kept")
+        self.assertEqual(result[-1], "cell_4", "End node must be kept")
 
     @patch('mesh_calculator.optimization.corridor.has_los')
     def test_consecutive_pairs_always_have_los(self, mock_los):

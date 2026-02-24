@@ -251,11 +251,27 @@ def optimize_node_selection(
             logger.debug("Removed node during optimization",
                          node=removed, score=best_remove_score)
         else:
-            # Can't remove any more without breaking connectivity
-            logger.warning(
-                "Cannot reduce to target without breaking connectivity",
-                current=len(result), target=max_nodes)
-            break
+            # No LOS-preserving removal possible; force-remove the
+            # lowest-scored intermediate node to respect the hard limit.
+            best_force_idx = None
+            best_force_score = float('inf')
+            for i in range(1, len(result) - 1):
+                node = result[i]
+                s = node_scores.get(node, 0.0)
+                if s < best_force_score:
+                    best_force_score = s
+                    best_force_idx = i
+
+            if best_force_idx is not None:
+                removed = result.pop(best_force_idx)
+                logger.warning(
+                    "Force-removed node to reach tower limit (no LOS-safe removal available)",
+                    node=removed, score=best_force_score,
+                    current=len(result), target=max_nodes,
+                )
+            else:
+                # Only endpoints remain — can't reduce further
+                break
 
     return result
 
