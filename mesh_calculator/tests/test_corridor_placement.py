@@ -1,16 +1,22 @@
 """
-Tests for corridor placement algorithm fixes.
+Tests for corridor placement algorithm (MaxMin DP).
 
-Fix #2: Fallback next-cell in corridor is accepted without LOS verification.
-        The scan loop starts at current_idx+2, leaving current_idx+1 unchecked.
-Fix #3: Greedy scan breaks at first LOS failure instead of scanning further.
-Fix #4: Final endpoint is forced without LOS check to last placed node.
+The greedy _walk_segment algorithm has been replaced with a MaxMin Bottleneck
+Path DP that finds the globally optimal tower chain maximising minimum Fresnel
+clearance.  These tests verify the DP's core behaviours:
+
+  - Skips cells that have no LOS to the current tower
+  - Finds the furthest/best visible cell (not just the immediate neighbour)
+  - Always includes both corridor endpoints
+  - Falls back to peak-based placement when no feasible chain exists
+  - Short corridors (2 cells) are handled correctly
 """
 import unittest
-from unittest.mock import patch, Mock
+from unittest.mock import patch
 
 from ..core.config import MeshConfig
 from ..core.grid import H3Cell
+from ..data.cache import LOSResult
 from ..network.graph import MeshSurface
 from ..optimization.corridor import place_nodes_along_corridor
 
@@ -35,23 +41,29 @@ def make_corridor(n):
     return [f"cell_{i}" for i in range(n)]
 
 
-def make_los_func(los_pairs):
-    """Create a has_los mock function from a dict of (src, dst) → bool."""
-    def los_check(src, dst, cells_arg, config, cache=None,
-                  elevation_provider=None):
-        return los_pairs.get((src, dst), False)
-    return los_check
-
-
-# ---------- Fix #2 ----------
-
-class TestFallbackNextCellLOS(unittest.TestCase):
-    """Fix #2: The immediate next cell must be LOS-checked, not assumed visible.
-
-    Bug: old code sets corridor[current+1] as the default "furthest visible"
-    and starts the scan at current+2. If the first scan cell has no LOS, it
-    breaks and falls back to current+1 — which was never LOS-checked.
+def make_compute_los_func(los_pairs, default_visible=False, clearance=10.0):
     """
+    Return a compute_los mock that reads visibility from los_pairs.
+
+    Keys are (src, dst) tuples; value is True/False.  Pairs not in the dict
+    default to default_visible.  Always returns a LOSResult.
+    """
+    def _compute_los(src, dst, cells_arg, config, cache=None,
+                     elevation_provider=None):
+        is_vis = los_pairs.get((src, dst), default_visible)
+        return LOSResult(
+            clearance_m=clearance if is_vis else -999.0,
+            path_loss_db=50.0,
+            distance_m=1000.0,
+            is_visible=is_vis,
+        )
+    return _compute_los
+
+
+# ---------- DP: non-adjacent LOS ----------
+
+class TestDPNonAdjacentLOS(unittest.TestCase):
+    """DP correctly connects through the best visible cell, skipping others."""
 
     def setUp(self):
         self.config = MeshConfig(
@@ -61,28 +73,25 @@ class TestFallbackNextCellLOS(unittest.TestCase):
             tower_separation_m=0.0,
         )
 
-    @patch('mesh_calculator.optimization.corridor.has_los')
+    @patch('mesh_calculator.optimization.corridor.compute_los')
     @patch('mesh_calculator.core.geometry.h3_distance')
-    def test_fallback_skipped_when_further_cell_has_los(
-        self, mock_distance, mock_los
+    def test_skips_nonvisible_finds_further_visible(
+        self, mock_distance, mock_compute_los
     ):
-        """When cell_1 has no LOS but cell_3 does, place at cell_3 (not cell_1).
+        """
+        When intermediate cells have no LOS but a further cell does,
+        the DP should select the further cell, not fall back to adjacent.
 
         Corridor: [0, 1, 2, 3, 4]
-        - 0->1: no LOS
-        - 0->2: no LOS (in old code, this is first scan cell, causes break)
-        - 0->3: LOS
-        - 0->4: no LOS
-
-        Old behavior: break at 0->2, fall back to cell_1 (unchecked) → places cell_1
-        Fixed: scans 0->1 (fail), 0->2 (fail), 0->3 (LOS!) → places cell_3
+        LOS: 0→3 only (not 0→1, 0→2, 0→4); 3→4.
+        Expected: [cell_0, cell_3, cell_4]  (cell_1 and cell_2 absent)
         """
         corridor = make_corridor(5)
         cells = make_cells(5)
         surface = MeshSurface(cells, self.config)
         mock_distance.return_value = 1000.0
 
-        mock_los.side_effect = make_los_func({
+        mock_compute_los.side_effect = make_compute_los_func({
             ("cell_0", "cell_1"): False,
             ("cell_0", "cell_2"): False,
             ("cell_0", "cell_3"): True,
@@ -93,74 +102,60 @@ class TestFallbackNextCellLOS(unittest.TestCase):
         nodes = place_nodes_along_corridor(corridor, surface)
 
         self.assertNotIn("cell_1", nodes,
-            "cell_1 should NOT be placed — it has no LOS from cell_0")
+            "cell_1 has no LOS from cell_0 and should be absent")
+        self.assertNotIn("cell_2", nodes,
+            "cell_2 has no LOS from cell_0 and should be absent")
         self.assertIn("cell_3", nodes,
-            "cell_3 should be placed — it has LOS from cell_0")
+            "cell_3 has LOS from cell_0 and should be selected")
 
-    @patch('mesh_calculator.optimization.corridor.has_los')
+    @patch('mesh_calculator.optimization.corridor.compute_los')
     @patch('mesh_calculator.core.geometry.h3_distance')
-    def test_los_checked_for_immediate_neighbor(
-        self, mock_distance, mock_los
+    def test_immediate_neighbour_chosen_when_only_option(
+        self, mock_distance, mock_compute_los
     ):
-        """Backward scan: farthest cell is checked first; immediate neighbor
-        is only checked when all farther cells fail LOS."""
+        """
+        When the immediate neighbour is the only cell with LOS, it is chosen.
+
+        Corridor: [0, 1, 2, 3]
+        LOS: 0→1 only; 1→3.
+        """
         corridor = make_corridor(4)
         cells = make_cells(4)
         surface = MeshSurface(cells, self.config)
         mock_distance.return_value = 1000.0
-        # Only the immediate next cell (cell_1) has LOS — all farther cells fail.
-        mock_los.side_effect = make_los_func({
-            ("cell_0", "cell_3"): False,
-            ("cell_0", "cell_2"): False,
+
+        mock_compute_los.side_effect = make_compute_los_func({
             ("cell_0", "cell_1"): True,
+            ("cell_0", "cell_2"): False,
+            ("cell_0", "cell_3"): False,
             ("cell_1", "cell_3"): True,
         })
 
         nodes = place_nodes_along_corridor(corridor, surface)
 
-        # cell_1 must be chosen (it's the only hop with LOS from cell_0)
         self.assertIn("cell_1", nodes,
-            "cell_1 must be placed when it is the only cell with LOS from cell_0")
+            "cell_1 is the only cell with LOS from cell_0 and must be chosen")
 
-
-# ---------- Fix #3 ----------
-
-class TestGreedyScanContinuesPastFailure(unittest.TestCase):
-    """Fix #3: Don't break on first LOS failure — scan further along corridor.
-
-    Bug: `else: break` stops scanning when a cell has no LOS. But a cell
-    further along might be on higher ground with clear LOS.
-    """
-
-    def setUp(self):
-        self.config = MeshConfig(
-            mast_height_m=10.0,
-            max_visibility_m=70000.0,
-            max_nodes_per_road=100,
-            tower_separation_m=0.0,
-        )
-
-    @patch('mesh_calculator.optimization.corridor.has_los')
+    @patch('mesh_calculator.optimization.corridor.compute_los')
     @patch('mesh_calculator.core.geometry.h3_distance')
-    def test_scan_past_valley_to_hilltop(self, mock_distance, mock_los):
-        """Valley at cell_3 blocks LOS, but hilltop at cell_4 is visible.
+    def test_finds_peak_past_valley(self, mock_distance, mock_compute_los):
+        """
+        DP should find a peak cell past a valley (no-LOS cell).
 
         Corridor: [0, 1, 2, 3, 4, 5]
-        - 0->1: LOS, 0->2: LOS, 0->3: no LOS (valley), 0->4: LOS (hilltop)
-
-        Old behavior: places at cell_2, breaks at cell_3 (never checks cell_4)
-        Fixed: continues scanning, finds cell_4, places there
+        LOS: 0→1, 0→2, 0→4 (hilltop, past valley 3); 4→5.
+        Expected: cell_4 chosen, not cell_2 (cell_4 is further and visible).
         """
         corridor = make_corridor(6)
         cells = make_cells(6)
         surface = MeshSurface(cells, self.config)
         mock_distance.return_value = 1000.0
 
-        mock_los.side_effect = make_los_func({
+        mock_compute_los.side_effect = make_compute_los_func({
             ("cell_0", "cell_1"): True,
             ("cell_0", "cell_2"): True,
-            ("cell_0", "cell_3"): False,  # valley
-            ("cell_0", "cell_4"): True,   # hilltop
+            ("cell_0", "cell_3"): False,   # valley
+            ("cell_0", "cell_4"): True,    # hilltop
             ("cell_0", "cell_5"): False,
             ("cell_4", "cell_5"): True,
         })
@@ -168,30 +163,31 @@ class TestGreedyScanContinuesPastFailure(unittest.TestCase):
         nodes = place_nodes_along_corridor(corridor, surface)
 
         self.assertIn("cell_4", nodes,
-            "Should scan past valley (cell_3) and find hilltop (cell_4)")
+            "Hilltop cell_4 should be selected; it has LOS from cell_0")
         self.assertNotIn("cell_2", nodes,
-            "cell_2 should be skipped — cell_4 is further and visible")
+            "cell_2 should be skipped — cell_4 is a further, visible relay")
 
-    @patch('mesh_calculator.optimization.corridor.has_los')
+    @patch('mesh_calculator.optimization.corridor.compute_los')
     @patch('mesh_calculator.core.geometry.h3_distance')
-    def test_multiple_gaps_scanned_through(self, mock_distance, mock_los):
-        """Multiple LOS failures between visible cells should be scanned through.
+    def test_scans_through_multiple_gaps(self, mock_distance, mock_compute_los):
+        """
+        DP finds the best relay even when several cells between them lack LOS.
 
-        Corridor: [0, 1, 2, 3, 4, 5, 6, 7]
-        - 0->1: LOS, 0->2: no, 0->3: no, 0->4: LOS, 0->5: no, 0->6: LOS
+        Corridor: [0..7]; 0→1, 0→4, 0→6 (furthest); 6→7.
+        Expected: cell_6 chosen over cell_4.
         """
         corridor = make_corridor(8)
         cells = make_cells(8)
         surface = MeshSurface(cells, self.config)
         mock_distance.return_value = 1000.0
 
-        mock_los.side_effect = make_los_func({
+        mock_compute_los.side_effect = make_compute_los_func({
             ("cell_0", "cell_1"): True,
             ("cell_0", "cell_2"): False,
             ("cell_0", "cell_3"): False,
             ("cell_0", "cell_4"): True,
             ("cell_0", "cell_5"): False,
-            ("cell_0", "cell_6"): True,   # Furthest visible from 0
+            ("cell_0", "cell_6"): True,    # furthest visible from cell_0
             ("cell_0", "cell_7"): False,
             ("cell_6", "cell_7"): True,
         })
@@ -199,42 +195,46 @@ class TestGreedyScanContinuesPastFailure(unittest.TestCase):
         nodes = place_nodes_along_corridor(corridor, surface)
 
         self.assertIn("cell_6", nodes,
-            "Should find cell_6 by scanning through multiple gaps")
+            "cell_6 (furthest visible from cell_0) should be selected")
         self.assertNotIn("cell_4", nodes,
-            "cell_4 should be skipped — cell_6 is further and visible")
+            "cell_4 should be skipped — cell_6 provides a better relay")
 
-    @patch('mesh_calculator.optimization.corridor.has_los')
+    @patch('mesh_calculator.optimization.corridor.compute_los')
     @patch('mesh_calculator.core.geometry.h3_distance')
-    def test_distance_limit_still_stops_scan(self, mock_distance, mock_los):
-        """Scan should stop when distance exceeds max_visibility_m."""
+    def test_distance_limit_forces_intermediate_nodes(
+        self, mock_distance, mock_compute_los
+    ):
+        """
+        When distance between adjacent reachable nodes exceeds max_visibility_m,
+        intermediate nodes are placed.
+
+        6 cells at 20 km spacing; max_visibility_m=70 km → can see ≤3 hops.
+        """
         corridor = make_corridor(6)
         cells = make_cells(6)
         surface = MeshSurface(cells, self.config)
 
         def distance_fn(src, dst):
-            src_idx = int(src.split("_")[1])
-            dst_idx = int(dst.split("_")[1])
-            return abs(dst_idx - src_idx) * 20000.0  # 20km per hop
+            si = int(src.split("_")[1])
+            di = int(dst.split("_")[1])
+            return abs(di - si) * 20000.0
 
         mock_distance.side_effect = distance_fn
-        mock_los.return_value = True
+        mock_compute_los.return_value = LOSResult(
+            clearance_m=10.0, path_loss_db=50.0,
+            distance_m=1000.0, is_visible=True,
+        )
 
         nodes = place_nodes_along_corridor(corridor, surface)
 
-        # 20km/hop, 70km max → can see 3 hops ahead → need intermediate nodes
         self.assertGreater(len(nodes), 2,
-            "Distance limit should force intermediate node placement")
+            "Distance limit forces at least one intermediate node")
 
 
-# ---------- Fix #4 ----------
+# ---------- DP: endpoints ----------
 
-class TestEndpointLOSVerification(unittest.TestCase):
-    """Fix #4: Verify LOS to the corridor endpoint.
-
-    With fixes #2 and #3, the scan loop naturally reaches the endpoint.
-    This tests that the endpoint is properly connected through the scan
-    rather than blindly appended.
-    """
+class TestEndpointHandling(unittest.TestCase):
+    """Both corridor endpoints are always included."""
 
     def setUp(self):
         self.config = MeshConfig(
@@ -244,81 +244,67 @@ class TestEndpointLOSVerification(unittest.TestCase):
             tower_separation_m=0.0,
         )
 
-    @patch('mesh_calculator.optimization.corridor.has_los')
+    @patch('mesh_calculator.optimization.corridor.compute_los')
     @patch('mesh_calculator.core.geometry.h3_distance')
-    def test_endpoint_reached_through_bridge_node(self, mock_distance, mock_los):
-        """When last placed can't see endpoint, scan finds a bridge.
-
-        Corridor: [0, 1, 2, 3, 4, 5, 6, 7]
-        - 0 sees up to 3 → place 3
-        - 3 can't see 4,5,6,7 → forced advance to 4
-        - 4 sees 6 → place 6
-        - 6 sees 7 → place 7
-
-        Without fix #3: from cell_3, would break at cell_4 (no LOS),
-        and the loop would force advance one cell at a time without
-        finding the bridge at cell_6.
-        """
-        corridor = make_corridor(8)
-        cells = make_cells(8)
-        surface = MeshSurface(cells, self.config)
-        mock_distance.return_value = 1000.0
-
-        mock_los.side_effect = make_los_func({
-            ("cell_0", "cell_1"): True,
-            ("cell_0", "cell_2"): True,
-            ("cell_0", "cell_3"): True,
-            ("cell_0", "cell_4"): False,
-            ("cell_0", "cell_5"): False,
-            ("cell_0", "cell_6"): False,
-            ("cell_0", "cell_7"): False,
-            ("cell_3", "cell_4"): False,
-            ("cell_3", "cell_5"): False,
-            ("cell_3", "cell_6"): False,
-            ("cell_3", "cell_7"): False,
-            # After forced advance to 4:
-            ("cell_4", "cell_5"): False,
-            ("cell_4", "cell_6"): True,   # Bridge!
-            ("cell_4", "cell_7"): False,
-            ("cell_6", "cell_7"): True,   # Bridge to endpoint
-        })
-
-        nodes = place_nodes_along_corridor(corridor, surface)
-
-        self.assertIn("cell_6", nodes,
-            "Bridge node cell_6 should be found after forced advance")
-        self.assertEqual(nodes[-1], "cell_7",
-            "Endpoint should be the last placed node")
-        # The link 6->7 should have LOS
-        self.assertIn("cell_7", nodes)
-
-    @patch('mesh_calculator.optimization.corridor.has_los')
-    @patch('mesh_calculator.core.geometry.h3_distance')
-    def test_endpoint_included_when_all_los_clear(self, mock_distance, mock_los):
-        """When all LOS is clear, endpoint should be included."""
+    def test_endpoints_included_all_los_clear(
+        self, mock_distance, mock_compute_los
+    ):
+        """When all LOS is clear, both endpoints are in the result."""
         corridor = make_corridor(5)
         cells = make_cells(5)
         surface = MeshSurface(cells, self.config)
         mock_distance.return_value = 1000.0
-        mock_los.return_value = True
+        mock_compute_los.return_value = LOSResult(
+            clearance_m=10.0, path_loss_db=50.0,
+            distance_m=1000.0, is_visible=True,
+        )
 
         nodes = place_nodes_along_corridor(corridor, surface)
 
         self.assertEqual(nodes[0], "cell_0")
         self.assertEqual(nodes[-1], "cell_4")
 
-    @patch('mesh_calculator.optimization.corridor.has_los')
+    @patch('mesh_calculator.optimization.corridor.compute_los')
     @patch('mesh_calculator.core.geometry.h3_distance')
-    def test_short_corridor_still_works(self, mock_distance, mock_los):
-        """Corridor of 2 cells should produce both cells."""
+    def test_short_corridor_both_cells_returned(
+        self, mock_distance, mock_compute_los
+    ):
+        """A 2-cell corridor returns exactly both cells."""
         corridor = make_corridor(2)
         cells = make_cells(2)
         surface = MeshSurface(cells, self.config)
         mock_distance.return_value = 1000.0
-        mock_los.return_value = True
+        mock_compute_los.return_value = LOSResult(
+            clearance_m=10.0, path_loss_db=50.0,
+            distance_m=1000.0, is_visible=True,
+        )
 
         nodes = place_nodes_along_corridor(corridor, surface)
+
         self.assertEqual(nodes, ["cell_0", "cell_1"])
+
+    @patch('mesh_calculator.optimization.corridor.compute_los')
+    @patch('mesh_calculator.core.geometry.h3_distance')
+    def test_fallback_includes_endpoints_when_no_los(
+        self, mock_distance, mock_compute_los
+    ):
+        """
+        When no feasible chain exists (all LOS blocked), the peak-based
+        fallback still includes both corridor endpoints.
+        """
+        corridor = make_corridor(8)
+        cells = make_cells(8)
+        surface = MeshSurface(cells, self.config)
+        mock_distance.return_value = 1000.0
+        mock_compute_los.return_value = LOSResult(
+            clearance_m=-999.0, path_loss_db=999.0,
+            distance_m=1000.0, is_visible=False,
+        )
+
+        nodes = place_nodes_along_corridor(corridor, surface)
+
+        self.assertIn("cell_0", nodes, "Start endpoint must always be present")
+        self.assertIn("cell_7", nodes, "End endpoint must always be present")
 
 
 if __name__ == '__main__':
