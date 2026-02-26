@@ -1,7 +1,7 @@
 """
 Node placement along corridors with LOS constraints.
 """
-from typing import List, Dict
+from typing import List, Dict, Optional
 import h3
 
 import structlog
@@ -9,86 +9,145 @@ import structlog
 from ..core.grid import H3Cell
 from ..core.config import MeshConfig
 from ..data.cache import LOSCache
-from ..physics.los import has_los
+from ..physics.los import has_los, compute_los
 from ..network.graph import MeshSurface
 
 logger = structlog.get_logger(__name__)
 
 
-def _walk_segment(
-    segment: List[str],
+def _dp_place_towers(
+    corridor: List[str],
     surface: MeshSurface,
-    cache: LOSCache = None
-) -> List[str]:
+    cache: LOSCache,
+    k: int,
+) -> Optional[List[str]]:
     """
-    Walk a corridor segment and place towers ensuring LOS connectivity.
-    Returns list of H3 indices (including both endpoints).
+    Optimal tower placement using MaxMin Bottleneck Path DP.
+
+    Finds a chain of <=k towers from corridor[0] to corridor[-1] that
+    maximises the minimum Fresnel clearance across all consecutive links.
+    Naturally prefers high-elevation cells (peaks) as relay positions.
+
+    State:  dp[t][i]  = best min-clearance reaching corridor[i] using
+                        exactly t towers placed so far
+    Transition: dp[t+1][j] = max(dp[t+1][j], min(dp[t][i], clearance(i→j)))
+                for all j > i where has_los(i, j) is True
+
+    Args:
+        corridor: Ordered list of H3 indices from start to end.
+        surface:  MeshSurface (provides cells, config, elevation_provider).
+        cache:    LOSCache (may be None).
+        k:        Maximum number of towers allowed (including endpoints).
+
+    Returns:
+        List of H3 indices (corridor order) forming the optimal chain, or
+        None if no feasible connected chain exists within k towers.
     """
-    if not segment or len(segment) < 2:
-        return list(segment)
+    if len(corridor) < 2:
+        return list(corridor)
 
     config = surface.config
     cells = surface.cells
-
+    elevation_provider = surface.elevation_provider
     from ..core.geometry import h3_distance
 
-    placed_nodes = [segment[0]]
-    current_h3 = segment[0]
-    current_idx = 0
+    n = len(corridor)
+    NEG_INF = float('-inf')
 
-    while current_idx < len(segment) - 1:
-        furthest_visible_idx = None
+    # dp[t][i]: best min-clearance using t towers, with the last tower at position i
+    dp = [[NEG_INF] * n for _ in range(k + 1)]
+    parent = [[-1] * n for _ in range(k + 1)]
 
-        # Find the farthest reachable index within max_visibility_m.
-        # Cache distances so the backward scan can reuse them without recomputing.
-        distances: dict = {}
-        max_reachable_idx = current_idx
-        for next_idx in range(current_idx + 1, len(segment)):
-            d = h3_distance(current_h3, segment[next_idx])
-            distances[next_idx] = d
-            if d > config.max_visibility_m:
-                break
-            max_reachable_idx = next_idx
+    # Tower 1 placed at start (position 0); no links yet → infinite clearance
+    dp[1][0] = float('inf')
 
-        # Scan backwards from farthest reachable cell — first LOS hit is furthest
-        # visible, so we stop immediately (O(1) vs O(n) forward scan)
-        for next_idx in range(max_reachable_idx, current_idx, -1):
-            next_h3 = segment[next_idx]
-            distance = distances.get(next_idx) or h3_distance(current_h3, next_h3)
-
-            is_endpoint = (next_idx == len(segment) - 1)
-            if (not is_endpoint
-                    and config.tower_separation_m > 0
-                    and distance < config.tower_separation_m):
+    for t in range(1, k):
+        for i in range(n - 1):
+            if dp[t][i] == NEG_INF:
                 continue
+            for j in range(i + 1, n):
+                # Early exit: corridor positions are roughly ordered by distance;
+                # once we exceed max_visibility_m we can stop.
+                dist = h3_distance(corridor[i], corridor[j])
+                if dist > config.max_visibility_m:
+                    break
 
-            if has_los(current_h3, next_h3, cells, config, cache,
-                       elevation_provider=surface.elevation_provider):
-                furthest_visible_idx = next_idx
-                break  # first hit from the far end = furthest visible cell
+                # Skip non-endpoint cells that violate constraints
+                is_endpoint_j = (j == n - 1)
+                if not is_endpoint_j:
+                    cell_j = cells.get(corridor[j])
+                    if cell_j and getattr(cell_j, 'is_in_unfit_area', False):
+                        continue
+                    # Enforce minimum tower separation
+                    if config.tower_separation_m > 0 and dist < config.tower_separation_m:
+                        continue
 
-        if furthest_visible_idx is not None:
-            furthest_h3 = segment[furthest_visible_idx]
-            if furthest_h3 not in placed_nodes:
-                placed_nodes.append(furthest_h3)
-            current_h3 = furthest_h3
-            current_idx = furthest_visible_idx
-        else:
-            # No visible cell — forced advance by one
-            current_idx += 1
-            current_h3 = segment[current_idx]
-            if current_h3 not in placed_nodes:
-                placed_nodes.append(current_h3)
-            logger.warning(
-                "No LOS to any forward cell, forced advance",
-                current=segment[current_idx - 1],
-                next=current_h3,
-            )
+                los = compute_los(
+                    corridor[i], corridor[j],
+                    cells, config, cache,
+                    elevation_provider=elevation_provider,
+                )
+                if los.is_visible:
+                    link_quality = min(dp[t][i], los.clearance_m)
+                    if link_quality > dp[t + 1][j]:
+                        dp[t + 1][j] = link_quality
+                        parent[t + 1][j] = i
 
-    if segment[-1] not in placed_nodes:
-        placed_nodes.append(segment[-1])
+    # Find the best feasible chain that reaches the last position
+    best_quality = NEG_INF
+    best_t = -1
+    for t in range(2, k + 1):
+        if dp[t][n - 1] > best_quality:
+            best_quality = dp[t][n - 1]
+            best_t = t
 
-    return placed_nodes
+    if best_t < 0:
+        return None  # No feasible chain found
+
+    # Reconstruct path via parent pointers
+    path_indices = []
+    j = n - 1
+    for t in range(best_t, 0, -1):
+        path_indices.append(j)
+        j = parent[t][j]
+    path_indices.reverse()
+
+    return [corridor[i] for i in path_indices]
+
+
+def _peak_fallback(
+    corridor: List[str],
+    cells: Dict[str, H3Cell],
+    k: int,
+) -> List[str]:
+    """
+    Fallback: place k towers at highest-elevation corridor cells.
+
+    Always includes both endpoints; fills remaining budget with the
+    highest-elevation cells in the corridor.
+
+    Args:
+        corridor: Ordered list of H3 indices.
+        cells:    Cell lookup dict.
+        k:        Maximum number of towers.
+
+    Returns:
+        Ordered list of selected H3 indices.
+    """
+    n = len(corridor)
+    sorted_by_elev = sorted(
+        range(n),
+        key=lambda i: (cells.get(corridor[i]) or H3Cell(
+            h3_index=corridor[i], lat=0, lon=0, elevation=0,
+        )).elevation,
+        reverse=True,
+    )
+    selected = {0, n - 1}
+    for i in sorted_by_elev:
+        if len(selected) >= k:
+            break
+        selected.add(i)
+    return [corridor[i] for i in sorted(selected)]
 
 
 def _fill_visibility_gaps(
@@ -153,10 +212,14 @@ def place_nodes_along_corridor(
     """
     Place nodes along a corridor ensuring LOS connectivity.
 
+    Uses MaxMin Bottleneck Path DP to find the globally optimal tower
+    placement that maximises the minimum Fresnel clearance across all
+    consecutive links while respecting the per-road tower budget
+    (config.max_nodes_per_road).
+
     Existing towers that fall on the corridor are reused as free relay
     points — the corridor is split at each such tower and each segment
-    is processed independently, so no new tower is placed where one
-    already exists.
+    is processed independently.
 
     Args:
         corridor: List of H3 cell indices forming the corridor
@@ -170,6 +233,9 @@ def place_nodes_along_corridor(
         return []
 
     logger.debug("Placing nodes along corridor", corridor_cells=len(corridor))
+
+    config = surface.config
+    cells = surface.cells
 
     # Find existing towers on this corridor and use them as free waypoints.
     # Split the corridor into segments separated by existing towers.
@@ -194,37 +260,37 @@ def place_nodes_along_corridor(
         seg_start = boundaries[bi]
         seg_end = boundaries[bi + 1]
         segment = corridor[seg_start:seg_end + 1]
-        seg_nodes = _walk_segment(segment, surface, cache)
+
+        seg_k = config.max_nodes_per_road
+
+        seg_nodes = _dp_place_towers(segment, surface, cache, seg_k)
+
+        if seg_nodes is None:
+            logger.warning(
+                "DP found no feasible chain for corridor segment; "
+                "falling back to peak-based placement",
+                seg_len=len(segment),
+                k=seg_k,
+                start=segment[0],
+                end=segment[-1],
+            )
+            seg_nodes = _peak_fallback(segment, cells, seg_k)
+
         for n in seg_nodes:
             if n not in seen:
                 seen.add(n)
                 all_nodes.append(n)
 
-    logger.debug("Nodes placed along corridor", count=len(all_nodes))
-
-    config = surface.config
-    cells = surface.cells
-
-    placed_nodes = all_nodes
-
-    # Check if we need to optimize for node limit
-    if len(placed_nodes) > config.max_nodes_per_road:
-        logger.debug("Optimizing node count",
-                     current=len(placed_nodes), limit=config.max_nodes_per_road)
-        placed_nodes = optimize_node_selection(
-            placed_nodes, config.max_nodes_per_road, cells, config, cache,
-            elevation_provider=surface.elevation_provider,
-        )
-        logger.debug("After optimization", count=len(placed_nodes))
+    logger.debug("Nodes placed along corridor (DP)", count=len(all_nodes))
 
     # Gap-fill: ensure no consecutive pair exceeds max_visibility_m
-    pre_fill_count = len(placed_nodes)
-    placed_nodes = _fill_visibility_gaps(placed_nodes, all_nodes, config.max_visibility_m)
-    if len(placed_nodes) > pre_fill_count:
-        logger.debug("After gap-fill", count=len(placed_nodes))
+    pre_fill_count = len(all_nodes)
+    all_nodes = _fill_visibility_gaps(all_nodes, corridor, config.max_visibility_m)
+    if len(all_nodes) > pre_fill_count:
+        logger.debug("After gap-fill", count=len(all_nodes))
 
     # Validate hop limit
-    hop_count = len(placed_nodes) - 1
+    hop_count = len(all_nodes) - 1
     if hop_count > config.hop_limit:
         logger.warning(
             "Corridor exceeds hop limit",
@@ -234,7 +300,7 @@ def place_nodes_along_corridor(
             end=corridor[-1],
         )
 
-    return placed_nodes
+    return all_nodes
 
 
 def optimize_node_selection(
@@ -251,6 +317,10 @@ def optimize_node_selection(
     Iteratively removes the lowest-scored node whose neighbors can still see
     each other (Fix #5: preserves corridor order, Fix #6: maintains chain
     connectivity).
+
+    NOTE: This function is no longer called by place_nodes_along_corridor
+    (replaced by the MaxMin DP algorithm), but is retained for external callers
+    and tests.
 
     Args:
         nodes: List of H3 cell indices (in corridor order)

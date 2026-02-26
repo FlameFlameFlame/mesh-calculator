@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from mesh_calculator.core.config import MeshConfig
 from mesh_calculator.core.grid import H3Cell
+from mesh_calculator.data.cache import LOSResult
 from mesh_calculator.network.graph import MeshSurface
 from mesh_calculator.optimization.corridor import place_nodes_along_corridor
 
@@ -42,6 +43,15 @@ def distance_per_cell(spacing_m):
     return dist_fn
 
 
+def _los_result(visible, clearance=10.0):
+    return LOSResult(
+        clearance_m=clearance if visible else -999.0,
+        path_loss_db=50.0,
+        distance_m=1000.0,
+        is_visible=visible,
+    )
+
+
 # ---------- Fix #9: Tower Separation ----------
 
 class TestTowerSeparation(unittest.TestCase):
@@ -54,54 +64,51 @@ class TestTowerSeparation(unittest.TestCase):
             max_nodes_per_road=100,
         )
 
-    @patch('mesh_calculator.optimization.corridor.has_los')
+    @patch('mesh_calculator.optimization.corridor.compute_los')
     @patch('mesh_calculator.core.geometry.h3_distance')
-    def test_close_cells_skipped(self, mock_distance, mock_los):
-        """Cells closer than tower_separation_m are skipped."""
-        # 10 cells, 1km apart. Separation=5km. All have LOS.
-        # From cell_0: cells 1-4 are too close (<5km), cell_5+ are OK.
-        # Expected: cell_0, cell_5 (or further), ..., cell_9
+    def test_close_cells_skipped(self, mock_distance, mock_compute_los):
+        """Cells closer than tower_separation_m are skipped as relay nodes."""
+        # 10 cells, 1 km apart.  Separation = 5 km.  All LOS pairs visible.
+        # From cell_0: cells 1-4 are <5 km → skipped.  Cells 5-9 are ≥5 km → eligible.
+        # With k=100 and all LOS the DP jumps directly from cell_0 to cell_9.
         corridor = make_corridor(10)
         cells = make_cells(10)
         surface = MeshSurface(cells, self.config)
 
         mock_distance.side_effect = distance_per_cell(1000.0)
-        mock_los.return_value = True
+        mock_compute_los.return_value = _los_result(True)
 
         nodes = place_nodes_along_corridor(corridor, surface)
 
-        # cell_1 through cell_4 should be skipped (< 5km from cell_0)
         for i in range(1, 5):
             self.assertNotIn(f"cell_{i}", nodes,
-                             f"cell_{i} is only {i}km from cell_0, "
-                             f"should be skipped (separation=5km)")
+                             f"cell_{i} is <5 km from cell_0; must be skipped")
 
-        # cell_0 and cell_9 must always be present
         self.assertEqual(nodes[0], "cell_0")
         self.assertEqual(nodes[-1], "cell_9")
 
-    @patch('mesh_calculator.optimization.corridor.has_los')
+    @patch('mesh_calculator.optimization.corridor.compute_los')
     @patch('mesh_calculator.core.geometry.h3_distance')
-    def test_endpoint_always_allowed(self, mock_distance, mock_los):
+    def test_endpoint_always_allowed(self, mock_distance, mock_compute_los):
         """Corridor endpoint is included even if within separation distance."""
-        # 4 cells, 2km apart. Total length = 6km.
-        # Separation=5km. From cell_0, cell_1 and cell_2 are too close.
-        # cell_3 (endpoint, 6km away) should be included.
+        # 4 cells, 2 km apart.  Separation = 5 km.
+        # cell_1 (2 km) and cell_2 (4 km) are < 5 km → skipped.
+        # cell_3 is the endpoint (6 km) → always allowed.
         corridor = make_corridor(4)
         cells = make_cells(4)
         surface = MeshSurface(cells, self.config)
 
         mock_distance.side_effect = distance_per_cell(2000.0)
-        mock_los.return_value = True
+        mock_compute_los.return_value = _los_result(True)
 
         nodes = place_nodes_along_corridor(corridor, surface)
 
         self.assertIn("cell_0", nodes)
         self.assertIn("cell_3", nodes)
 
-    @patch('mesh_calculator.optimization.corridor.has_los')
+    @patch('mesh_calculator.optimization.corridor.compute_los')
     @patch('mesh_calculator.core.geometry.h3_distance')
-    def test_separation_zero_no_filtering(self, mock_distance, mock_los):
+    def test_separation_zero_no_filtering(self, mock_distance, mock_compute_los):
         """tower_separation_m=0 means no separation filtering."""
         config = MeshConfig(
             tower_separation_m=0.0,
@@ -113,30 +120,31 @@ class TestTowerSeparation(unittest.TestCase):
         surface = MeshSurface(cells, config)
 
         mock_distance.side_effect = distance_per_cell(1000.0)
-        mock_los.return_value = True
+        mock_compute_los.return_value = _los_result(True)
 
         nodes = place_nodes_along_corridor(corridor, surface)
 
-        # With separation=0 and all LOS, furthest visible is endpoint
         self.assertIn("cell_0", nodes)
         self.assertIn("cell_4", nodes)
 
-    @patch('mesh_calculator.optimization.corridor.has_los')
+    @patch('mesh_calculator.optimization.corridor.compute_los')
     @patch('mesh_calculator.core.geometry.h3_distance')
-    def test_forced_advance_still_works(self, mock_distance, mock_los):
-        """When no LOS found, forced advance works regardless of separation."""
-        # All cells within separation, no LOS at all.
-        # Forced advance must still move forward to avoid infinite loop.
+    def test_fallback_includes_endpoints_when_no_los(
+        self, mock_distance, mock_compute_los
+    ):
+        """
+        When no LOS is found (DP returns None), the peak fallback still
+        returns a list that includes both endpoints.
+        """
         corridor = make_corridor(4)
         cells = make_cells(4)
         surface = MeshSurface(cells, self.config)
 
         mock_distance.side_effect = distance_per_cell(1000.0)
-        mock_los.return_value = False
+        mock_compute_los.return_value = _los_result(False)
 
         nodes = place_nodes_along_corridor(corridor, surface)
 
-        # Should still include start and end
         self.assertEqual(nodes[0], "cell_0")
         self.assertEqual(nodes[-1], "cell_3")
 
@@ -146,39 +154,38 @@ class TestTowerSeparation(unittest.TestCase):
 class TestHopLimit(unittest.TestCase):
     """Fix #10: hop_limit validated after corridor placement."""
 
-    @patch('mesh_calculator.optimization.corridor.has_los')
+    @patch('mesh_calculator.optimization.corridor.compute_los')
     @patch('mesh_calculator.core.geometry.h3_distance')
     @patch('mesh_calculator.optimization.corridor.logger')
     def test_within_hop_limit_no_warning(
-        self, mock_logger, mock_distance, mock_los
+        self, mock_logger, mock_distance, mock_compute_los
     ):
-        """Corridor with <= hop_limit hops produces no warning."""
+        """Corridor with <= hop_limit hops produces no hop-limit warning."""
         config = MeshConfig(
             hop_limit=5,
             max_visibility_m=70000.0,
             max_nodes_per_road=100,
             tower_separation_m=0.0,
         )
-        # 4 cells = 3 hops, hop_limit=5 → OK
+        # 4 cells = max 3 hops; hop_limit = 5 → no warning expected
         corridor = make_corridor(4)
         cells = make_cells(4)
         surface = MeshSurface(cells, config)
 
         mock_distance.return_value = 1000.0
-        mock_los.return_value = True
+        mock_compute_los.return_value = _los_result(True)
 
         place_nodes_along_corridor(corridor, surface)
 
-        # Check no warning about hop limit
         for call in mock_logger.warning.call_args_list:
             self.assertNotIn("hop", str(call).lower(),
                              "Should not warn when within hop limit")
 
-    @patch('mesh_calculator.optimization.corridor.has_los')
+    @patch('mesh_calculator.optimization.corridor.compute_los')
     @patch('mesh_calculator.core.geometry.h3_distance')
     @patch('mesh_calculator.optimization.corridor.logger')
     def test_exceeds_hop_limit_warns(
-        self, mock_logger, mock_distance, mock_los
+        self, mock_logger, mock_distance, mock_compute_los
     ):
         """Corridor with > hop_limit hops logs a warning."""
         config = MeshConfig(
@@ -187,37 +194,35 @@ class TestHopLimit(unittest.TestCase):
             max_nodes_per_road=100,
             tower_separation_m=0.0,
         )
-        # 6 cells, each only sees next cell → 5 hops. hop_limit=2 → warn.
+        # 6 cells; only adjacent pairs have LOS → 5 hops.  hop_limit = 2 → warn.
         corridor = make_corridor(6)
         cells = make_cells(6)
         surface = MeshSurface(cells, config)
 
         mock_distance.return_value = 1000.0
 
-        def only_adjacent_los(src, dst, *args, **kwargs):
+        def only_adjacent(src, dst, *args, **kwargs):
             si = int(src.split("_")[1])
             di = int(dst.split("_")[1])
-            return abs(si - di) == 1
+            vis = abs(si - di) == 1
+            return _los_result(vis)
 
-        mock_los.side_effect = only_adjacent_los
+        mock_compute_los.side_effect = only_adjacent
 
         place_nodes_along_corridor(corridor, surface)
 
-        # Should have warned about hop limit
-        warning_calls = [
-            str(c) for c in mock_logger.warning.call_args_list
-        ]
+        warning_calls = [str(c) for c in mock_logger.warning.call_args_list]
         hop_warnings = [c for c in warning_calls if "hop" in c.lower()]
         self.assertTrue(len(hop_warnings) > 0,
                         "Should warn when corridor exceeds hop limit")
 
-    @patch('mesh_calculator.optimization.corridor.has_los')
+    @patch('mesh_calculator.optimization.corridor.compute_los')
     @patch('mesh_calculator.core.geometry.h3_distance')
     @patch('mesh_calculator.optimization.corridor.logger')
     def test_exceeds_hop_limit_still_returns_all_nodes(
-        self, mock_logger, mock_distance, mock_los
+        self, mock_logger, mock_distance, mock_compute_los
     ):
-        """Even when hop limit exceeded, all nodes are still returned."""
+        """Even when hop limit is exceeded, all nodes are still returned."""
         config = MeshConfig(
             hop_limit=2,
             max_visibility_m=70000.0,
@@ -230,16 +235,16 @@ class TestHopLimit(unittest.TestCase):
 
         mock_distance.return_value = 1000.0
 
-        def only_adjacent_los(src, dst, *args, **kwargs):
+        def only_adjacent(src, dst, *args, **kwargs):
             si = int(src.split("_")[1])
             di = int(dst.split("_")[1])
-            return abs(si - di) == 1
+            vis = abs(si - di) == 1
+            return _los_result(vis)
 
-        mock_los.side_effect = only_adjacent_los
+        mock_compute_los.side_effect = only_adjacent
 
         nodes = place_nodes_along_corridor(corridor, surface)
 
-        # All nodes should be present (not truncated)
         self.assertEqual(nodes[0], "cell_0")
         self.assertEqual(nodes[-1], "cell_4")
         self.assertEqual(len(nodes), 5)
