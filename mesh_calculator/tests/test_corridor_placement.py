@@ -49,7 +49,7 @@ def make_compute_los_func(los_pairs, default_visible=False, clearance=10.0):
     default to default_visible.  Always returns a LOSResult.
     """
     def _compute_los(src, dst, cells_arg, config, cache=None,
-                     elevation_provider=None):
+                     elevation_provider=None, corridor_cells=None):
         is_vis = los_pairs.get((src, dst), default_visible)
         return LOSResult(
             clearance_m=clearance if is_vis else -999.0,

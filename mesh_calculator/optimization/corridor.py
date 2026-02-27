@@ -83,6 +83,7 @@ def _dp_place_towers(
                     corridor[i], corridor[j],
                     cells, config, cache,
                     elevation_provider=elevation_provider,
+                    corridor_cells=corridor[i:j+1],
                 )
                 if los.is_visible:
                     link_quality = min(dp[t][i], los.clearance_m)
