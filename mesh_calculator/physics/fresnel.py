@@ -22,6 +22,7 @@ def compute_fresnel_clearance(
     cells: Dict[str, H3Cell],
     config: MeshConfig,
     elevation_provider=None,
+    corridor_cells=None,
 ) -> Tuple[float, float, float, float]:
     """
     Calculate minimum Fresnel clearance between two H3 cells.
@@ -71,16 +72,20 @@ def compute_fresnel_clearance(
     # Effective earth radius (accounts for radio refraction)
     effective_radius = config.effective_earth_radius_m
 
-    # Sample cells along the path, capped at FRESNEL_MAX_SAMPLES to avoid
-    # excessive elevation lookups at fine H3 resolutions (e.g. res 11 = 29m cells
-    # → 172 intermediate cells per 5km link). Terrain features blocking LOS are
-    # typically ≥100m wide, so subsampling to ~50 points is physically adequate.
+    # Sample terrain along the path between src and dst.
+    # If a corridor slice is provided (ordered road cells from src to dst),
+    # use it — this avoids sampling off-road terrain that the signal doesn't
+    # actually cross (the road curves around ridges; the straight-line H3 path
+    # cuts through them).  Falls back to h3.grid_path_cells otherwise.
     _FRESNEL_MAX_SAMPLES = 50
-    try:
-        path_cells = list(h3.grid_path_cells(h3_src, h3_dst))
-    except Exception as e:
-        logger.warning("Failed to get path cells", error=str(e))
-        path_cells = [h3_src, h3_dst]
+    if corridor_cells is not None:
+        path_cells = list(corridor_cells)
+    else:
+        try:
+            path_cells = list(h3.grid_path_cells(h3_src, h3_dst))
+        except Exception as e:
+            logger.warning("Failed to get path cells", error=str(e))
+            path_cells = [h3_src, h3_dst]
 
     if len(path_cells) > _FRESNEL_MAX_SAMPLES:
         step = max(1, len(path_cells) // _FRESNEL_MAX_SAMPLES)

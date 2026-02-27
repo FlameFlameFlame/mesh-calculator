@@ -18,6 +18,7 @@ def compute_los(
     config: MeshConfig,
     cache: LOSCache = None,
     elevation_provider=None,
+    corridor_cells=None,
 ) -> LOSResult:
     """
     Compute complete LOS result including clearance and path loss.
@@ -49,8 +50,11 @@ def compute_los(
             )
         return result
 
+    # corridor_cells bypasses cache — result depends on the specific path slice
+    use_cache = cache is not None and corridor_cells is None
+
     # Check cache first
-    if cache is not None:
+    if use_cache:
         cached = cache.get(
             h3_src, h3_dst,
             config.mast_height_m, config.mast_height_m,
@@ -68,7 +72,7 @@ def compute_los(
             distance_m=distance,
             is_visible=False
         )
-        if cache is not None:
+        if use_cache:
             cache.put(
                 h3_src, h3_dst,
                 config.mast_height_m, config.mast_height_m,
@@ -81,6 +85,7 @@ def compute_los(
     clearance, distance_m, d1, d2 = compute_fresnel_clearance(
         h3_src, h3_dst, cells, config,
         elevation_provider=elevation_provider,
+        corridor_cells=corridor_cells,
     )
 
     # Compute path loss
@@ -96,8 +101,8 @@ def compute_los(
         is_visible=(clearance > 0)
     )
 
-    # Cache result
-    if cache is not None:
+    # Cache result (only for straight-line path checks)
+    if use_cache:
         cache.put(
             h3_src, h3_dst,
             config.mast_height_m, config.mast_height_m,
