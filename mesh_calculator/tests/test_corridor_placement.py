@@ -69,8 +69,7 @@ class TestDPNonAdjacentLOS(unittest.TestCase):
         self.config = MeshConfig(
             mast_height_m=10.0,
             max_visibility_m=70000.0,
-            max_nodes_per_road=100,
-            tower_separation_m=0.0,
+            max_towers_per_route=100,
         )
 
     @patch('mesh_calculator.optimization.corridor.compute_los')
@@ -240,8 +239,7 @@ class TestEndpointHandling(unittest.TestCase):
         self.config = MeshConfig(
             mast_height_m=10.0,
             max_visibility_m=70000.0,
-            max_nodes_per_road=100,
-            tower_separation_m=0.0,
+            max_towers_per_route=100,
         )
 
     @patch('mesh_calculator.optimization.corridor.compute_los')

@@ -61,6 +61,8 @@ class H3Cell:
     visible_tower_count: int = 0
     distance_to_closest_tower: float = float('inf')
     closest_tower_id: Optional[int] = None
+    received_power_dbm: Optional[float] = None   # Computed link budget result
+    is_covered: bool = False                      # received_power >= sensitivity AND LOS
 
 
 def load_boundary(boundary_path: str) -> Polygon:
