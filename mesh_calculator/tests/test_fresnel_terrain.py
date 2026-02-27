@@ -25,7 +25,6 @@ class TestFresnelTerrainVisibility(unittest.TestCase):
         """Set up test cells with known positions."""
         self.config = MeshConfig(
             mast_height_m=10.0,
-            max_visibility_m=70000.0,
             h3_resolution=8,
         )
 
@@ -152,7 +151,6 @@ class TestLOSWithElevationProvider(unittest.TestCase):
         """Set up same scenario as terrain visibility tests."""
         self.config = MeshConfig(
             mast_height_m=10.0,
-            max_visibility_m=70000.0,
             h3_resolution=8,
         )
 

@@ -68,7 +68,6 @@ class TestDPNonAdjacentLOS(unittest.TestCase):
     def setUp(self):
         self.config = MeshConfig(
             mast_height_m=10.0,
-            max_visibility_m=70000.0,
             max_towers_per_route=100,
         )
 
@@ -200,14 +199,12 @@ class TestDPNonAdjacentLOS(unittest.TestCase):
 
     @patch('mesh_calculator.optimization.corridor.compute_los')
     @patch('mesh_calculator.core.geometry.h3_distance')
-    def test_distance_limit_forces_intermediate_nodes(
+    def test_direct_los_skips_intermediates(
         self, mock_distance, mock_compute_los
     ):
         """
-        When distance between adjacent reachable nodes exceeds max_visibility_m,
-        intermediate nodes are placed.
-
-        6 cells at 20 km spacing; max_visibility_m=70 km → can see ≤3 hops.
+        When all cells have LOS to each other, the DP picks only endpoints
+        (max clearance path uses fewest hops).
         """
         corridor = make_corridor(6)
         cells = make_cells(6)
@@ -226,8 +223,8 @@ class TestDPNonAdjacentLOS(unittest.TestCase):
 
         nodes = place_nodes_along_corridor(corridor, surface)
 
-        self.assertGreater(len(nodes), 2,
-            "Distance limit forces at least one intermediate node")
+        self.assertEqual(nodes[0], corridor[0], "First endpoint always included")
+        self.assertEqual(nodes[-1], corridor[-1], "Last endpoint always included")
 
 
 # ---------- DP: endpoints ----------
@@ -238,7 +235,6 @@ class TestEndpointHandling(unittest.TestCase):
     def setUp(self):
         self.config = MeshConfig(
             mast_height_m=10.0,
-            max_visibility_m=70000.0,
             max_towers_per_route=100,
         )
 
