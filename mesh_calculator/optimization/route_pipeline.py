@@ -182,8 +182,13 @@ def run_route_pipeline(
             route.route_id, len(route.features), route.max_towers_per_route,
         )
 
-        # Convert GeoJSON features to ordered H3 corridor
-        corridor = road_geojson_to_h3_corridor(route.features, mesh_config.h3_resolution)
+        # Convert GeoJSON features to ordered H3 corridor (site1→site2)
+        corridor = road_geojson_to_h3_corridor(
+            route.features,
+            mesh_config.h3_resolution,
+            site1=route.site1,
+            site2=route.site2,
+        )
 
         if len(corridor) < 2:
             logger.warning(

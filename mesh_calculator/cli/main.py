@@ -54,7 +54,7 @@ def main(config: str, output: str, verbose: bool, quiet: bool):
     logger.info("Configuration loaded",
                 h3_resolution=cfg.parameters.h3_resolution,
                 max_visibility_km=cfg.parameters.max_visibility_m / 1000,
-                max_nodes_per_road=cfg.parameters.max_nodes_per_road)
+                max_nodes_per_route=cfg.parameters.max_towers_per_route)
 
     # Load input data
     logger.info("[2/9] Loading input data")
