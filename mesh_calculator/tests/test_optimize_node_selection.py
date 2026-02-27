@@ -50,7 +50,6 @@ class TestCorridorOrderPreservation(unittest.TestCase):
     def setUp(self):
         self.config = MeshConfig(
             mast_height_m=10.0,
-            max_visibility_m=70000.0,
             max_towers_per_route=100,
         )
 
@@ -112,7 +111,6 @@ class TestChainConnectivity(unittest.TestCase):
     def setUp(self):
         self.config = MeshConfig(
             mast_height_m=10.0,
-            max_visibility_m=70000.0,
             max_towers_per_route=100,
         )
 
@@ -260,7 +258,6 @@ class TestOptimizeEdgeCases(unittest.TestCase):
     def setUp(self):
         self.config = MeshConfig(
             mast_height_m=10.0,
-            max_visibility_m=70000.0,
             max_towers_per_route=100,
         )
 

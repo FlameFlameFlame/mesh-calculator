@@ -16,9 +16,6 @@ class MeshConfig:
     frequency_hz: float = 868e6  # 868 MHz
     mast_height_m: float = 28.0  # Tower mast height in meters
 
-    # Visibility and spacing constraints
-    max_visibility_m: float = 70000.0  # 70 km maximum LOS distance
-
     # Network topology parameters
     max_towers_per_route: int = 10  # Maximum towers per route
     routing_k_ring: int = 2  # k-ring radius for routing graph neighbor search
@@ -37,6 +34,17 @@ class MeshConfig:
     def effective_earth_radius_m(self) -> float:
         """Effective earth radius accounting for radio refraction."""
         return self.earth_radius_m * self.effective_earth_radius_factor
+
+    @property
+    def max_visibility_m(self) -> float:
+        """Physics-derived maximum LOS range: distance at which FSPL equals link budget."""
+        import math
+        # FSPL(d) = 20*log10(4*pi*d*f/c); solve for d given link_budget
+        d = (self.speed_of_light_m_s / (4 * math.pi * self.frequency_hz)) * (
+            10 ** (self.link_budget_db / 20)
+        )
+        # Cap at 200 km — beyond that, earth curvature dominates regardless
+        return min(d, 200_000.0)
 
     @property
     def wavelength_m(self) -> float:
@@ -105,7 +113,9 @@ class MeshCalculatorConfig:
     @classmethod
     def from_dict(cls, config_dict: dict) -> 'MeshCalculatorConfig':
         """Create config from dictionary (loaded from YAML)."""
-        params = MeshConfig(**config_dict.get('parameters', {}))
+        raw_params = dict(config_dict.get('parameters', {}))
+        raw_params.pop('max_visibility_m', None)  # removed; now a computed property
+        params = MeshConfig(**raw_params)
 
         inputs_dict = config_dict.get('inputs', {})
         inputs = InputPaths(**inputs_dict) if inputs_dict else None

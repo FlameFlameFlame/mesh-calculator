@@ -7,9 +7,6 @@ parameters:
   # H3 grid resolution (8 = ~0.7 km² per cell)
   h3_resolution: 8
 
-  # Maximum line-of-sight distance (meters)
-  max_visibility_m: 70000  # 70 km
-
   # Tower mast height (meters)
   mast_height_m: 28
 
