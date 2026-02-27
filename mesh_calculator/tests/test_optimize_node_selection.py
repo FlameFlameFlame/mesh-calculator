@@ -51,7 +51,7 @@ class TestCorridorOrderPreservation(unittest.TestCase):
         self.config = MeshConfig(
             mast_height_m=10.0,
             max_visibility_m=70000.0,
-            max_nodes_per_road=100,
+            max_towers_per_route=100,
         )
 
     @patch('mesh_calculator.optimization.corridor.has_los')
@@ -113,7 +113,7 @@ class TestChainConnectivity(unittest.TestCase):
         self.config = MeshConfig(
             mast_height_m=10.0,
             max_visibility_m=70000.0,
-            max_nodes_per_road=100,
+            max_towers_per_route=100,
         )
 
     @patch('mesh_calculator.optimization.corridor.has_los')
@@ -261,7 +261,7 @@ class TestOptimizeEdgeCases(unittest.TestCase):
         self.config = MeshConfig(
             mast_height_m=10.0,
             max_visibility_m=70000.0,
-            max_nodes_per_road=100,
+            max_towers_per_route=100,
         )
 
     def test_nodes_under_limit_unchanged(self):

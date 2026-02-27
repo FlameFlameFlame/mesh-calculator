@@ -32,6 +32,23 @@ def compute_los(
     Returns:
         LOSResult with clearance, path loss, distance, and visibility
     """
+    # Same-cell: trivially visible at zero distance, skip path loss calculation
+    if h3_src == h3_dst:
+        result = LOSResult(
+            clearance_m=config.mast_height_m,
+            path_loss_db=0.0,
+            distance_m=0.0,
+            is_visible=True,
+        )
+        if cache is not None:
+            cache.put(
+                h3_src, h3_dst,
+                config.mast_height_m, config.mast_height_m,
+                config.frequency_hz,
+                result,
+            )
+        return result
+
     # Check cache first
     if cache is not None:
         cached = cache.get(

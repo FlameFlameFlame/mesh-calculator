@@ -18,12 +18,15 @@ class MeshConfig:
 
     # Visibility and spacing constraints
     max_visibility_m: float = 70000.0  # 70 km maximum LOS distance
-    tower_separation_m: float = 5000.0  # 5 km minimum tower separation
 
     # Network topology parameters
-    hop_limit: int = 7  # Maximum hops within a cluster
-    max_nodes_per_road: int = 10  # Maximum nodes per road segment
+    max_towers_per_route: int = 10  # Maximum towers per route
     routing_k_ring: int = 2  # k-ring radius for routing graph neighbor search
+
+    # Link budget parameters
+    tx_power_mw: float = 500.0              # Transmit power in milliwatts
+    antenna_gain_dbi: float = 2.0           # Antenna gain, applied at both TX and RX
+    receiver_sensitivity_dbm: float = -137.0  # Minimum receivable signal (LoRa SF12)
 
     # Physical constants
     earth_radius_m: float = 6371000.0  # Earth radius in meters
@@ -45,6 +48,17 @@ class MeshConfig:
         """Frequency in MHz for FSPL calculations."""
         return self.frequency_hz / 1e6
 
+    @property
+    def tx_power_dbm(self) -> float:
+        """TX power in dBm."""
+        import math
+        return 10.0 * math.log10(self.tx_power_mw)
+
+    @property
+    def link_budget_db(self) -> float:
+        """Total one-way link budget: TX power + both antenna gains − sensitivity."""
+        return self.tx_power_dbm + 2.0 * self.antenna_gain_dbi - self.receiver_sensitivity_dbm
+
 
 @dataclass
 class InputPaths:
@@ -64,6 +78,7 @@ class OutputPaths:
 
     towers: str = "output/towers.geojson"
     coverage: str = "output/coverage.geojson"
+    tower_coverage: str = "output/tower_coverage.geojson"
     report: str = "output/report.json"
     visibility_edges: str = "output/visibility_edges.geojson"
 
@@ -76,7 +91,7 @@ class RouteSpec:
     features: list  # GeoJSON feature dicts for this route
     site1: dict     # {name, lat, lon}
     site2: dict     # {name, lat, lon}
-    max_towers: int = 10  # per-route tower limit
+    max_towers_per_route: int = 10  # per-route tower limit
 
 
 @dataclass

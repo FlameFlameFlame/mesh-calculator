@@ -78,9 +78,6 @@ def _dp_place_towers(
                     cell_j = cells.get(corridor[j])
                     if cell_j and getattr(cell_j, 'is_in_unfit_area', False):
                         continue
-                    # Enforce minimum tower separation
-                    if config.tower_separation_m > 0 and dist < config.tower_separation_m:
-                        continue
 
                 los = compute_los(
                     corridor[i], corridor[j],
@@ -261,7 +258,7 @@ def place_nodes_along_corridor(
         seg_end = boundaries[bi + 1]
         segment = corridor[seg_start:seg_end + 1]
 
-        seg_k = config.max_nodes_per_road
+        seg_k = config.max_towers_per_route
 
         seg_nodes = _dp_place_towers(segment, surface, cache, seg_k)
 
@@ -288,17 +285,6 @@ def place_nodes_along_corridor(
     all_nodes = _fill_visibility_gaps(all_nodes, corridor, config.max_visibility_m)
     if len(all_nodes) > pre_fill_count:
         logger.debug("After gap-fill", count=len(all_nodes))
-
-    # Validate hop limit
-    hop_count = len(all_nodes) - 1
-    if hop_count > config.hop_limit:
-        logger.warning(
-            "Corridor exceeds hop limit",
-            hops=hop_count,
-            limit=config.hop_limit,
-            start=corridor[0],
-            end=corridor[-1],
-        )
 
     return all_nodes
 

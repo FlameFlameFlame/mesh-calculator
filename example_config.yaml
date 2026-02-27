@@ -10,20 +10,19 @@ parameters:
   # Maximum line-of-sight distance (meters)
   max_visibility_m: 70000  # 70 km
 
-  # Minimum separation between towers (meters)
-  tower_separation_m: 5000  # 5 km
-
   # Tower mast height (meters)
   mast_height_m: 28
 
   # Radio frequency (Hz)
   frequency_hz: 868000000  # 868 MHz
 
-  # Maximum hops within a cluster
-  hop_limit: 7
+  # Maximum towers to place along a single route
+  max_towers_per_route: 10
 
-  # Maximum nodes per road segment
-  max_nodes_per_road: 10
+  # Link budget parameters
+  tx_power_mw: 500.0               # Transmit power (mW); 500 mW ≈ 27 dBm
+  antenna_gain_dbi: 2.0            # Antenna gain applied at TX and RX ends
+  receiver_sensitivity_dbm: -137.0 # LoRa SF12 BW125 receiver sensitivity
 
 inputs:
   # Required inputs

@@ -187,10 +187,9 @@ def generate_test_data(output_dir='test_data'):
         'parameters': {
             'h3_resolution': 8,
             'max_visibility_m': 70000,
-            'tower_separation_m': 5000,
             'mast_height_m': 28,
             'frequency_hz': 868000000,
-            'max_nodes_per_road': 5
+            'max_towers_per_route': 5
         },
         'inputs': {
             'boundary': boundary_path,

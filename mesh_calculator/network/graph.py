@@ -40,6 +40,7 @@ class Tower:
     lon: float
     source: str
     city_link: bool = False
+    coverage_radius_m: float = 0.0  # Max distance of any LOS-covered cell
 
 
 class VisibilityGraph:
@@ -379,6 +380,10 @@ class MeshSurface:
                     entry[4] = tower_list[ti].tower_id
 
         # Apply results to cells
+        tx_dbm = config.tx_power_dbm
+        gain = 2.0 * config.antenna_gain_dbi
+        sens = config.receiver_sensitivity_dbm
+
         updated = 0
         for ci, (count, dist, clearance, ploss, closest_tid) in cell_results.items():
             cell = cell_list[ci]
@@ -387,10 +392,185 @@ class MeshSurface:
             cell.clearance = clearance
             cell.path_loss = ploss
             cell.closest_tower_id = closest_tid
+            if ploss is not None:
+                rx = tx_dbm + gain - ploss
+                cell.received_power_dbm = rx
+                cell.is_covered = (count > 0 and rx >= sens)
             updated += 1
+
+        # Per-tower coverage radius: max distance of any covered cell
+        tower_radius: Dict[int, float] = {}
+        for cell in self.cells.values():
+            if cell.is_covered and cell.closest_tower_id is not None:
+                tid = cell.closest_tower_id
+                d = cell.distance_to_closest_tower
+                if d > tower_radius.get(tid, 0.0):
+                    tower_radius[tid] = d
+        for tid, radius in tower_radius.items():
+            self.towers[tid].coverage_radius_m = radius
 
         logger.info("Cell coverage computed",
                     cells_with_coverage=updated, total_cells=len(cell_list))
+
+    def compute_tower_radial_coverage(self, los_cache: LOSCache = None) -> list:
+        """Compute signal coverage for all hexes within range of any tower,
+        including off-road hexes not in surface.cells.
+
+        Returns a list of dicts (one per covered hex) containing:
+        h3_index, lat, lon, elevation, has_road, distance_m,
+        clearance_m, path_loss_db, received_power_dbm, is_covered, closest_tower_id.
+        """
+        import h3 as h3lib
+
+        tower_list = list(self.towers.values())
+        if not tower_list:
+            return []
+
+        config = self.config
+        elev = self.elevation_provider
+
+        # Determine max rings from max_visibility_m and average hex edge length.
+        # Cap at 30 rings to keep candidate hex count manageable (~2700 hexes per tower).
+        edge_m = h3lib.average_hexagon_edge_length(config.h3_resolution, unit='m')
+        max_rings = min(int(config.max_visibility_m / edge_m) + 1, 30)
+
+        logger.info("Tower radial coverage: max_rings=%d per tower (max_vis=%.0fm, edge=%.0fm)",
+                    max_rings, config.max_visibility_m, edge_m)
+
+        # Collect all candidate hexes via grid_disk from every tower
+        candidate_h3s: set = set()
+        for tower in tower_list:
+            candidate_h3s.update(h3lib.grid_disk(tower.h3_index, max_rings))
+
+        logger.info("Tower radial coverage: %d candidate hexes from %d towers",
+                    len(candidate_h3s), len(tower_list))
+
+        # Build augmented cells dict: road cells + new off-road cells with elevation
+        augmented_cells = dict(self.cells)
+        for h3_idx in candidate_h3s:
+            if h3_idx not in augmented_cells:
+                lat, lon = h3lib.cell_to_latlng(h3_idx)
+                elevation = elev.get_elevation(lat, lon) if elev else 0.0
+                augmented_cells[h3_idx] = H3Cell(
+                    h3_index=h3_idx, lat=lat, lon=lon,
+                    elevation=elevation, has_road=False, is_in_boundary=False,
+                )
+
+        # Build KDTree over tower positions (same pattern as compute_cell_coverage)
+        t_lats = np.array([t.lat for t in tower_list])
+        t_lons = np.array([t.lon for t in tower_list])
+        t_lats_rad = np.radians(t_lats)
+        t_lons_rad = np.radians(t_lons)
+        t_cos_lat = np.cos(t_lats_rad)
+        tower_xyz = np.column_stack([
+            t_cos_lat * np.cos(t_lons_rad),
+            t_cos_lat * np.sin(t_lons_rad),
+            np.sin(t_lats_rad),
+        ]) * _EARTH_R
+        tower_tree = cKDTree(tower_xyz)
+
+        # Build candidate cell list and XYZ coords for batch query
+        cand_list = [augmented_cells[h] for h in candidate_h3s]
+        c_lats = np.array([c.lat for c in cand_list])
+        c_lons = np.array([c.lon for c in cand_list])
+        c_lats_rad = np.radians(c_lats)
+        c_lons_rad = np.radians(c_lons)
+        c_cos_lat = np.cos(c_lats_rad)
+        cell_xyz = np.column_stack([
+            c_cos_lat * np.cos(c_lons_rad),
+            c_cos_lat * np.sin(c_lons_rad),
+            np.sin(c_lats_rad),
+        ]) * _EARTH_R
+
+        # For each candidate cell find nearby tower indices
+        max_dist = config.max_visibility_m
+        nearby = tower_tree.query_ball_point(cell_xyz, r=max_dist)
+
+        # Build (cell_idx, tower_idx) LOS pairs
+        los_pairs = []
+        tower_h3_set = {t.h3_index for t in tower_list}
+        cells_with_own_tower = set()
+        for ci, cell in enumerate(cand_list):
+            if cell.h3_index in tower_h3_set:
+                cells_with_own_tower.add(ci)
+            for ti in nearby[ci]:
+                t = tower_list[ti]
+                if t.h3_index == cell.h3_index:
+                    continue
+                los_pairs.append((ci, ti))
+
+        logger.info("Tower radial coverage: %d LOS checks", len(los_pairs))
+
+        # Parallel LOS computation
+        def _check_pair(pair):
+            ci, ti = pair
+            c = cand_list[ci]
+            t = tower_list[ti]
+            result = compute_los(
+                c.h3_index, t.h3_index,
+                augmented_cells, config, los_cache,
+                elevation_provider=elev,
+            )
+            if result.is_visible:
+                return (ci, ti, result.distance_m, result.clearance_m, result.path_loss_db)
+            return None
+
+        # Accumulate best result per candidate cell
+        cell_results: Dict[int, list] = {}
+        for ci in cells_with_own_tower:
+            cell = cand_list[ci]
+            own_tower = self.tower_by_h3.get(cell.h3_index)
+            own_id = own_tower.tower_id if own_tower else None
+            cell_results[ci] = [1, 0.0, 0.0, 0.0, own_id]
+
+        max_workers = os.cpu_count() or 4
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_check_pair, p) for p in los_pairs]
+            for future in as_completed(futures):
+                res = future.result()
+                if res is None:
+                    continue
+                ci, ti, dist_m, clear_m, ploss_db = res
+                if ci not in cell_results:
+                    cell_results[ci] = [0, float('inf'), None, None, None]
+                entry = cell_results[ci]
+                entry[0] += 1
+                if dist_m < entry[1]:
+                    entry[1] = dist_m
+                    entry[2] = clear_m
+                    entry[3] = ploss_db
+                    entry[4] = tower_list[ti].tower_id
+
+        # Build output feature dicts for covered cells only
+        tx_dbm = config.tx_power_dbm
+        gain = 2.0 * config.antenna_gain_dbi
+        sens = config.receiver_sensitivity_dbm
+
+        results = []
+        for ci, (count, dist, clearance, ploss, closest_tid) in cell_results.items():
+            cell = cand_list[ci]
+            rx_dbm = None
+            is_covered = False
+            if ploss is not None:
+                rx_dbm = tx_dbm + gain - ploss
+                is_covered = (count > 0 and rx_dbm >= sens)
+            results.append({
+                'h3_index': cell.h3_index,
+                'lat': cell.lat,
+                'lon': cell.lon,
+                'elevation': cell.elevation,
+                'has_road': cell.has_road,
+                'visible_tower_count': count,
+                'distance_m': dist if dist != float('inf') else None,
+                'clearance_m': clearance if clearance is not None and clearance != float('inf') else None,
+                'path_loss_db': ploss,
+                'received_power_dbm': round(rx_dbm, 2) if rx_dbm is not None else None,
+                'is_covered': is_covered,
+                'closest_tower_id': closest_tid,
+            })
+
+        logger.info("Tower radial coverage computed: %d covered hexes", len(results))
+        return results
 
     def get_tower_clusters(self) -> Dict[int, int]:
         """
