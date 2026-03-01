@@ -429,13 +429,15 @@ class MeshSurface:
         config = self.config
         elev = self.elevation_provider
 
-        # Determine max rings from max_visibility_m and average hex edge length.
-        # Cap at 30 rings to keep candidate hex count manageable (~2700 hexes per tower).
+        # Determine max rings from max_coverage_radius_m and average hex edge length.
         edge_m = h3lib.average_hexagon_edge_length(config.h3_resolution, unit='m')
-        max_rings = min(int(config.max_visibility_m / edge_m) + 1, 30)
+        max_rings = max(1, int(config.max_coverage_radius_m / edge_m))
 
-        logger.info("Tower radial coverage: max_rings=%d per tower (max_vis=%.0fm, edge=%.0fm)",
-                    max_rings, config.max_visibility_m, edge_m)
+        logger.info(
+            "Tower radial coverage: max_rings=%d per tower "
+            "(radius=%.0fm, edge=%.0fm)",
+            max_rings, config.max_coverage_radius_m, edge_m,
+        )
 
         # Collect all candidate hexes via grid_disk from every tower
         candidate_h3s: set = set()
@@ -483,7 +485,7 @@ class MeshSurface:
         ]) * _EARTH_R
 
         # For each candidate cell find nearby tower indices
-        max_dist = config.max_visibility_m
+        max_dist = config.max_coverage_radius_m
         nearby = tower_tree.query_ball_point(cell_xyz, r=max_dist)
 
         # Build (cell_idx, tower_idx) LOS pairs
