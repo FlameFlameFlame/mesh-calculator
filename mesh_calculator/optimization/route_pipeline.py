@@ -73,10 +73,10 @@ def _expand_cells_with_buffer(
     existing_cells: dict,
 ) -> dict:
     """
-    Expand corridor cells with a spatial buffer.
+    Expand corridor cells with a spatial buffer at the main H3 resolution.
 
-    For each road cell, samples H3 res-10 hexes within road_buffer_m and maps
-    them back to the main resolution, adding any new cells to the grid.
+    Uses grid_disk at the working resolution — k rings of neighbors around
+    each road cell. Each ring step adds ~one hex-edge-length of radius.
 
     Returns:
         Dict of new H3Cell objects (not already in existing_cells).
@@ -84,20 +84,15 @@ def _expand_cells_with_buffer(
     if mesh_config.road_buffer_m <= 0:
         return {}
 
-    buffer_res = 10
-    edge_m_buf = h3.average_hexagon_edge_length(buffer_res, unit='m')
-    buffer_rings = max(1, round(mesh_config.road_buffer_m / edge_m_buf))
+    edge_m = h3.average_hexagon_edge_length(mesh_config.h3_resolution, unit='m')
+    buffer_rings = max(1, round(mesh_config.road_buffer_m / edge_m))
 
-    new_main_cells: set = set()
     road_cell_set = set(road_cells)
+    new_main_cells: set = set()
     for road_cell in road_cells:
-        lat, lon = h3_to_lat_lon(road_cell)
-        center_res10 = h3.latlng_to_cell(lat, lon, buffer_res)
-        res10_disk = h3.grid_disk(center_res10, buffer_rings)
-        for res10_hex in res10_disk:
-            main_hex = h3.cell_to_parent(res10_hex, mesh_config.h3_resolution)
-            if main_hex not in road_cell_set and main_hex not in existing_cells:
-                new_main_cells.add(main_hex)
+        for neighbor in h3.grid_disk(road_cell, buffer_rings):
+            if neighbor not in road_cell_set and neighbor not in existing_cells:
+                new_main_cells.add(neighbor)
 
     new_cells = {}
     for h3_idx in new_main_cells:
@@ -115,8 +110,8 @@ def _expand_cells_with_buffer(
         )
 
     logger.info(
-        "Buffer expansion: added %d new cells (buffer_m=%.0f, rings=%d)",
-        len(new_cells), mesh_config.road_buffer_m, buffer_rings,
+        "Buffer expansion: added %d new cells (buffer_m=%.0f, rings=%d, edge_m=%.0f)",
+        len(new_cells), mesh_config.road_buffer_m, buffer_rings, edge_m,
     )
     return new_cells
 

@@ -235,12 +235,56 @@ def place_nodes_along_corridor(
     config = surface.config
     cells = surface.cells
 
+    from ..core.geometry import h3_distance, h3_to_lat_lon
+    corridor_set = set(corridor)
+
+    # Inject buffer cells: for each road corridor cell, add the highest-elevation
+    # neighbor from the road buffer (cells already in surface.cells with has_road=False)
+    # at the corridor position closest to that neighbor.
+    # This lets the DP route through elevated terrain adjacent to the road.
+    buffer_ring = config.road_buffer_rings if hasattr(config, 'road_buffer_rings') else (
+        max(1, round(config.road_buffer_m / h3.average_hexagon_edge_length(
+            config.h3_resolution, unit='m'))) if config.road_buffer_m > 0 else 0
+    )
+    if buffer_ring > 0:
+        candidate_buffer_cells = []
+        for road_h3 in list(corridor_set):
+            neighbors = h3.grid_disk(road_h3, buffer_ring)
+            for nb in neighbors:
+                if nb not in corridor_set and nb in cells and not cells[nb].has_road:
+                    candidate_buffer_cells.append(nb)
+        # For each road cell, keep only the highest-elevation buffer neighbor
+        # to avoid inflating corridor length with many flat buffer cells.
+        best_by_road: dict = {}
+        for nb in candidate_buffer_cells:
+            # Find the road cell this buffer cell is closest to
+            closest = min(corridor_set, key=lambda r: h3_distance(nb, r))
+            elev = cells[nb].elevation
+            if closest not in best_by_road or elev > best_by_road[closest][1]:
+                best_by_road[closest] = (nb, elev)
+
+        injected_buffer = 0
+        for road_h3, (nb, _elev) in best_by_road.items():
+            if nb in corridor_set:
+                continue
+            # Insert after the road cell it belongs to
+            try:
+                pos = corridor.index(road_h3)
+            except ValueError:
+                continue
+            corridor.insert(pos + 1, nb)
+            corridor_set.add(nb)
+            injected_buffer += 1
+
+        if injected_buffer:
+            logger.info(
+                "Injected %d buffer cells as corridor candidates", injected_buffer
+            )
+
     # Inject nearby existing towers as relay candidates into the corridor.
     # For each existing tower NOT already on the corridor, check distance
     # to sampled corridor cells; if within max_visibility_m, insert it at
     # the closest corridor position so the DP can route through it.
-    from ..core.geometry import h3_distance, h3_to_lat_lon
-    corridor_set = set(corridor)
     relay_towers = []
     sample_step = max(1, len(corridor) // 20)
     sampled = corridor[::sample_step]
@@ -262,6 +306,7 @@ def place_nodes_along_corridor(
                 ),
             )
             corridor.insert(best_pos, tower.h3_index)
+            corridor_set.add(tower.h3_index)
             # Ensure cell exists in surface.cells
             if tower.h3_index not in cells:
                 lat, lon = h3_to_lat_lon(tower.h3_index)
