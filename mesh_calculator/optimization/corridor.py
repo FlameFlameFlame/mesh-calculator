@@ -295,6 +295,7 @@ def place_nodes_along_corridor(
     if boundaries[-1] != len(corridor) - 1:
         boundaries.append(len(corridor) - 1)
 
+    total_corridor_len = len(corridor)
     all_nodes: List[str] = []
     seen: set = set()
 
@@ -303,7 +304,13 @@ def place_nodes_along_corridor(
         seg_end = boundaries[bi + 1]
         segment = corridor[seg_start:seg_end + 1]
 
-        seg_k = config.max_towers_per_route
+        # Allocate tower budget proportionally to segment length.
+        # This prevents a short early segment from consuming the full budget
+        # when the corridor is split at existing tower waypoints.
+        seg_len = seg_end - seg_start
+        seg_k = max(2, round(
+            config.max_towers_per_route * seg_len / max(total_corridor_len, 1)
+        ))
 
         seg_nodes = _dp_place_towers(segment, surface, cache, seg_k)
 

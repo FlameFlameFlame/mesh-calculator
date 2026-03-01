@@ -14,6 +14,7 @@ import h3
 
 from ..core.config import MeshConfig, RouteSpec
 from ..core.elevation import ElevationProvider
+from ..core.geometry import h3_to_lat_lon
 from ..core.grid import H3Cell
 from ..core.road_corridor import road_geojson_to_h3_corridor
 from ..data.cache import LOSCache
@@ -62,6 +63,61 @@ def _build_corridor_cells(
             has_road=True,
             is_in_boundary=True,
         )
+    return new_cells
+
+
+def _expand_cells_with_buffer(
+    road_cells: List[str],
+    mesh_config: MeshConfig,
+    elevation_provider: ElevationProvider,
+    existing_cells: dict,
+) -> dict:
+    """
+    Expand corridor cells with a spatial buffer.
+
+    For each road cell, samples H3 res-10 hexes within road_buffer_m and maps
+    them back to the main resolution, adding any new cells to the grid.
+
+    Returns:
+        Dict of new H3Cell objects (not already in existing_cells).
+    """
+    if mesh_config.road_buffer_m <= 0:
+        return {}
+
+    buffer_res = 10
+    edge_m_buf = h3.average_hexagon_edge_length(buffer_res, unit='m')
+    buffer_rings = max(1, round(mesh_config.road_buffer_m / edge_m_buf))
+
+    new_main_cells: set = set()
+    road_cell_set = set(road_cells)
+    for road_cell in road_cells:
+        lat, lon = h3_to_lat_lon(road_cell)
+        center_res10 = h3.latlng_to_cell(lat, lon, buffer_res)
+        res10_disk = h3.grid_disk(center_res10, buffer_rings)
+        for res10_hex in res10_disk:
+            main_hex = h3.cell_to_parent(res10_hex, mesh_config.h3_resolution)
+            if main_hex not in road_cell_set and main_hex not in existing_cells:
+                new_main_cells.add(main_hex)
+
+    new_cells = {}
+    for h3_idx in new_main_cells:
+        if h3_idx in existing_cells:
+            continue
+        lat, lon = h3_to_lat_lon(h3_idx)
+        elevation = elevation_provider.get_elevation(lat, lon)
+        new_cells[h3_idx] = H3Cell(
+            h3_index=h3_idx,
+            lat=lat,
+            lon=lon,
+            elevation=elevation,
+            has_road=False,
+            is_in_boundary=True,
+        )
+
+    logger.info(
+        "Buffer expansion: added %d new cells (buffer_m=%.0f, rings=%d)",
+        len(new_cells), mesh_config.road_buffer_m, buffer_rings,
+    )
     return new_cells
 
 
@@ -222,8 +278,16 @@ def run_route_pipeline(
         # Build cells for this corridor and add to shared surface
         new_cells = _build_corridor_cells(corridor, elevation_provider, surface.cells)
         surface.cells.update(new_cells)
+
+        # Expand with road buffer: add nearby off-road cells for elevated terrain
+        buffer_cells = _expand_cells_with_buffer(
+            corridor, mesh_config, elevation_provider, surface.cells
+        )
+        surface.cells.update(buffer_cells)
+
         logger.info(
-            "Added %d new cells (total: %d)", len(new_cells), len(surface.cells)
+            "Added %d corridor + %d buffer cells (total: %d)",
+            len(new_cells), len(buffer_cells), len(surface.cells),
         )
 
         # Mark city-interior corridor cells as unfit
