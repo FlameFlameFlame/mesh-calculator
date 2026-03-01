@@ -191,29 +191,24 @@ def generate_road_grid(
     road_cells = find_h3_cells_on_roads(roads_gdf, config.h3_resolution)
     logger.info("Cells on roads", count=len(road_cells))
 
-    # Expand road cells by buffer: sample at res 10, map back to main res
+    # Expand road cells by buffer: add k-ring neighbors at main resolution.
+    # Using grid_disk at the working resolution is the correct approach —
+    # the res-10 intermediate sampling was wrong because cell_to_parent maps
+    # small offsets back to the same parent cell.
     if config.road_buffer_m > 0:
-        buffer_res = 10
-        edge_m_buf = h3.average_hexagon_edge_length(buffer_res, unit='m')
-        buffer_rings = max(1, round(config.road_buffer_m / edge_m_buf))
+        edge_m = h3.average_hexagon_edge_length(config.h3_resolution, unit='m')
+        buffer_rings = max(1, round(config.road_buffer_m / edge_m))
 
         new_main_cells = set()
         for road_cell in list(road_cells):
-            lat, lon = h3_to_lat_lon(road_cell)
-            center_res10 = h3.latlng_to_cell(lat, lon, buffer_res)
-            res10_disk = h3.grid_disk(center_res10, buffer_rings)
-            for res10_hex in res10_disk:
-                main_hex = h3.cell_to_parent(
-                    res10_hex, config.h3_resolution
-                )
-                new_main_cells.add(main_hex)
+            for neighbor in h3.grid_disk(road_cell, buffer_rings):
+                new_main_cells.add(neighbor)
 
         added = len(new_main_cells - road_cells)
         road_cells = road_cells | new_main_cells
         logger.info(
             "Road cells after buffer expansion",
             buffer_m=config.road_buffer_m,
-            buffer_res=buffer_res,
             rings=buffer_rings,
             added=added,
             total=len(road_cells),
