@@ -1,9 +1,9 @@
 """
 Tests for road buffer expansion in generate_road_grid().
 
-When config.road_buffer_m > 0, the function expands road cells by sampling at
-H3 resolution 10 within the buffer radius and mapping back to the main
-resolution.  All expanded cells are returned with has_road=True.
+When config.road_buffer_m > 0, the function expands road cells by adding
+k-ring neighbors at the main H3 resolution.  Road cells keep has_road=True;
+pure buffer cells (not on a road) get has_road=False.
 
 Strategy: call generate_road_grid() directly with a real (tiny) road geometry
 and a mock ElevationProvider.  We use a real Shapely LineString + GeoDataFrame
@@ -82,7 +82,7 @@ class TestRoadBufferZero(unittest.TestCase):
 
 
 class TestRoadBufferPositive(unittest.TestCase):
-    """With road_buffer_m > 0, more cells are produced and all are road-flagged."""
+    """With road_buffer_m > 0, more cells are produced; road cells stay flagged, buffer cells are not."""
 
     def _run(self, buffer_m):
         config = MeshConfig(h3_resolution=8, road_buffer_m=buffer_m)
@@ -108,13 +108,16 @@ class TestRoadBufferPositive(unittest.TestCase):
             "Buffer should expand the road cell set",
         )
 
-    def test_buffer_cells_have_road_flag_true(self):
-        cells = self._run(300.0)
-        for cell in cells.values():
-            self.assertTrue(
-                cell.has_road,
-                f"Expanded buffer cell {cell.h3_index} must have has_road=True",
-            )
+    def test_road_cells_flagged_buffer_cells_not(self):
+        """Road cells must have has_road=True; pure buffer cells must have has_road=False."""
+        cells_no_buf = self._run(0.0)
+        cells_with_buf = self._run(300.0)
+        road_indices = set(cells_no_buf.keys())
+        for h3_idx, cell in cells_with_buf.items():
+            if h3_idx in road_indices:
+                self.assertTrue(cell.has_road, f"Road cell {h3_idx} must have has_road=True")
+            else:
+                self.assertFalse(cell.has_road, f"Buffer cell {h3_idx} must have has_road=False")
 
     def test_larger_buffer_produces_more_cells_than_smaller_buffer(self):
         cells_small = self._run(100.0)

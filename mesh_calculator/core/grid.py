@@ -191,6 +191,10 @@ def generate_road_grid(
     road_cells = find_h3_cells_on_roads(roads_gdf, config.h3_resolution)
     logger.info("Cells on roads", count=len(road_cells))
 
+    # Keep the original road cell set so we can set has_road correctly.
+    # Buffer cells must NOT be marked has_road=True.
+    original_road_cells = set(road_cells)
+
     # Expand road cells by buffer: add k-ring neighbors at main resolution.
     # Using grid_disk at the working resolution is the correct approach —
     # the res-10 intermediate sampling was wrong because cell_to_parent maps
@@ -214,9 +218,9 @@ def generate_road_grid(
             total=len(road_cells),
         )
 
-    # Filter to cells in boundary with roads
+    # Filter to cells in boundary with roads (or buffer)
     valid_cells = all_cells & road_cells
-    logger.info("Valid cells (boundary + roads)", count=len(valid_cells))
+    logger.info("Valid cells (boundary + roads + buffer)", count=len(valid_cells))
 
     # Create H3Cell objects with elevation data
     cells_dict = {}
@@ -231,7 +235,7 @@ def generate_road_grid(
             lat=lat,
             lon=lon,
             elevation=elevation,
-            has_road=True,
+            has_road=(h3_idx in original_road_cells),
             is_in_boundary=True
         )
 
