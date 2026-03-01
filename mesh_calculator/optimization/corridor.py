@@ -91,13 +91,24 @@ def _dp_place_towers(
                         dp[t + 1][j] = link_quality
                         parent[t + 1][j] = i
 
-    # Find the best feasible chain that reaches the last position
+    # Find the best feasible chain that reaches the last position.
+    # Prefer fewer towers: pick the smallest t that reaches the endpoint
+    # with positive clearance.  Only fall back to the highest-clearance
+    # chain (any t) if no chain has positive clearance.
     best_quality = NEG_INF
     best_t = -1
     for t in range(2, k + 1):
-        if dp[t][n - 1] > best_quality:
+        if dp[t][n - 1] > 0:
+            # First feasible chain with positive clearance wins (fewest towers)
             best_quality = dp[t][n - 1]
             best_t = t
+            break
+    if best_t < 0:
+        # No positive-clearance chain; fall back to best of any quality
+        for t in range(2, k + 1):
+            if dp[t][n - 1] > best_quality:
+                best_quality = dp[t][n - 1]
+                best_t = t
 
     if best_t < 0:
         return None  # No feasible chain found
@@ -146,6 +157,43 @@ def _peak_fallback(
             break
         selected.add(i)
     return [corridor[i] for i in sorted(selected)]
+
+
+def _prune_redundant(
+    chain: List[str],
+    surface: MeshSurface,
+    cache: LOSCache,
+) -> List[str]:
+    """
+    Remove interior towers whose neighbors have LOS to each other.
+
+    The DP maximises minimum clearance and may fill its budget with adjacent
+    towers that add no connectivity benefit.  This pass removes them so the
+    budget is not wasted on clusters.
+
+    Args:
+        chain:   Ordered list of H3 indices returned by the DP / fallback.
+        surface: MeshSurface (cells, config, elevation_provider).
+        cache:   LOSCache (may be None).
+
+    Returns:
+        Pruned chain (same list object, modified in place).
+    """
+    changed = True
+    while changed:
+        changed = False
+        for i in range(len(chain) - 2, 0, -1):
+            los = compute_los(
+                chain[i - 1], chain[i + 1],
+                surface.cells, surface.config, cache,
+                elevation_provider=surface.elevation_provider,
+                corridor_cells=None,
+            )
+            if los.is_visible:
+                removed = chain.pop(i)
+                logger.debug("Pruned redundant tower", node=removed)
+                changed = True
+    return chain
 
 
 def _fill_visibility_gaps(
@@ -283,19 +331,30 @@ def place_nodes_along_corridor(
 
     # Find existing towers on this corridor and use them as free waypoints.
     # Split the corridor into segments separated by existing towers.
+    # Exclude position 0: it is always the start boundary, so including it
+    # would create a duplicate [0, 0, …] producing a useless 1-cell segment.
     existing_tower_indices = [
         i for i, h3_idx in enumerate(corridor)
-        if h3_idx in surface.tower_by_h3
+        if h3_idx in surface.tower_by_h3 and i != 0
     ]
 
     if existing_tower_indices:
         logger.debug("Reusing existing towers as waypoints",
                      count=len(existing_tower_indices))
 
-    # Build segment boundaries: [0, t1, t2, ..., last]
+    # Build strictly-increasing segment boundaries: [0, t1, t2, ..., last]
+    last_idx = len(corridor) - 1
     boundaries = [0] + existing_tower_indices
-    if boundaries[-1] != len(corridor) - 1:
-        boundaries.append(len(corridor) - 1)
+    if boundaries[-1] != last_idx:
+        boundaries.append(last_idx)
+
+    # Pre-placed anchor towers at corridor endpoints are "free" — don't count
+    # against the user's max_towers_per_route budget.
+    endpoint_anchors = sum(
+        1 for idx in (0, len(corridor) - 1)
+        if corridor[idx] in surface.tower_by_h3
+    )
+    effective_budget = config.max_towers_per_route + endpoint_anchors
 
     total_corridor_len = len(corridor)
     all_nodes: List[str] = []
@@ -311,7 +370,7 @@ def place_nodes_along_corridor(
         # when the corridor is split at existing tower waypoints.
         seg_len = seg_end - seg_start
         seg_k = max(2, round(
-            config.max_towers_per_route * seg_len / max(total_corridor_len, 1)
+            effective_budget * seg_len / max(total_corridor_len, 1)
         ))
 
         seg_nodes = _dp_place_towers(segment, surface, cache, seg_k)
@@ -326,6 +385,16 @@ def place_nodes_along_corridor(
                 end=segment[-1],
             )
             seg_nodes = _peak_fallback(segment, cells, seg_k)
+
+        # Prune redundant towers: remove interior nodes whose neighbors
+        # already have LOS to each other (prevents clustering).
+        pre_prune = len(seg_nodes)
+        seg_nodes = _prune_redundant(seg_nodes, surface, cache)
+        if len(seg_nodes) < pre_prune:
+            logger.info(
+                "Pruned %d redundant tower(s) from segment",
+                pre_prune - len(seg_nodes),
+            )
 
         for n in seg_nodes:
             if n not in seen:
