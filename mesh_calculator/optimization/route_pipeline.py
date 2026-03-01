@@ -311,27 +311,23 @@ def run_route_pipeline(
             len(corridor), len(trimmed_corridor), len(corridor) - len(trimmed_corridor),
         )
 
-        # Place anchor towers at the actual site coordinates (not boundary entry cells).
-        # Using the real site H3 ensures all routes sharing a site land on the same cell,
-        # preventing duplicate anchor towers when a site is approached from different directions.
-        for site in [route.site1, route.site2]:
-            if site and 'lat' in site and 'lon' in site:
-                site_h3 = h3.latlng_to_cell(
-                    site['lat'], site['lon'], mesh_config.h3_resolution
+        # Place anchor towers at city boundary entry points (one per road entry into city).
+        # Two routes using the same road get the same anchor; routes on different roads
+        # get separate anchors.  To handle slight corridor variations between routes on
+        # the same road we skip placing a new anchor when an existing tower is already
+        # within 1 H3 ring of the candidate entry cell.
+        for anchor_h3 in filter(None, [entry1_h3, entry2_h3]):
+            if anchor_h3 not in surface.cells:
+                continue
+            # Check if an existing tower is already within 1 ring (same-road dedup)
+            neighbors_1ring = h3.grid_disk(anchor_h3, 1)
+            if any(nb in surface.tower_by_h3 for nb in neighbors_1ring):
+                logger.info(
+                    "Skipping anchor at %s — nearby tower already exists", anchor_h3
                 )
-                if site_h3 not in surface.tower_by_h3:
-                    # Ensure the cell exists (site may be outside the corridor cells)
-                    if site_h3 not in surface.cells:
-                        lat, lon = h3.cell_to_latlng(site_h3)
-                        elev = elevation_provider.get_elevation(lat, lon)
-                        surface.cells[site_h3] = H3Cell(
-                            h3_index=site_h3, lat=lat, lon=lon,
-                            elevation=elev, has_road=False, is_in_boundary=False,
-                        )
-                    surface.place_tower(site_h3, source='site')
-                    logger.info(
-                        "Placed site anchor tower at %s (%s)", site_h3, site.get('name', '')
-                    )
+                continue
+            surface.place_tower(anchor_h3, source='site')
+            logger.info("Placed city-boundary anchor tower at %s", anchor_h3)
 
         # Override max towers for this route
         saved_max = mesh_config.max_towers_per_route
