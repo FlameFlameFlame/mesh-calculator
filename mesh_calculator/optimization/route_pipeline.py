@@ -28,7 +28,11 @@ from ..data.exporters import (
 )
 from ..network.graph import MeshSurface
 from ..optimization.city_coverage import tag_city_links
-from ..optimization.corridor import install_nodes, place_nodes_along_corridor
+from ..optimization.corridor import (
+    install_nodes,
+    place_nodes_along_corridor,
+    wire_corridor_edges,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -385,6 +389,13 @@ def run_route_pipeline(
         placed = place_nodes_along_corridor(trimmed_corridor, surface, los_cache)
         install_nodes(placed, surface, source=route.route_id)
         towers_after = len(surface.towers)
+
+        # Wire corridor-path visibility edges between consecutive placed towers.
+        # The DP proved these pairs are LOS-connected along the road path; we
+        # register those edges immediately so they appear in the visibility graph
+        # even when straight-line LOS (used by update_visibility_edges) is blocked
+        # by terrain.
+        wire_corridor_edges(placed, trimmed_corridor, surface, los_cache)
 
         mesh_config.max_towers_per_route = saved_max
 

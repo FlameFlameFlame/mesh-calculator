@@ -16,7 +16,7 @@ from ..data.sites import Site, group_sites_by_priority, find_nearest_site
 from ..network.graph import MeshSurface
 from ..network.routing import build_routing_graph, find_road_corridor
 from ..data.cache import LOSCache
-from .corridor import place_nodes_along_corridor, install_nodes
+from .corridor import place_nodes_along_corridor, install_nodes, wire_corridor_edges
 
 logger = structlog.get_logger(__name__)
 
@@ -104,17 +104,18 @@ def connect_sites_by_priority(
         def _compute_nodes(item):
             site, nearest_site, corridor = item
             if not corridor:
-                return None, site.name, nearest_site.name, 0
+                return None, None, site.name, nearest_site.name, 0
             nodes = place_nodes_along_corridor(corridor, surface, cache)
-            return nodes, site.name, nearest_site.name, len(corridor)
+            return nodes, corridor, site.name, nearest_site.name, len(corridor)
 
         with ThreadPoolExecutor() as executor:
             node_results = list(executor.map(_compute_nodes, planned))
 
-        # Step 3: Serial — install towers
-        for nodes, site_name, target_name, corridor_len in node_results:
+        # Step 3: Serial — install towers and wire corridor-path edges
+        for nodes, corridor, site_name, target_name, corridor_len in node_results:
             if nodes:
                 install_nodes(nodes, surface, source=f'priority_{priority}')
+                wire_corridor_edges(nodes, corridor, surface, cache)
                 logger.info("Corridor established",
                             site=site_name, target=target_name,
                             corridor_cells=corridor_len, nodes_placed=len(nodes))
@@ -157,9 +158,9 @@ def connect_priority1_mesh(
         site1, site2 = args
         corridor = find_road_corridor(site1.h3_index, site2.h3_index, routing_graph)
         if not corridor:
-            return None, site1.name, site2.name, 0
+            return None, None, site1.name, site2.name, 0
         nodes = place_nodes_along_corridor(corridor, surface, cache)
-        return nodes, site1.name, site2.name, len(corridor)
+        return nodes, corridor, site1.name, site2.name, len(corridor)
 
     results = []
     with ThreadPoolExecutor() as executor:
@@ -168,9 +169,10 @@ def connect_priority1_mesh(
             results.append(future.result())
 
     # Serial installation — fast, negligible time
-    for nodes, name1, name2, corridor_len in results:
+    for nodes, corridor, name1, name2, corridor_len in results:
         if nodes:
             install_nodes(nodes, surface, source='priority_1')
+            wire_corridor_edges(nodes, corridor, surface, cache)
             logger.info("Corridor established",
                         site1=name1, site2=name2,
                         corridor_cells=corridor_len, nodes_placed=len(nodes))

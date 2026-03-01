@@ -531,3 +531,84 @@ def install_nodes(
     for h3_idx in node_h3_list:
         if h3_idx in surface.cells:
             surface.place_tower(h3_idx, source=source)
+
+
+def wire_corridor_edges(
+    placed: List[str],
+    corridor: List[str],
+    surface: MeshSurface,
+    cache: LOSCache,
+) -> None:
+    """
+    Add visibility edges between consecutive towers in the placed chain,
+    using corridor-path LOS (not straight-line).
+
+    The DP places towers that are LOS-connected along the road path
+    (corridor_cells).  The global update_visibility_edges step uses
+    straight-line LOS which may be blocked by terrain.  This function
+    registers the corridor-path edges immediately after placement so the
+    visibility graph is correct regardless of terrain obstruction on the
+    straight-line path.
+
+    Args:
+        placed:   Ordered list of H3 indices returned by place_nodes_along_corridor.
+        corridor: The trimmed corridor used during placement (to recover sub-paths).
+        surface:  MeshSurface (cells, config, elevation_provider, visibility_graph).
+        cache:    LOSCache.
+    """
+    if len(placed) < 2:
+        return
+
+    # Build a position lookup in the corridor for fast sub-path extraction.
+    corridor_pos: Dict[str, int] = {}
+    for idx, h3_idx in enumerate(corridor):
+        if h3_idx not in corridor_pos:
+            corridor_pos[h3_idx] = idx
+
+    edges_added = 0
+    for i in range(len(placed) - 1):
+        h3_a = placed[i]
+        h3_b = placed[i + 1]
+
+        tower_a = surface.tower_by_h3.get(h3_a)
+        tower_b = surface.tower_by_h3.get(h3_b)
+        if tower_a is None or tower_b is None:
+            continue
+
+        # Skip if edge already exists in the visibility graph
+        if surface.visibility_graph.has_edge(tower_a.tower_id, tower_b.tower_id):
+            continue
+
+        pos_a = corridor_pos.get(h3_a)
+        pos_b = corridor_pos.get(h3_b)
+        if pos_a is None or pos_b is None:
+            corridor_cells_seg = None
+        else:
+            lo, hi = (pos_a, pos_b) if pos_a <= pos_b else (pos_b, pos_a)
+            corridor_cells_seg = corridor[lo:hi + 1]
+
+        los = compute_los(
+            h3_a, h3_b,
+            surface.cells, surface.config, cache,
+            elevation_provider=surface.elevation_provider,
+            corridor_cells=corridor_cells_seg,
+        )
+        if los.is_visible:
+            surface.visibility_graph.add_visibility_edge(
+                tower_a.tower_id, tower_b.tower_id,
+                distance_m=los.distance_m,
+                clearance_m=los.clearance_m,
+                path_loss_db=los.path_loss_db,
+            )
+            edges_added += 1
+        else:
+            logger.warning(
+                "Corridor-path LOS failed between consecutive placed towers",
+                h3_a=h3_a, h3_b=h3_b,
+                clearance_m=getattr(los, 'clearance_m', None),
+            )
+
+    if edges_added:
+        logger.info(
+            "Wired %d corridor-path visibility edge(s)", edges_added
+        )
