@@ -161,6 +161,7 @@ def _peak_fallback(
 
 def _prune_redundant(
     chain: List[str],
+    corridor: List[str],
     surface: MeshSurface,
     cache: LOSCache,
 ) -> List[str]:
@@ -171,29 +172,109 @@ def _prune_redundant(
     towers that add no connectivity benefit.  This pass removes them so the
     budget is not wasted on clusters.
 
+    Uses corridor-path LOS (not straight-line) so that towers placed as
+    relays around terrain obstacles are not incorrectly pruned because the
+    straight-line between their neighbours happens to be clear.
+
     Args:
         chain:   Ordered list of H3 indices returned by the DP / fallback.
+        corridor: The corridor slice used for this segment (to extract sub-paths).
         surface: MeshSurface (cells, config, elevation_provider).
         cache:   LOSCache (may be None).
 
     Returns:
         Pruned chain (same list object, modified in place).
     """
+    corridor_pos: Dict[str, int] = {}
+    for idx, h3_idx in enumerate(corridor):
+        if h3_idx not in corridor_pos:
+            corridor_pos[h3_idx] = idx
+
     changed = True
     while changed:
         changed = False
         for i in range(len(chain) - 2, 0, -1):
+            prev_h3 = chain[i - 1]
+            next_h3 = chain[i + 1]
+            pos_prev = corridor_pos.get(prev_h3)
+            pos_next = corridor_pos.get(next_h3)
+            if pos_prev is not None and pos_next is not None:
+                lo, hi = (pos_prev, pos_next) if pos_prev <= pos_next else (pos_next, pos_prev)
+                corridor_cells_seg = corridor[lo:hi + 1]
+            else:
+                corridor_cells_seg = None
             los = compute_los(
-                chain[i - 1], chain[i + 1],
+                prev_h3, next_h3,
                 surface.cells, surface.config, cache,
                 elevation_provider=surface.elevation_provider,
-                corridor_cells=None,
+                corridor_cells=corridor_cells_seg,
             )
             if los.is_visible:
                 removed = chain.pop(i)
                 logger.debug("Pruned redundant tower", node=removed)
                 changed = True
     return chain
+
+
+def _expand_segment_buffer(
+    segment: List[str],
+    segment_set: set,
+    ring: int,
+    surface: MeshSurface,
+) -> int:
+    """
+    Inject higher-elevation buffer neighbors into segment for a given ring size.
+
+    For each road cell in segment, looks ring-neighbors for cells already in
+    surface.cells (pre-loaded buffer).  Keeps only the highest-elevation
+    neighbor per road cell and inserts it after that road cell in segment.
+
+    Returns the number of newly injected cells.
+    """
+    from ..core.geometry import h3_distance as _dist
+    cells = surface.cells
+    elevation_provider = surface.elevation_provider
+    injected = 0
+    best_by_road: dict = {}
+    for road_h3 in list(segment_set):
+        for nb in h3.grid_disk(road_h3, ring):
+            if nb in segment_set:
+                continue
+            if nb in cells:
+                elev = cells[nb].elevation
+            elif elevation_provider is not None:
+                lat, lon = h3.cell_to_latlng(nb)
+                elev = elevation_provider.get_elevation(lat, lon)
+            else:
+                continue
+            closest = min(
+                segment_set,
+                key=lambda r: _dist(nb, r),
+            )
+            if (closest not in best_by_road
+                    or elev > best_by_road[closest][1]):
+                best_by_road[closest] = (nb, elev)
+
+    for road_h3, (nb, elev) in best_by_road.items():
+        if nb in segment_set:
+            continue
+        if nb not in cells and elevation_provider is not None:
+            lat, lon = h3.cell_to_latlng(nb)
+            from ..core.grid import H3Cell
+            cells[nb] = H3Cell(
+                h3_index=nb, lat=lat, lon=lon,
+                elevation=elev,
+                has_road=False, is_in_boundary=False,
+            )
+        try:
+            pos = segment.index(road_h3)
+        except ValueError:
+            continue
+        segment.insert(pos + 1, nb)
+        segment_set.add(nb)
+        injected += 1
+
+    return injected
 
 
 def _fill_visibility_gaps(
@@ -375,21 +456,47 @@ def place_nodes_along_corridor(
 
         seg_nodes = _dp_place_towers(segment, surface, cache, seg_k)
 
+        # If DP fails, retry up to 3 times with progressively wider buffer
+        # rings injected into the segment — this finds elevated relay cells
+        # that give LOS across terrain the road itself cannot clear.
         if seg_nodes is None:
-            logger.warning(
-                "DP found no feasible chain for corridor segment; "
-                "falling back to peak-based placement",
+            segment_set = set(segment)
+            for attempt in range(1, 4):
+                try:
+                    added = _expand_segment_buffer(
+                        segment, segment_set,
+                        buffer_ring + attempt, surface,
+                    )
+                except Exception:
+                    added = 0
+                logger.warning(
+                    "DP failed; retrying with wider buffer",
+                    attempt=attempt,
+                    added_cells=added,
+                    seg_len=len(segment),
+                )
+                seg_nodes = _dp_place_towers(
+                    segment, surface, cache, seg_k,
+                )
+                if seg_nodes is not None:
+                    break
+
+        if seg_nodes is None:
+            logger.error(
+                "DP found no feasible LOS chain after 3 buffer expansions"
+                " — skipping segment",
                 seg_len=len(segment),
                 k=seg_k,
                 start=segment[0],
                 end=segment[-1],
             )
-            seg_nodes = _peak_fallback(segment, cells, seg_k)
+            # Include only endpoints so the corridor is not completely broken
+            seg_nodes = [segment[0], segment[-1]]
 
         # Prune redundant towers: remove interior nodes whose neighbors
         # already have LOS to each other (prevents clustering).
         pre_prune = len(seg_nodes)
-        seg_nodes = _prune_redundant(seg_nodes, surface, cache)
+        seg_nodes = _prune_redundant(seg_nodes, segment, surface, cache)
         if len(seg_nodes) < pre_prune:
             logger.info(
                 "Pruned %d redundant tower(s) from segment",
