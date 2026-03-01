@@ -142,6 +142,36 @@ def export_tower_coverage_geojson(hex_results: list, output_path: str):
     logger.info("Exported tower coverage hexes", count=len(features), path=output_path)
 
 
+def export_grid_cells_geojson(cells: Dict, output_path: str):
+    """
+    Export H3 grid cells as GeoJSON polygons.
+
+    Args:
+        cells: Dict of H3 index → H3Cell
+        output_path: Output GeoJSON file path
+    """
+    features = []
+    for h3_idx, cell in cells.items():
+        boundary = h3.cell_to_boundary(h3_idx)
+        coords = [[lon, lat] for lat, lon in boundary]
+        coords.append(coords[0])
+        features.append({
+            'type': 'Feature',
+            'geometry': {'type': 'Polygon', 'coordinates': [coords]},
+            'properties': {
+                'h3_index': h3_idx,
+                'elevation': cell.elevation,
+                'has_road': cell.has_road,
+                'is_in_unfit_area': cell.is_in_unfit_area,
+            },
+        })
+
+    geojson = {'type': 'FeatureCollection', 'features': features}
+    with open(output_path, 'w') as f:
+        json.dump(geojson, f, indent=2)
+    logger.info("Exported grid cells", count=len(features), path=output_path)
+
+
 def export_visibility_edges_geojson(surface: MeshSurface, output_path: str):
     """
     Export visibility graph edges as GeoJSON LineStrings.
