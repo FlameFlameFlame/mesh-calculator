@@ -19,6 +19,8 @@ class MeshConfig:
     # Network topology parameters
     max_towers_per_route: int = 10  # Maximum towers per route
     routing_k_ring: int = 2  # k-ring radius for routing graph neighbor search
+    road_buffer_m: float = 0.0  # Buffer around road cells in meters (0 = road-only)
+    max_coverage_radius_m: float = 15000.0  # Max tower coverage search radius in meters
 
     # Link budget parameters
     tx_power_mw: float = 500.0              # Transmit power in milliwatts
