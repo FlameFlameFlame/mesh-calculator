@@ -281,49 +281,6 @@ def place_nodes_along_corridor(
                 "Injected %d buffer cells as corridor candidates", injected_buffer
             )
 
-    # Inject nearby existing towers as relay candidates into the corridor.
-    # For each existing tower NOT already on the corridor, check distance
-    # to sampled corridor cells; if within max_visibility_m, insert it at
-    # the closest corridor position so the DP can route through it.
-    relay_towers = []
-    sample_step = max(1, len(corridor) // 20)
-    sampled = corridor[::sample_step]
-    for tower in surface.towers.values():
-        if tower.h3_index in corridor_set:
-            continue
-        min_dist = min(
-            h3_distance(tower.h3_index, c) for c in sampled
-        )
-        if min_dist <= config.max_visibility_m:
-            relay_towers.append(tower)
-
-    if relay_towers:
-        for tower in relay_towers:
-            best_pos = min(
-                range(len(corridor)),
-                key=lambda i, t=tower: h3_distance(
-                    t.h3_index, corridor[i]
-                ),
-            )
-            corridor.insert(best_pos, tower.h3_index)
-            corridor_set.add(tower.h3_index)
-            # Ensure cell exists in surface.cells
-            if tower.h3_index not in cells:
-                lat, lon = h3_to_lat_lon(tower.h3_index)
-                elev = (
-                    surface.elevation_provider.get_elevation(lat, lon)
-                    if surface.elevation_provider else 0
-                )
-                cells[tower.h3_index] = H3Cell(
-                    h3_index=tower.h3_index,
-                    lat=lat, lon=lon,
-                    elevation=elev, has_tower=True,
-                )
-        logger.info(
-            "Injected existing towers as relay candidates",
-            count=len(relay_towers),
-        )
-
     # Find existing towers on this corridor and use them as free waypoints.
     # Split the corridor into segments separated by existing towers.
     existing_tower_indices = [
