@@ -429,8 +429,8 @@ def _repair_broken_gaps(
     new_ring = base_ring * (repair_round + 1)  # 2x, 3x, 4x on rounds 1/2/3
     # Process in reverse so splices don't shift subsequent broken indices
     for i in reversed(broken):
-        anchor_a = chain[i - 1] if i > 0 else chain[i]
-        anchor_b = chain[i + 2] if i + 2 < len(chain) else chain[i + 1]
+        anchor_a = chain[i]
+        anchor_b = chain[i + 1]
         pos_a = corridor_pos.get(anchor_a)
         pos_b = corridor_pos.get(anchor_b)
         if pos_a is None or pos_b is None:
@@ -455,11 +455,9 @@ def _repair_broken_gaps(
             )
             continue
         new_seg, best_t = result
-        # Splice new_seg into chain replacing the broken section.
+        # Splice new_seg into chain replacing only the broken pair.
         # anchor_a == new_seg[0], anchor_b == new_seg[-1].
-        left = (i - 1) if i > 0 else i
-        right = (i + 2) if i + 2 < len(chain) else (i + 1)
-        chain[left:right + 1] = new_seg
+        chain[i:i + 2] = new_seg
         # Register any newly introduced cells into corridor_pos so subsequent
         # repair rounds can locate them as anchors.
         for h3_cell in new_seg:
