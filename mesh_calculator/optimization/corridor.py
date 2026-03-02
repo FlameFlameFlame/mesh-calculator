@@ -15,12 +15,12 @@ from ..network.graph import MeshSurface
 logger = structlog.get_logger(__name__)
 
 
-def _dp_place_towers(
+def _dp_place_towers_with_meta(
     corridor: List[str],
     surface: MeshSurface,
     cache: LOSCache,
     k: int,
-) -> Optional[List[str]]:
+) -> Optional[tuple]:
     """
     Optimal tower placement using MaxMin Bottleneck Path DP.
 
@@ -40,11 +40,12 @@ def _dp_place_towers(
         k:        Maximum number of towers allowed (including endpoints).
 
     Returns:
-        List of H3 indices (corridor order) forming the optimal chain, or
-        None if no feasible connected chain exists within k towers.
+        (chain, best_t) — chain is a list of H3 indices forming the optimal
+        placement, best_t is the winning tower count.  Returns None if no
+        feasible connected chain exists within k towers.
     """
     if len(corridor) < 2:
-        return list(corridor)
+        return (list(corridor), len(corridor))
 
     config = surface.config
     cells = surface.cells
@@ -121,7 +122,26 @@ def _dp_place_towers(
         j = parent[t][j]
     path_indices.reverse()
 
-    return [corridor[i] for i in path_indices]
+    return ([corridor[i] for i in path_indices], best_t)
+
+
+def _dp_place_towers(
+    corridor: List[str],
+    surface: MeshSurface,
+    cache: LOSCache,
+    k: int,
+) -> Optional[List[str]]:
+    """
+    Thin wrapper around _dp_place_towers_with_meta that discards best_t.
+
+    Returns:
+        List of H3 indices (corridor order) forming the optimal chain, or
+        None if no feasible connected chain exists within k towers.
+    """
+    result = _dp_place_towers_with_meta(corridor, surface, cache, k)
+    if result is None:
+        return None
+    return result[0]
 
 
 def _peak_fallback(
@@ -381,6 +401,7 @@ def _repair_broken_gaps(
     surface: MeshSurface,
     cache: LOSCache,
     k: int,
+    node_meta: Optional[Dict[str, dict]] = None,
 ) -> List[str]:
     """
     For each broken gap in chain, expand the sub-corridor between surrounding
@@ -395,6 +416,8 @@ def _repair_broken_gaps(
         surface:       MeshSurface.
         cache:         LOSCache (may be None).
         k:             Max towers for DP (uses effective_budget).
+        node_meta:     Optional dict to populate with placement metadata for
+                       newly introduced nodes (algorithm='dp_repair', repair_round=r).
 
     Returns:
         Updated chain (same list object).
@@ -423,14 +446,15 @@ def _repair_broken_gaps(
             _expand_segment_buffer(sub_corridor, sub_set, new_ring, surface)
         except Exception:
             pass
-        new_seg = _dp_place_towers(sub_corridor, surface, cache, k)
-        if new_seg is None:
+        result = _dp_place_towers_with_meta(sub_corridor, surface, cache, k)
+        if result is None:
             logger.warning(
                 "Gap repair DP failed",
                 repair_round=repair_round, gap_idx=i,
                 anchor_a=anchor_a, anchor_b=anchor_b,
             )
             continue
+        new_seg, best_t = result
         # Splice new_seg into chain replacing the broken section.
         # anchor_a == new_seg[0], anchor_b == new_seg[-1].
         left = (i - 1) if i > 0 else i
@@ -442,6 +466,13 @@ def _repair_broken_gaps(
             if h3_cell not in corridor_pos:
                 corridor_pos[h3_cell] = len(corridor)
                 corridor.append(h3_cell)
+            # Tag interior nodes introduced by this repair (not anchors)
+            if node_meta is not None and h3_cell not in (anchor_a, anchor_b):
+                node_meta[h3_cell] = {
+                    'algorithm': 'dp_repair',
+                    'dp_steps': best_t,
+                    'repair_round': repair_round,
+                }
         logger.info(
             "Gap repair successful",
             repair_round=repair_round, gap_idx=i, new_nodes=len(new_seg),
@@ -452,7 +483,8 @@ def _repair_broken_gaps(
 def place_nodes_along_corridor(
     corridor: List[str],
     surface: MeshSurface,
-    cache: LOSCache = None
+    cache: LOSCache = None,
+    out_meta: Optional[Dict[str, dict]] = None,
 ) -> List[str]:
     """
     Place nodes along a corridor ensuring LOS connectivity.
@@ -467,9 +499,13 @@ def place_nodes_along_corridor(
     is processed independently.
 
     Args:
-        corridor: List of H3 cell indices forming the corridor
-        surface: Mesh surface
-        cache: Optional LOS cache
+        corridor:  List of H3 cell indices forming the corridor
+        surface:   Mesh surface
+        cache:     Optional LOS cache
+        out_meta:  Optional dict; if provided, populated with
+                   {h3_index: {'algorithm': ..., 'dp_steps': ..., 'repair_round': ...}}
+                   for every node returned.  Endpoints reused from existing towers
+                   are not written (they were placed by an earlier call).
 
     Returns:
         List of H3 indices where nodes were placed
@@ -564,6 +600,8 @@ def place_nodes_along_corridor(
     total_corridor_len = len(corridor)
     all_nodes: List[str] = []
     seen: set = set()
+    # Tracks placement metadata for each node placed in this call.
+    node_meta: Dict[str, dict] = {}
 
     for bi in range(len(boundaries) - 1):
         seg_start = boundaries[bi]
@@ -578,7 +616,9 @@ def place_nodes_along_corridor(
             effective_budget * seg_len / max(total_corridor_len, 1)
         ))
 
-        seg_nodes = _dp_place_towers(segment, surface, cache, seg_k)
+        seg_result = _dp_place_towers_with_meta(segment, surface, cache, seg_k)
+        seg_nodes = seg_result[0] if seg_result is not None else None
+        seg_best_t = seg_result[1] if seg_result is not None else None
 
         # If DP fails, retry up to 3 times with progressively wider buffer
         # rings injected into the segment — this finds elevated relay cells
@@ -599,10 +639,11 @@ def place_nodes_along_corridor(
                     added_cells=added,
                     seg_len=len(segment),
                 )
-                seg_nodes = _dp_place_towers(
+                seg_result = _dp_place_towers_with_meta(
                     segment, surface, cache, seg_k,
                 )
-                if seg_nodes is not None:
+                if seg_result is not None:
+                    seg_nodes, seg_best_t = seg_result
                     break
 
         if seg_nodes is None:
@@ -616,6 +657,19 @@ def place_nodes_along_corridor(
             )
             # Include only endpoints so the corridor is not completely broken
             seg_nodes = [segment[0], segment[-1]]
+            seg_best_t = None
+
+        # Tag placement metadata for nodes in this segment.
+        # Endpoints are existing anchors (already placed) — skip them.
+        for node_h3 in seg_nodes:
+            if node_h3 in surface.tower_by_h3:
+                continue  # reused existing tower, already has its own meta
+            if seg_best_t is not None:
+                node_meta[node_h3] = {'algorithm': 'dp', 'dp_steps': seg_best_t,
+                                      'repair_round': None}
+            else:
+                node_meta[node_h3] = {'algorithm': 'endpoint_fallback',
+                                      'dp_steps': None, 'repair_round': None}
 
         # Sync corridor_pos with any buffer cells injected into segment
         # during the retry loop — they may have been chosen by DP and will
@@ -648,6 +702,7 @@ def place_nodes_along_corridor(
         all_nodes = _repair_broken_gaps(
             all_nodes, corridor, corridor_pos,
             buffer_ring, repair_round, surface, cache, effective_budget,
+            node_meta=node_meta,
         )
     else:
         still_broken = _find_broken_gaps(
@@ -664,6 +719,9 @@ def place_nodes_along_corridor(
     all_nodes = _fill_visibility_gaps(all_nodes, corridor, config.max_visibility_m)
     if len(all_nodes) > pre_fill_count:
         logger.debug("After gap-fill", count=len(all_nodes))
+
+    if out_meta is not None:
+        out_meta.update(node_meta)
 
     return all_nodes
 
@@ -774,19 +832,24 @@ def optimize_node_selection(
 def install_nodes(
     node_h3_list: List[str],
     surface: MeshSurface,
-    source: str = 'corridor'
+    source: str = 'corridor',
+    placement_meta: Optional[Dict[str, dict]] = None,
 ):
     """
     Install nodes (towers) at specified H3 cells.
 
     Args:
-        node_h3_list: List of H3 cell indices
-        surface: Mesh surface
-        source: Source label for towers
+        node_h3_list:    List of H3 cell indices
+        surface:         Mesh surface
+        source:          Source label for towers
+        placement_meta:  Optional {h3_index: meta_dict} from place_nodes_along_corridor.
+                         When provided, each tower is created with its debug metadata
+                         (algorithm, dp_steps, repair_round).
     """
     for h3_idx in node_h3_list:
         if h3_idx in surface.cells:
-            surface.place_tower(h3_idx, source=source)
+            meta = placement_meta.get(h3_idx) if placement_meta else None
+            surface.place_tower(h3_idx, source=source, placement_meta=meta)
 
 
 def wire_corridor_edges(
