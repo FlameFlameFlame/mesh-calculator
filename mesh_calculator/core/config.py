@@ -18,6 +18,7 @@ class MeshConfig:
 
     # Network topology parameters
     max_towers_per_route: int = 10  # Maximum towers per route
+    gap_repair_rounds: int = 5     # Max gap repair rounds (0 = disabled)
     routing_k_ring: int = 2  # k-ring radius for routing graph neighbor search
     road_buffer_m: float = 0.0  # Buffer around road cells in meters (0 = road-only)
     max_coverage_radius_m: float = 15000.0  # Max tower coverage search radius in meters

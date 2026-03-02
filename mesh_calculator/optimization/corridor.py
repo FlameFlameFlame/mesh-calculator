@@ -460,6 +460,7 @@ def _repair_broken_gaps(
                 "Gap repair DP failed",
                 repair_round=repair_round, gap_idx=i,
                 anchor_a=anchor_a, anchor_b=anchor_b,
+                buffer_ring=new_ring,
             )
             continue
         new_seg, best_t = result
@@ -482,6 +483,7 @@ def _repair_broken_gaps(
         logger.info(
             "Gap repair successful",
             repair_round=repair_round, gap_idx=i, new_nodes=len(new_seg),
+            buffer_ring=new_ring,
         )
         # Post-repair pruning: the new anchor_b (chain[i + len(new_seg) - 1])
         # may now have direct LOS to a later tower, making intermediate towers
@@ -691,15 +693,16 @@ def place_nodes_along_corridor(
     # Phase 2: targeted gap repair.
     # Find consecutive pairs with no corridor-path LOS and re-run DP on the
     # sub-corridor between their surrounding anchors with a wider buffer ring.
-    for repair_round in range(1, 4):
+    for repair_round in range(1, config.gap_repair_rounds + 1):
         broken = _find_broken_gaps(
             all_nodes, corridor, corridor_pos, surface, cache,
         )
         if not broken:
             break
         logger.info(
-            "Gap repair round %d: %d broken pair(s)",
-            repair_round, len(broken),
+            "Gap repair round %d/%d: %d broken pair(s), buffer_ring=%d",
+            repair_round, config.gap_repair_rounds, len(broken),
+            buffer_ring * (repair_round + 1),
         )
         all_nodes = _repair_broken_gaps(
             all_nodes, corridor, corridor_pos,
@@ -713,7 +716,8 @@ def place_nodes_along_corridor(
         )
         for i in still_broken:
             logger.error(
-                "No LOS after 3 gap repair rounds",
+                "No LOS after %d gap repair rounds",
+                config.gap_repair_rounds,
                 h3_a=all_nodes[i], h3_b=all_nodes[i + 1],
             )
 
