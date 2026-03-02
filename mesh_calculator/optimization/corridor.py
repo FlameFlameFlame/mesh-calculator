@@ -402,6 +402,7 @@ def _repair_broken_gaps(
     cache: LOSCache,
     user_budget: int,
     node_meta: Optional[Dict[str, dict]] = None,
+    out_debug_hexes: Optional[List[dict]] = None,
 ) -> List[str]:
     """
     For each broken gap in chain, expand the sub-corridor between the two
@@ -412,16 +413,19 @@ def _repair_broken_gaps(
     intermediate towers chain[i+1..i+k-1] are removed.
 
     Args:
-        chain:        Current tower chain (modified in-place and returned).
-        corridor:     Full corridor (with buffer cells already injected).
-        corridor_pos: Position lookup {h3_idx: position_in_corridor}.
-        base_ring:    Initial buffer ring size from config.
-        repair_round: 1-based round number; ring expands to base_ring*(round+1).
-        surface:      MeshSurface.
-        cache:        LOSCache (may be None).
-        user_budget:  Max total interior towers allowed (effective_budget - 2).
-        node_meta:    Optional dict populated with placement metadata for newly
-                      introduced nodes (algorithm='dp_repair', repair_round=r).
+        chain:           Current tower chain (modified in-place and returned).
+        corridor:        Full corridor (with buffer cells already injected).
+        corridor_pos:    Position lookup {h3_idx: position_in_corridor}.
+        base_ring:       Initial buffer ring size from config.
+        repair_round:    1-based round number; ring expands to base_ring*(round+1).
+        surface:         MeshSurface.
+        cache:           LOSCache (may be None).
+        user_budget:     Max total interior towers allowed (effective_budget - 2).
+        node_meta:       Optional dict populated with placement metadata for newly
+                         introduced nodes (algorithm='dp_repair', repair_round=r).
+        out_debug_hexes: Optional list; each searched sub_corridor cell is
+                         appended as a dict with h3_index, repair_round, gap_idx,
+                         buffer_ring.
 
     Returns:
         Updated chain (same list object).
@@ -450,6 +454,14 @@ def _repair_broken_gaps(
             _expand_segment_buffer(sub_corridor, sub_set, new_ring, surface)
         except Exception:
             pass
+        if out_debug_hexes is not None:
+            for h3_cell in sub_corridor:
+                out_debug_hexes.append({
+                    'h3_index': h3_cell,
+                    'repair_round': repair_round,
+                    'gap_idx': i,
+                    'buffer_ring': new_ring,
+                })
         # Budget for this gap: remaining interior slots after already-placed towers.
         # chain includes both endpoints, so interior count = len(chain) - 2.
         already_interior = len(chain) - 2
@@ -693,6 +705,7 @@ def place_nodes_along_corridor(
     # Phase 2: targeted gap repair.
     # Find consecutive pairs with no corridor-path LOS and re-run DP on the
     # sub-corridor between their surrounding anchors with a wider buffer ring.
+    _debug_hexes: List[dict] = []
     for repair_round in range(1, config.gap_repair_rounds + 1):
         broken = _find_broken_gaps(
             all_nodes, corridor, corridor_pos, surface, cache,
@@ -709,6 +722,7 @@ def place_nodes_along_corridor(
             buffer_ring, repair_round, surface, cache,
             user_budget=effective_budget - 2,
             node_meta=node_meta,
+            out_debug_hexes=_debug_hexes,
         )
     else:
         still_broken = _find_broken_gaps(
@@ -729,6 +743,9 @@ def place_nodes_along_corridor(
 
     if out_meta is not None:
         out_meta.update(node_meta)
+
+    if _debug_hexes:
+        surface.gap_repair_debug.extend(_debug_hexes)
 
     return all_nodes
 

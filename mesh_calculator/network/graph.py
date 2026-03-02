@@ -163,6 +163,7 @@ class MeshSurface:
         self.tower_by_h3: Dict[str, Tower] = {}
         self.visibility_graph = VisibilityGraph()
         self._next_tower_id = 1
+        self.gap_repair_debug: list = []  # debug records from gap repair rounds
 
     def place_tower(
         self,
