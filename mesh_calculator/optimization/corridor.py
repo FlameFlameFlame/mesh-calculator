@@ -618,42 +618,16 @@ def place_nodes_along_corridor(
         seg_nodes = seg_result[0] if seg_result is not None else None
         seg_best_t = seg_result[1] if seg_result is not None else None
 
-        # If DP fails, retry up to 3 times with progressively wider buffer
-        # rings injected into the segment — this finds elevated relay cells
-        # that give LOS across terrain the road itself cannot clear.
         if seg_nodes is None:
-            segment_set = set(segment)
-            for attempt in range(1, 4):
-                try:
-                    added = _expand_segment_buffer(
-                        segment, segment_set,
-                        buffer_ring + attempt, surface,
-                    )
-                except Exception:
-                    added = 0
-                logger.warning(
-                    "DP failed; retrying with wider buffer",
-                    attempt=attempt,
-                    added_cells=added,
-                    seg_len=len(segment),
-                )
-                seg_result = _dp_place_towers_with_meta(
-                    segment, surface, cache, seg_k,
-                )
-                if seg_result is not None:
-                    seg_nodes, seg_best_t = seg_result
-                    break
-
-        if seg_nodes is None:
-            logger.error(
-                "DP found no feasible LOS chain after 3 buffer expansions"
-                " — skipping segment",
+            logger.warning(
+                "DP found no feasible LOS chain — gap repair will handle it",
                 seg_len=len(segment),
                 k=seg_k,
                 start=segment[0],
                 end=segment[-1],
             )
-            # Include only endpoints so the corridor is not completely broken
+            # Include only endpoints so the chain is not completely broken;
+            # gap repair rounds will insert relays as needed.
             seg_nodes = [segment[0], segment[-1]]
             seg_best_t = None
 
@@ -669,9 +643,7 @@ def place_nodes_along_corridor(
                 node_meta[node_h3] = {'algorithm': 'endpoint_fallback',
                                       'dp_steps': None, 'repair_round': None}
 
-        # Sync corridor_pos with any buffer cells injected into segment
-        # during the retry loop — they may have been chosen by DP and will
-        # appear in all_nodes, so they must be findable in corridor_pos.
+        # Sync corridor_pos with any buffer cells injected into segment.
         for seg_h3 in segment:
             if seg_h3 not in corridor_pos:
                 corridor_pos[seg_h3] = len(corridor)
