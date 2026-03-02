@@ -400,24 +400,28 @@ def _repair_broken_gaps(
     repair_round: int,
     surface: MeshSurface,
     cache: LOSCache,
-    k: int,
+    user_budget: int,
     node_meta: Optional[Dict[str, dict]] = None,
 ) -> List[str]:
     """
-    For each broken gap in chain, expand the sub-corridor between surrounding
-    anchors and re-run DP to find a relay path around the obstacle.
+    For each broken gap in chain, expand the sub-corridor between the two
+    broken towers and re-run DP to find a relay path around the obstacle.
+
+    After a successful repair, prune any now-redundant towers that follow
+    anchor_b: if anchor_b has direct LOS to chain[i+k] for some k>1, the
+    intermediate towers chain[i+1..i+k-1] are removed.
 
     Args:
-        chain:         Current tower chain (modified in place and returned).
-        corridor:      Full corridor (with buffer cells already injected).
-        corridor_pos:  Position lookup {h3_idx: position_in_corridor}.
-        base_ring:     Initial buffer ring size from config.
-        repair_round:  1-based round number; ring expands to base_ring*(round+1).
-        surface:       MeshSurface.
-        cache:         LOSCache (may be None).
-        k:             Max towers for DP (uses effective_budget).
-        node_meta:     Optional dict to populate with placement metadata for
-                       newly introduced nodes (algorithm='dp_repair', repair_round=r).
+        chain:        Current tower chain (modified in-place and returned).
+        corridor:     Full corridor (with buffer cells already injected).
+        corridor_pos: Position lookup {h3_idx: position_in_corridor}.
+        base_ring:    Initial buffer ring size from config.
+        repair_round: 1-based round number; ring expands to base_ring*(round+1).
+        surface:      MeshSurface.
+        cache:        LOSCache (may be None).
+        user_budget:  Max total interior towers allowed (effective_budget - 2).
+        node_meta:    Optional dict populated with placement metadata for newly
+                      introduced nodes (algorithm='dp_repair', repair_round=r).
 
     Returns:
         Updated chain (same list object).
@@ -446,7 +450,11 @@ def _repair_broken_gaps(
             _expand_segment_buffer(sub_corridor, sub_set, new_ring, surface)
         except Exception:
             pass
-        result = _dp_place_towers_with_meta(sub_corridor, surface, cache, k)
+        # Budget for this gap: remaining interior slots after already-placed towers.
+        # chain includes both endpoints, so interior count = len(chain) - 2.
+        already_interior = len(chain) - 2
+        gap_k = max(2, user_budget - already_interior)
+        result = _dp_place_towers_with_meta(sub_corridor, surface, cache, gap_k)
         if result is None:
             logger.warning(
                 "Gap repair DP failed",
@@ -475,6 +483,30 @@ def _repair_broken_gaps(
             "Gap repair successful",
             repair_round=repair_round, gap_idx=i, new_nodes=len(new_seg),
         )
+        # Post-repair pruning: the new anchor_b (chain[i + len(new_seg) - 1])
+        # may now have direct LOS to a later tower, making intermediate towers
+        # redundant. Find the furthest reachable tower and remove the ones
+        # in between.
+        new_anchor_b_idx = i + len(new_seg) - 1
+        if new_anchor_b_idx + 2 <= len(chain) - 1:
+            new_anchor_b = chain[new_anchor_b_idx]
+            furthest_reachable = new_anchor_b_idx + 1  # default: no pruning
+            for j in range(len(chain) - 1, new_anchor_b_idx + 1, -1):
+                los = compute_los(
+                    new_anchor_b, chain[j],
+                    surface.cells, surface.config, cache,
+                    elevation_provider=surface.elevation_provider,
+                )
+                if los.is_visible:
+                    furthest_reachable = j
+                    break
+            if furthest_reachable > new_anchor_b_idx + 1:
+                pruned = chain[new_anchor_b_idx + 1:furthest_reachable]
+                del chain[new_anchor_b_idx + 1:furthest_reachable]
+                logger.info(
+                    "Post-repair pruned redundant towers",
+                    count=len(pruned), after_idx=new_anchor_b_idx,
+                )
     return chain
 
 
@@ -671,7 +703,8 @@ def place_nodes_along_corridor(
         )
         all_nodes = _repair_broken_gaps(
             all_nodes, corridor, corridor_pos,
-            buffer_ring, repair_round, surface, cache, effective_budget,
+            buffer_ring, repair_round, surface, cache,
+            user_budget=effective_budget - 2,
             node_meta=node_meta,
         )
     else:
