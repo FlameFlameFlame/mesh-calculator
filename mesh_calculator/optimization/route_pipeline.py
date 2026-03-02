@@ -386,8 +386,12 @@ def run_route_pipeline(
 
         # Place towers along trimmed corridor (city interior already excluded)
         towers_before = len(surface.towers)
-        placed = place_nodes_along_corridor(trimmed_corridor, surface, los_cache)
-        install_nodes(placed, surface, source=route.route_id)
+        placement_meta: dict = {}
+        placed = place_nodes_along_corridor(
+            trimmed_corridor, surface, los_cache, out_meta=placement_meta,
+        )
+        install_nodes(placed, surface, source=route.route_id,
+                      placement_meta=placement_meta)
         towers_after = len(surface.towers)
 
         # Wire corridor-path visibility edges between consecutive placed towers.

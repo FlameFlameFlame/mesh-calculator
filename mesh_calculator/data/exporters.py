@@ -26,6 +26,7 @@ def export_towers_geojson(surface: MeshSurface, output_path: str):
     features = []
 
     for tower in surface.towers.values():
+        meta = tower.placement_meta or {}
         feature = {
             'type': 'Feature',
             'geometry': {
@@ -41,7 +42,13 @@ def export_towers_geojson(surface: MeshSurface, output_path: str):
                 'city_link': getattr(tower, 'city_link', False),
                 'coverage_radius_m': getattr(tower, 'coverage_radius_m', 0.0),
                 'lat': tower.lat,
-                'lon': tower.lon
+                'lon': tower.lon,
+                'algorithm': meta.get(
+                    'algorithm',
+                    'site' if tower.source == 'site' else None,
+                ),
+                'dp_steps': meta.get('dp_steps'),
+                'repair_round': meta.get('repair_round'),
             }
         }
         features.append(feature)
@@ -182,6 +189,23 @@ def export_visibility_edges_geojson(surface: MeshSurface, output_path: str):
     """
     features = []
 
+    def _link_type(t1, t2) -> str:
+        """Classify a visibility link for color rendering.
+
+        green  — both towers placed by normal DP (or are site anchors)
+        yellow — either tower was placed by gap-repair DP
+        red    — either tower fell back to peak/endpoint fallback
+        """
+        algs = {
+            (t1.placement_meta or {}).get('algorithm'),
+            (t2.placement_meta or {}).get('algorithm'),
+        }
+        if algs & {'peak_fallback', 'endpoint_fallback'}:
+            return 'red'
+        if algs & {'dp_repair'}:
+            return 'yellow'
+        return 'green'
+
     for t1_id, t2_id, data in surface.visibility_graph.graph.edges(data=True):
         t1 = surface.towers[t1_id]
         t2 = surface.towers[t2_id]
@@ -206,6 +230,7 @@ def export_visibility_edges_geojson(surface: MeshSurface, output_path: str):
                 'distance_m': data.get('distance_m'),
                 'clearance_m': data.get('clearance_m'),
                 'path_loss_db': data.get('path_loss_db'),
+                'link_type': _link_type(t1, t2),
             }
         }
         features.append(feature)

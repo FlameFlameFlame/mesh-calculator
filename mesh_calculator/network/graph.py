@@ -3,8 +3,8 @@ Network graph representation for towers and visibility.
 """
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
-from typing import Dict, Set
+from dataclasses import dataclass, field
+from typing import Dict, Optional, Set
 
 import networkx as nx
 import numpy as np
@@ -33,6 +33,10 @@ class Tower:
         h3_index: H3 cell index where tower is placed
         lat, lon: Tower coordinates
         source: Source of tower placement ('seed', 'route', 'bridge', 'greedy', 'corridor')
+        placement_meta: Debug metadata about how/why this tower was placed.
+            Keys: algorithm ('dp'|'dp_repair'|'peak_fallback'|'endpoint_fallback'|'site'),
+                  dp_steps (int, tower count t used in winning DP solution),
+                  repair_round (int, 1-3 for dp_repair towers).
     """
     tower_id: int
     h3_index: str
@@ -41,6 +45,7 @@ class Tower:
     source: str
     city_link: bool = False
     coverage_radius_m: float = 0.0  # Max distance of any LOS-covered cell
+    placement_meta: dict = field(default_factory=dict)
 
 
 class VisibilityGraph:
@@ -159,13 +164,19 @@ class MeshSurface:
         self.visibility_graph = VisibilityGraph()
         self._next_tower_id = 1
 
-    def place_tower(self, h3_index: str, source: str = 'unknown') -> Tower:
+    def place_tower(
+        self,
+        h3_index: str,
+        source: str = 'unknown',
+        placement_meta: Optional[dict] = None,
+    ) -> Tower:
         """
         Place a tower at an H3 cell.
 
         Args:
             h3_index: H3 cell index
             source: Source of tower placement
+            placement_meta: Optional debug metadata (algorithm, dp_steps, repair_round, …)
 
         Returns:
             Created Tower object
@@ -184,7 +195,8 @@ class MeshSurface:
             h3_index=h3_index,
             lat=cell.lat,
             lon=cell.lon,
-            source=source
+            source=source,
+            placement_meta=placement_meta or {},
         )
 
         self.towers[tower.tower_id] = tower
