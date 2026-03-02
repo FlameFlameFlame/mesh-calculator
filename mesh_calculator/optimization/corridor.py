@@ -617,16 +617,6 @@ def place_nodes_along_corridor(
             # Include only endpoints so the corridor is not completely broken
             seg_nodes = [segment[0], segment[-1]]
 
-        # Prune redundant towers: remove interior nodes whose neighbors
-        # already have LOS to each other (prevents clustering).
-        pre_prune = len(seg_nodes)
-        seg_nodes = _prune_redundant(seg_nodes, segment, surface, cache)
-        if len(seg_nodes) < pre_prune:
-            logger.info(
-                "Pruned %d redundant tower(s) from segment",
-                pre_prune - len(seg_nodes),
-            )
-
         # Sync corridor_pos with any buffer cells injected into segment
         # during the retry loop — they may have been chosen by DP and will
         # appear in all_nodes, so they must be findable in corridor_pos.
