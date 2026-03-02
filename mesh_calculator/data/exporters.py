@@ -179,6 +179,40 @@ def export_grid_cells_geojson(cells: Dict, output_path: str):
     logger.info("Exported grid cells", count=len(features), path=output_path)
 
 
+def export_gap_repair_hexes_geojson(debug_hexes: list, output_path: str):
+    """
+    Export gap repair search hexagons as GeoJSON polygons.
+
+    Each record in debug_hexes corresponds to an H3 cell that was included
+    in a gap repair sub-corridor during a specific repair round.
+
+    Args:
+        debug_hexes: List of dicts with keys h3_index, repair_round, gap_idx, buffer_ring
+        output_path: Output GeoJSON file path
+    """
+    features = []
+    for rec in debug_hexes:
+        h3_idx = rec['h3_index']
+        boundary = h3.cell_to_boundary(h3_idx)
+        coords = [[lon, lat] for lat, lon in boundary]
+        coords.append(coords[0])
+        features.append({
+            'type': 'Feature',
+            'geometry': {'type': 'Polygon', 'coordinates': [coords]},
+            'properties': {
+                'h3_index': h3_idx,
+                'repair_round': rec['repair_round'],
+                'gap_idx': rec['gap_idx'],
+                'buffer_ring': rec['buffer_ring'],
+            },
+        })
+
+    geojson = {'type': 'FeatureCollection', 'features': features}
+    with open(output_path, 'w') as f:
+        json.dump(geojson, f, indent=2)
+    logger.info("Exported gap repair hexes", count=len(features), path=output_path)
+
+
 def export_visibility_edges_geojson(surface: MeshSurface, output_path: str):
     """
     Export visibility graph edges as GeoJSON LineStrings.

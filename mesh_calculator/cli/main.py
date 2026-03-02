@@ -16,6 +16,7 @@ from ..data.cache import LOSCache
 from ..data.exporters import (
     export_towers_geojson, export_coverage_geojson,
     export_tower_coverage_geojson, export_visibility_edges_geojson, generate_report,
+    export_gap_repair_hexes_geojson,
 )
 from ..core.elevation import ElevationProvider
 from ..core.grid import load_boundary, load_roads, generate_road_grid
@@ -161,6 +162,9 @@ def main(config: str, output: str, verbose: bool, quiet: bool):
         export_tower_coverage_geojson(radial_hexes, tower_coverage_path)
         generate_report(surface, report_path)
         export_visibility_edges_geojson(surface, edges_path)
+        if surface.gap_repair_debug:
+            debug_path = os.path.join(output, 'gap_repair_hexes.geojson')
+            export_gap_repair_hexes_geojson(surface.gap_repair_debug, debug_path)
 
     # Log cache stats
     cache_stats = los_cache.stats()
