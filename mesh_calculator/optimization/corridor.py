@@ -331,6 +331,124 @@ def _fill_visibility_gaps(
     return result
 
 
+def _find_broken_gaps(
+    chain: List[str],
+    corridor: List[str],
+    corridor_pos: Dict[str, int],
+    surface: MeshSurface,
+    cache: LOSCache,
+) -> List[int]:
+    """
+    Return list of chain indices i where chain[i]↔chain[i+1] has no corridor-path LOS.
+
+    Args:
+        chain:        Ordered list of placed tower H3 indices.
+        corridor:     Full corridor used during placement.
+        corridor_pos: Position lookup {h3_idx: position_in_corridor}.
+        surface:      MeshSurface.
+        cache:        LOSCache (may be None).
+
+    Returns:
+        List of indices i (into chain) where the pair (chain[i], chain[i+1]) is broken.
+    """
+    broken = []
+    for i in range(len(chain) - 1):
+        h3_a, h3_b = chain[i], chain[i + 1]
+        pos_a = corridor_pos.get(h3_a)
+        pos_b = corridor_pos.get(h3_b)
+        if pos_a is not None and pos_b is not None:
+            lo, hi = (pos_a, pos_b) if pos_a <= pos_b else (pos_b, pos_a)
+            corridor_cells_seg = corridor[lo:hi + 1]
+        else:
+            corridor_cells_seg = None
+        los = compute_los(
+            h3_a, h3_b,
+            surface.cells, surface.config, cache,
+            elevation_provider=surface.elevation_provider,
+            corridor_cells=corridor_cells_seg,
+        )
+        if not los.is_visible:
+            broken.append(i)
+    return broken
+
+
+def _repair_broken_gaps(
+    chain: List[str],
+    corridor: List[str],
+    corridor_pos: Dict[str, int],
+    base_ring: int,
+    repair_round: int,
+    surface: MeshSurface,
+    cache: LOSCache,
+    k: int,
+) -> List[str]:
+    """
+    For each broken gap in chain, expand the sub-corridor between surrounding
+    anchors and re-run DP to find a relay path around the obstacle.
+
+    Args:
+        chain:         Current tower chain (modified in place and returned).
+        corridor:      Full corridor (with buffer cells already injected).
+        corridor_pos:  Position lookup {h3_idx: position_in_corridor}.
+        base_ring:     Initial buffer ring size from config.
+        repair_round:  1-based round number; ring expands to base_ring*(round+1).
+        surface:       MeshSurface.
+        cache:         LOSCache (may be None).
+        k:             Max towers for DP (uses effective_budget).
+
+    Returns:
+        Updated chain (same list object).
+    """
+    broken = _find_broken_gaps(chain, corridor, corridor_pos, surface, cache)
+    if not broken:
+        return chain
+
+    new_ring = base_ring * (repair_round + 1)  # 2x, 3x, 4x on rounds 1/2/3
+    # Process in reverse so splices don't shift subsequent broken indices
+    for i in reversed(broken):
+        anchor_a = chain[i - 1] if i > 0 else chain[i]
+        anchor_b = chain[i + 2] if i + 2 < len(chain) else chain[i + 1]
+        pos_a = corridor_pos.get(anchor_a)
+        pos_b = corridor_pos.get(anchor_b)
+        if pos_a is None or pos_b is None:
+            logger.warning(
+                "Cannot find anchor positions for gap repair",
+                repair_round=repair_round, gap_idx=i,
+            )
+            continue
+        lo, hi = (pos_a, pos_b) if pos_a <= pos_b else (pos_b, pos_a)
+        sub_corridor = list(corridor[lo:hi + 1])
+        sub_set = set(sub_corridor)
+        try:
+            _expand_segment_buffer(sub_corridor, sub_set, new_ring, surface)
+        except Exception:
+            pass
+        new_seg = _dp_place_towers(sub_corridor, surface, cache, k)
+        if new_seg is None:
+            logger.warning(
+                "Gap repair DP failed",
+                repair_round=repair_round, gap_idx=i,
+                anchor_a=anchor_a, anchor_b=anchor_b,
+            )
+            continue
+        # Splice new_seg into chain replacing the broken section.
+        # anchor_a == new_seg[0], anchor_b == new_seg[-1].
+        left = (i - 1) if i > 0 else i
+        right = (i + 2) if i + 2 < len(chain) else (i + 1)
+        chain[left:right + 1] = new_seg
+        # Register any newly introduced cells into corridor_pos so subsequent
+        # repair rounds can locate them as anchors.
+        for h3_cell in new_seg:
+            if h3_cell not in corridor_pos:
+                corridor_pos[h3_cell] = len(corridor)
+                corridor.append(h3_cell)
+        logger.info(
+            "Gap repair successful",
+            repair_round=repair_round, gap_idx=i, new_nodes=len(new_seg),
+        )
+    return chain
+
+
 def place_nodes_along_corridor(
     corridor: List[str],
     surface: MeshSurface,
@@ -364,7 +482,7 @@ def place_nodes_along_corridor(
     config = surface.config
     cells = surface.cells
 
-    from ..core.geometry import h3_distance, h3_to_lat_lon
+    from ..core.geometry import h3_distance
     corridor_set = set(corridor)
 
     # Inject buffer cells: for each road corridor cell, add the highest-elevation
@@ -409,6 +527,12 @@ def place_nodes_along_corridor(
             logger.info(
                 "Injected %d buffer cells as corridor candidates", injected_buffer
             )
+
+    # Build position lookup once (after buffer injection) for Phase 2 repair.
+    corridor_pos: Dict[str, int] = {}
+    for _idx, _h3 in enumerate(corridor):
+        if _h3 not in corridor_pos:
+            corridor_pos[_h3] = _idx
 
     # Find existing towers on this corridor and use them as free waypoints.
     # Split the corridor into segments separated by existing towers.
@@ -503,12 +627,47 @@ def place_nodes_along_corridor(
                 pre_prune - len(seg_nodes),
             )
 
+        # Sync corridor_pos with any buffer cells injected into segment
+        # during the retry loop — they may have been chosen by DP and will
+        # appear in all_nodes, so they must be findable in corridor_pos.
+        for seg_h3 in segment:
+            if seg_h3 not in corridor_pos:
+                corridor_pos[seg_h3] = len(corridor)
+                corridor.append(seg_h3)
+
         for n in seg_nodes:
             if n not in seen:
                 seen.add(n)
                 all_nodes.append(n)
 
     logger.debug("Nodes placed along corridor (DP)", count=len(all_nodes))
+
+    # Phase 2: targeted gap repair.
+    # Find consecutive pairs with no corridor-path LOS and re-run DP on the
+    # sub-corridor between their surrounding anchors with a wider buffer ring.
+    for repair_round in range(1, 4):
+        broken = _find_broken_gaps(
+            all_nodes, corridor, corridor_pos, surface, cache,
+        )
+        if not broken:
+            break
+        logger.info(
+            "Gap repair round %d: %d broken pair(s)",
+            repair_round, len(broken),
+        )
+        all_nodes = _repair_broken_gaps(
+            all_nodes, corridor, corridor_pos,
+            buffer_ring, repair_round, surface, cache, effective_budget,
+        )
+    else:
+        still_broken = _find_broken_gaps(
+            all_nodes, corridor, corridor_pos, surface, cache,
+        )
+        for i in still_broken:
+            logger.error(
+                "No LOS after 3 gap repair rounds",
+                h3_a=all_nodes[i], h3_b=all_nodes[i + 1],
+            )
 
     # Gap-fill: ensure no consecutive pair exceeds max_visibility_m
     pre_fill_count = len(all_nodes)
