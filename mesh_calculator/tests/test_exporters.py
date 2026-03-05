@@ -91,7 +91,7 @@ class TestExportVisibilityEdges(unittest.TestCase):
             os.unlink(path)
 
     def test_properties(self):
-        """Edge properties include source_id, target_id, distance_m, clearance_m, path_loss_db."""
+        """Edge properties include source_id, target_id, distance_m, clearance_m, path_loss_db, mast_height_m."""
         surface = _make_surface_with_edges()
         with tempfile.NamedTemporaryFile(suffix=".geojson", delete=False) as f:
             path = f.name
@@ -105,9 +105,11 @@ class TestExportVisibilityEdges(unittest.TestCase):
             self.assertIn("distance_m", props)
             self.assertIn("clearance_m", props)
             self.assertIn("path_loss_db", props)
+            self.assertIn("mast_height_m", props)
             self.assertAlmostEqual(props["distance_m"], 12000.0)
             self.assertAlmostEqual(props["clearance_m"], 15.5)
             self.assertAlmostEqual(props["path_loss_db"], 120.3)
+            self.assertAlmostEqual(props["mast_height_m"], surface.config.mast_height_m)
         finally:
             os.unlink(path)
 

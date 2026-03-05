@@ -17,3 +17,4 @@
 - 2026-03-05: Extended `LINK_BUDGET_AND_LOS.md` with runtime tower coverage API behavior and policy notes.
 - 2026-03-05: Added geometric LOS state export fields on visibility edges: `is_nlos` and `los_state` (`los`/`nlos`) derived from clearance sign.
 - 2026-03-05: Added exporter regression test coverage for LOS/NLOS edge-state serialization in `tests/test_exporters.py`.
+- 2026-03-05: Added `mast_height_m` to exported `visibility_edges.geojson` edge properties so link-analysis uses the mast value from the optimization run.
