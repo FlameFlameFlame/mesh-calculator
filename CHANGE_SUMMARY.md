@@ -9,3 +9,9 @@
 - 2026-03-05: Expanded LOS cache key with radio/policy parameters (`tx_power_mw`, `antenna_gain_dbi`, `receiver_sensitivity_dbm`, `min_fresnel_clearance_m`) to prevent stale visibility reuse across policy changes.
 - 2026-03-05: Added cache and config regression tests plus dual-mode scenario validation (`default_none` vs `strict_zero`) on `gyumri-greedy-bad`, `gyumri-vanadzor-random`, and `yerevan_gyumri`.
 - 2026-03-05: Added `LINK_BUDGET_AND_LOS.md` documenting Fresnel clearance, path loss, link budget policy, cache semantics, and how LOS decisions affect tower placement.
+- 2026-03-05: Added standalone runtime tower-coverage API in `mesh_calculator/network/tower_coverage.py` with `CoverageSource` and `compute_h3_tower_coverage(...)`, reusing `compute_los` and returning covered cells only.
+- 2026-03-05: Refactored `MeshSurface.compute_tower_radial_coverage` into a thin wrapper over the standalone coverage API to avoid duplicated LOS/coverage logic.
+- 2026-03-05: Removed automatic tower coverage export from route/CLI pipelines (`route_pipeline.py`, `cli/main.py`) while keeping road-cell coverage export unchanged.
+- 2026-03-05: Updated config parsing to ignore legacy unknown output keys (including `outputs.tower_coverage`) and added regression coverage in `tests/test_config_new_params.py`.
+- 2026-03-05: Added runtime coverage regression tests in `tests/test_tower_coverage_runtime.py` (source-cell path loss 0, dedupe behavior, negative-clearance visible link retention).
+- 2026-03-05: Extended `LINK_BUDGET_AND_LOS.md` with runtime tower coverage API behavior and policy notes.

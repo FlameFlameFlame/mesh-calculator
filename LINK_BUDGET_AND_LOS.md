@@ -86,7 +86,7 @@ Tower placement consumes `compute_los()` everywhere:
 - Gap repair rounds (`optimization/corridor.py`)
 - Edge wiring between placed towers (`wire_corridor_edges`)
 - Global visibility graph updates (`network/graph.py`)
-- Coverage and tower radial coverage (`network/graph.py`)
+- Road-cell coverage (`network/graph.py`)
 
 Practical effect:
 
@@ -123,3 +123,16 @@ For stricter geometric LOS compliance:
 
 - Set `min_fresnel_clearance_m` to `0.0` or higher.
 - Expect fewer feasible links and potentially more disconnected routes unless compensated by higher towers or better radio budget.
+
+## 10) Runtime tower coverage API
+
+Tower radial coverage is now an explicit runtime calculation, not an automatic route-pipeline export.
+
+- Standalone compute entrypoint: `mesh_calculator/network/tower_coverage.py`
+  - `CoverageSource(source_id, h3_index, lat, lon)`
+  - `compute_h3_tower_coverage(...)`
+- The same LOS function (`compute_los`) is reused, so Fresnel, diffraction, link budget, and optional clearance threshold are identical to placement logic.
+- Output is covered cells only, including the source H3 cell with:
+  - `distance_m = 0.0`
+  - `path_loss_db = 0.0`
+- `mesh-generator` calls this on demand for selected/all displayed towers and random clicked map points (when elevation is available).

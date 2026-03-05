@@ -15,7 +15,7 @@ from ..data.sites import load_sites, snap_sites_to_roads
 from ..data.cache import LOSCache
 from ..data.exporters import (
     export_towers_geojson, export_coverage_geojson,
-    export_tower_coverage_geojson, export_visibility_edges_geojson, generate_report,
+    export_visibility_edges_geojson, generate_report,
     export_gap_repair_hexes_geojson,
 )
 from ..core.elevation import ElevationProvider
@@ -136,11 +136,6 @@ def main(config: str, output: str, verbose: bool, quiet: bool):
     with PerfTimer("cell_coverage"):
         surface.compute_cell_coverage(los_cache)
 
-    # Compute radial tower coverage (all hexes within signal range, not just roads)
-    logger.info("[9.7/10] Computing tower radial coverage")
-    with PerfTimer("tower_radial_coverage"):
-        radial_hexes = surface.compute_tower_radial_coverage(los_cache)
-
     # Export results — use YAML output paths when configured, else --output dir
     logger.info("[10/10] Exporting results")
     with PerfTimer("export_results"):
@@ -149,17 +144,15 @@ def main(config: str, output: str, verbose: bool, quiet: bool):
 
         towers_path = out.towers if out.towers != _defaults.towers else os.path.join(output, 'towers.geojson')
         coverage_path = out.coverage if out.coverage != _defaults.coverage else os.path.join(output, 'coverage.geojson')
-        tower_coverage_path = out.tower_coverage if out.tower_coverage != _defaults.tower_coverage else os.path.join(output, 'tower_coverage.geojson')
         report_path = out.report if out.report != _defaults.report else os.path.join(output, 'report.json')
         edges_path = out.visibility_edges if out.visibility_edges != _defaults.visibility_edges else os.path.join(output, 'visibility_edges.geojson')
 
         # Ensure output directories exist
-        for p in (towers_path, coverage_path, tower_coverage_path, report_path, edges_path):
+        for p in (towers_path, coverage_path, report_path, edges_path):
             os.makedirs(os.path.dirname(os.path.abspath(p)), exist_ok=True)
 
         export_towers_geojson(surface, towers_path)
         export_coverage_geojson(surface, coverage_path)
-        export_tower_coverage_geojson(radial_hexes, tower_coverage_path)
         generate_report(surface, report_path)
         export_visibility_edges_geojson(surface, edges_path)
         if surface.gap_repair_debug:
