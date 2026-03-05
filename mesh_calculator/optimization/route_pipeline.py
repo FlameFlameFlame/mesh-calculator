@@ -8,7 +8,7 @@ edges, road-cell coverage, and optionally tags city links.
 import json
 import logging
 import os
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import h3
 
@@ -194,6 +194,7 @@ def run_route_pipeline(
     city_boundaries_geojson: Optional[dict] = None,
     output_dir: str = "output",
     strategy: str = 'dp',
+    progress_callback: Optional[Callable[[dict], None]] = None,
 ) -> dict:
     """
     Run the full route-based tower placement pipeline.
@@ -218,16 +219,58 @@ def run_route_pipeline(
         output_dir: Directory to write output files.
         strategy: Tower placement algorithm — 'dp' (MaxMin DP, default) or
                   'greedy' (furthest-clear-LOS, fewer towers, no gap repair).
+        progress_callback: Optional callback receiving structured progress dicts.
 
     Returns:
         Summary dict with tower count, route count, etc.
     """
+    total_routes = len(routes)
+    route_weight = (80.0 / total_routes) if total_routes > 0 else 0.0
+    has_city_phase = bool(
+        city_boundaries_geojson
+        and city_boundaries_geojson.get('features')
+    )
+    city_weight = 2.0 if has_city_phase else 0.0
+    export_start_percent = 98.0 if has_city_phase else 96.0
+
+    def _route_label(route: RouteSpec) -> str:
+        s1 = route.site1.get('name') if isinstance(route.site1, dict) else None
+        s2 = route.site2.get('name') if isinstance(route.site2, dict) else None
+        if s1 and s2:
+            return f"{s1} ↔ {s2} ({route.route_id})"
+        return route.route_id
+
+    def _emit_progress(
+        stage: str,
+        step: str,
+        percent: float,
+        route_index: Optional[int] = None,
+        route_id: Optional[str] = None,
+        route_label: Optional[str] = None,
+    ) -> None:
+        if progress_callback is None:
+            return
+        payload = {
+            'stage': stage,
+            'step': step,
+            'percent': max(0.0, min(100.0, float(percent))),
+            'route_total': total_routes,
+            'route_index': route_index if route_index is not None else 0,
+            'route_id': route_id,
+            'route_label': route_label,
+        }
+        try:
+            progress_callback(payload)
+        except Exception:
+            logger.debug("Progress callback failed", exc_info=True)
+
     os.makedirs(output_dir, exist_ok=True)
 
     logger.info(
         "Starting route pipeline: %d route(s), output=%s",
         len(routes), output_dir,
     )
+    _emit_progress('route', 'Starting route pipeline', 0.0)
 
     elevation_provider = ElevationProvider(elevation_path)
     surface = MeshSurface({}, mesh_config, elevation_provider)
@@ -235,7 +278,18 @@ def run_route_pipeline(
 
     route_summaries = []
 
-    for route in routes:
+    for route_idx, route in enumerate(routes, start=1):
+        route_base = (route_idx - 1) * route_weight
+        route_label = _route_label(route)
+        _emit_progress(
+            stage='route',
+            step='Preparing corridor',
+            percent=route_base,
+            route_index=route_idx,
+            route_id=route.route_id,
+            route_label=route_label,
+        )
+
         logger.info(
             "Processing route '%s': %d features, max_towers=%d",
             route.route_id, len(route.features), route.max_towers_per_route,
@@ -248,6 +302,14 @@ def run_route_pipeline(
             site1=route.site1,
             site2=route.site2,
         )
+        _emit_progress(
+            stage='route',
+            step='Preparing corridor',
+            percent=route_base + route_weight * 0.15,
+            route_index=route_idx,
+            route_id=route.route_id,
+            route_label=route_label,
+        )
 
         if len(corridor) < 2:
             logger.warning(
@@ -259,6 +321,14 @@ def run_route_pipeline(
                 'towers_placed': 0,
                 'skipped': True,
             })
+            _emit_progress(
+                stage='route',
+                step='Route skipped (corridor too short)',
+                percent=route_base + route_weight,
+                route_index=route_idx,
+                route_id=route.route_id,
+                route_label=route_label,
+            )
             continue
 
         logger.info("Corridor: %d cells for route '%s'", len(corridor), route.route_id)
@@ -286,6 +356,14 @@ def run_route_pipeline(
             corridor, mesh_config, elevation_provider, surface.cells
         )
         surface.cells.update(buffer_cells)
+        _emit_progress(
+            stage='route',
+            step='Preparing cells and buffer',
+            percent=route_base + route_weight * 0.35,
+            route_index=route_idx,
+            route_id=route.route_id,
+            route_label=route_label,
+        )
 
         logger.info(
             "Added %d corridor + %d buffer cells (total: %d)",
@@ -311,6 +389,14 @@ def run_route_pipeline(
                 'towers_reused': 0,
                 'skipped': True,
             })
+            _emit_progress(
+                stage='route',
+                step='Route skipped (no eligible corridor)',
+                percent=route_base + route_weight,
+                route_index=route_idx,
+                route_id=route.route_id,
+                route_label=route_label,
+            )
             continue
 
         logger.info(
@@ -397,6 +483,14 @@ def run_route_pipeline(
         install_nodes(placed, surface, source=route.route_id,
                       placement_meta=placement_meta)
         towers_after = len(surface.towers)
+        _emit_progress(
+            stage='route',
+            step='Placing and installing towers',
+            percent=route_base + route_weight * 0.80,
+            route_index=route_idx,
+            route_id=route.route_id,
+            route_label=route_label,
+        )
 
         # Wire corridor-path visibility edges between consecutive placed towers.
         # The DP proved these pairs are LOS-connected along the road path; we
@@ -419,20 +513,35 @@ def run_route_pipeline(
             'towers_new': new_tower_count,
             'towers_reused': len(placed) - new_tower_count,
         })
+        _emit_progress(
+            stage='route',
+            step='Finalizing route links',
+            percent=route_base + route_weight,
+            route_index=route_idx,
+            route_id=route.route_id,
+            route_label=route_label,
+        )
 
     # Compute visibility edges between all towers
+    _emit_progress('visibility', 'Computing visibility edges', 80.0)
     logger.info("Computing visibility edges for %d tower(s)...", len(surface.towers))
     surface.update_visibility_edges(los_cache)
+    _emit_progress('visibility', 'Visibility edges computed', 88.0)
 
     # Compute per-cell coverage (path loss per hex)
+    _emit_progress('coverage', 'Computing road-cell coverage', 88.0)
     logger.info("Computing cell coverage...")
     surface.compute_cell_coverage(los_cache)
+    _emit_progress('coverage', 'Coverage computed', 96.0)
 
     # Tag city links
     if city_boundaries_geojson:
+        _emit_progress('city_links', 'Tagging city links', 96.0)
         tag_city_links(surface, city_boundaries_geojson, threshold=0.20)
+        _emit_progress('city_links', 'City links tagged', 96.0 + city_weight)
 
     # Export results
+    _emit_progress('export', 'Exporting outputs and report', export_start_percent)
     towers_path = os.path.join(output_dir, 'towers.geojson')
     coverage_path = os.path.join(output_dir, 'coverage.geojson')
     edges_path = os.path.join(output_dir, 'visibility_edges.geojson')
@@ -447,6 +556,7 @@ def run_route_pipeline(
     if surface.gap_repair_debug:
         export_gap_repair_hexes_geojson(surface.gap_repair_debug, gap_repair_hexes_path)
     generate_report(surface, report_path)
+    _emit_progress('export', 'Outputs exported', 100.0)
 
     cache_stats = los_cache.stats()
     elev_stats = elevation_provider.cache_stats()
@@ -466,4 +576,5 @@ def run_route_pipeline(
         "Pipeline complete: %d towers, %d cells, %d visibility edges",
         summary['total_towers'], summary['total_cells'], summary['visibility_edges'],
     )
+    _emit_progress('done', 'Pipeline complete', 100.0)
     return summary
