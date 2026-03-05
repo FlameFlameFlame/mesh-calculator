@@ -15,6 +15,49 @@ from ..network.graph import MeshSurface
 logger = structlog.get_logger(__name__)
 
 
+def _effective_initial_search_radius_m(config: MeshConfig) -> float:
+    """Resolve planner search radius, preserving backward compatibility."""
+    if config.optimizer_search_radius_m is not None:
+        return max(0.0, float(config.optimizer_search_radius_m))
+    return max(0.0, float(config.road_buffer_m))
+
+
+def _radius_to_ring_m(config: MeshConfig, radius_m: float, minimum: int = 0) -> int:
+    """Convert a metric radius to H3 disk ring count."""
+    if radius_m <= 0:
+        return minimum
+    import math
+    edge_m = h3.average_hexagon_edge_length(config.h3_resolution, unit='m')
+    return max(minimum, math.ceil(radius_m / edge_m))
+
+
+def _append_search_debug_records(
+    surface: MeshSurface,
+    h3_indices: List[str],
+    algorithm: str,
+    phase: str,
+    attempt_id: int,
+    segment_idx: int,
+    repair_round: Optional[int],
+    search_radius_m: float,
+    search_ring: int,
+) -> None:
+    for h3_idx in h3_indices:
+        surface.gap_repair_debug.append({
+            'h3_index': h3_idx,
+            'algorithm': algorithm,
+            'phase': phase,
+            'attempt_id': attempt_id,
+            'segment_idx': segment_idx,
+            'repair_round': repair_round,
+            'search_radius_m': search_radius_m,
+            'search_ring': search_ring,
+            # Legacy keys kept for compatibility with existing layer tooltips.
+            'gap_idx': segment_idx,
+            'buffer_ring': search_ring,
+        })
+
+
 def _dp_place_towers_with_meta(
     corridor: List[str],
     surface: MeshSurface,
@@ -375,13 +418,13 @@ def _repair_broken_gaps(
     chain: List[str],
     corridor: List[str],
     corridor_pos: Dict[str, int],
-    base_ring: int,
+    search_radius_m: float,
     repair_round: int,
+    attempt_id: int,
     surface: MeshSurface,
     cache: LOSCache,
     user_budget: int,
     node_meta: Optional[Dict[str, dict]] = None,
-    out_debug_hexes: Optional[List[dict]] = None,
 ) -> List[str]:
     """
     For each broken gap in chain, expand the sub-corridor between the two
@@ -395,17 +438,14 @@ def _repair_broken_gaps(
         chain:           Current tower chain (modified in-place and returned).
         corridor:        Full corridor (with buffer cells already injected).
         corridor_pos:    Position lookup {h3_idx: position_in_corridor}.
-        base_ring:       Initial buffer ring size from config.
-        repair_round:    1-based round number; ring expands to base_ring*(round+1).
+        search_radius_m: Search radius to use in this repair round.
+        repair_round:    1-based gap-repair round.
+        attempt_id:      Placement attempt id.
         surface:         MeshSurface.
         cache:           LOSCache (may be None).
         user_budget:     Max total interior towers allowed (effective_budget - 2).
         node_meta:       Optional dict populated with placement metadata for newly
                          introduced nodes (algorithm='dp_repair', repair_round=r).
-        out_debug_hexes: Optional list; each searched sub_corridor cell is
-                         appended as a dict with h3_index, repair_round, gap_idx,
-                         buffer_ring.
-
     Returns:
         Updated chain (same list object).
     """
@@ -413,7 +453,7 @@ def _repair_broken_gaps(
     if not broken:
         return chain
 
-    new_ring = base_ring * (repair_round + 1)  # 2x, 3x, 4x on rounds 1/2/3
+    new_ring = _radius_to_ring_m(surface.config, search_radius_m, minimum=1)
     # Process in reverse so splices don't shift subsequent broken indices
     for i in reversed(broken):
         anchor_a = chain[i]
@@ -433,14 +473,17 @@ def _repair_broken_gaps(
             _expand_segment_buffer(sub_corridor, sub_set, new_ring, surface)
         except Exception:
             pass
-        if out_debug_hexes is not None:
-            for h3_cell in sub_corridor:
-                out_debug_hexes.append({
-                    'h3_index': h3_cell,
-                    'repair_round': repair_round,
-                    'gap_idx': i,
-                    'buffer_ring': new_ring,
-                })
+        _append_search_debug_records(
+            surface=surface,
+            h3_indices=sub_corridor,
+            algorithm='dp',
+            phase='gap_repair',
+            attempt_id=attempt_id,
+            segment_idx=i,
+            repair_round=repair_round,
+            search_radius_m=search_radius_m,
+            search_ring=new_ring,
+        )
         # Budget for this gap: remaining interior slots after already-placed towers.
         # chain includes both endpoints, so interior count = len(chain) - 2.
         already_interior = len(chain) - 2
@@ -509,6 +552,9 @@ def _greedy_place_towers(
     cache: LOSCache,
     k: int,
     out_meta: Optional[Dict[str, dict]] = None,
+    search_radius_m: Optional[float] = None,
+    attempt_id: int = 0,
+    segment_idx: int = 0,
 ) -> List[str]:
     """
     Buffer-aware furthest-clear-LOS greedy tower placement.
@@ -533,11 +579,13 @@ def _greedy_place_towers(
     config = surface.config
     elevation_provider = surface.elevation_provider
 
-    # Compute buffer ring size — minimum 1 even when road_buffer_m=0
-    edge_m = h3.average_hexagon_edge_length(config.h3_resolution, unit='m')
-    buffer_ring = max(1,
-        round(config.road_buffer_m / edge_m) if config.road_buffer_m > 0 else 1
+    # Greedy keeps at least a 1-ring neighborhood even when search radius is 0.
+    effective_radius_m = (
+        float(search_radius_m)
+        if search_radius_m is not None
+        else _effective_initial_search_radius_m(config)
     )
+    buffer_ring = _radius_to_ring_m(config, effective_radius_m, minimum=1)
 
     # Identify road cells and assign road-position index to every corridor cell
     road_cells = [c for c in corridor if cells.get(c) and cells[c].has_road]
@@ -632,6 +680,18 @@ def _greedy_place_towers(
                 current = road_cells[current_road_j]
             continue
 
+        _append_search_debug_records(
+            surface=surface,
+            h3_indices=list(set(src_buffer).union(dst_candidates.keys())),
+            algorithm='greedy',
+            phase='initial',
+            attempt_id=attempt_id,
+            segment_idx=segment_idx,
+            repair_round=None,
+            search_radius_m=effective_radius_m,
+            search_ring=buffer_ring,
+        )
+
         # Build (src, dst) pairs within visibility range
         pairs = [
             (src, dst)
@@ -716,197 +776,243 @@ def place_nodes_along_corridor(
 
     config = surface.config
     cells = surface.cells
-
     from ..core.geometry import h3_distance
-    corridor_set = set(corridor)
 
-    # Inject buffer cells: for each road corridor cell, add the highest-elevation
-    # neighbor from the road buffer (cells already in surface.cells with has_road=False)
-    # at the corridor position closest to that neighbor.
-    # This lets the DP route through elevated terrain adjacent to the road.
-    buffer_ring = config.road_buffer_rings if hasattr(config, 'road_buffer_rings') else (
-        max(1, round(config.road_buffer_m / h3.average_hexagon_edge_length(
-            config.h3_resolution, unit='m'))) if config.road_buffer_m > 0 else 0
-    )
-    if buffer_ring > 0:
+    def _normalize_radii(values: Optional[List[float]], default_value: float) -> List[float]:
+        radii = []
+        for value in values or []:
+            try:
+                radius = float(value)
+            except (TypeError, ValueError):
+                continue
+            if radius < 0:
+                continue
+            radii.append(radius)
+        if not radii:
+            radii = [default_value]
+        return radii
+
+    def _inject_buffer_candidates(
+        working_corridor: List[str],
+        search_radius_m: float,
+    ) -> int:
+        corridor_set = set(working_corridor)
+        search_ring = _radius_to_ring_m(config, search_radius_m, minimum=0)
+        if search_ring <= 0:
+            return 0
         candidate_buffer_cells = []
         for road_h3 in list(corridor_set):
-            neighbors = h3.grid_disk(road_h3, buffer_ring)
+            try:
+                neighbors = h3.grid_disk(road_h3, search_ring)
+            except Exception:
+                continue
             for nb in neighbors:
                 if nb not in corridor_set and nb in cells and not cells[nb].has_road:
                     candidate_buffer_cells.append(nb)
-        # For each road cell, keep only the highest-elevation buffer neighbor
-        # to avoid inflating corridor length with many flat buffer cells.
         best_by_road: dict = {}
         for nb in candidate_buffer_cells:
-            # Find the road cell this buffer cell is closest to
             closest = min(corridor_set, key=lambda r: h3_distance(nb, r))
             elev = cells[nb].elevation
             if closest not in best_by_road or elev > best_by_road[closest][1]:
                 best_by_road[closest] = (nb, elev)
-
-        injected_buffer = 0
+        injected = 0
         for road_h3, (nb, _elev) in best_by_road.items():
             if nb in corridor_set:
                 continue
-            # Insert after the road cell it belongs to
             try:
-                pos = corridor.index(road_h3)
+                pos = working_corridor.index(road_h3)
             except ValueError:
                 continue
-            corridor.insert(pos + 1, nb)
+            working_corridor.insert(pos + 1, nb)
             corridor_set.add(nb)
-            injected_buffer += 1
+            injected += 1
+        return injected
 
+    def _run_attempt(
+        search_radius_m: float,
+        attempt_id: int,
+        phase_label: str,
+    ) -> tuple[List[str], Dict[str, dict], List[str], Dict[str, int], int]:
+        working_corridor = list(corridor)
+        injected_buffer = _inject_buffer_candidates(working_corridor, search_radius_m)
         if injected_buffer:
             logger.info(
                 "Injected %d buffer cells as corridor candidates", injected_buffer
             )
 
-    # Build position lookup once (after buffer injection) for Phase 2 repair.
-    corridor_pos: Dict[str, int] = {}
-    for _idx, _h3 in enumerate(corridor):
-        if _h3 not in corridor_pos:
-            corridor_pos[_h3] = _idx
+        corridor_pos: Dict[str, int] = {}
+        for _idx, _h3 in enumerate(working_corridor):
+            if _h3 not in corridor_pos:
+                corridor_pos[_h3] = _idx
 
-    # Find existing towers on this corridor and use them as free waypoints.
-    # Split the corridor into segments separated by existing towers.
-    # Exclude position 0: it is always the start boundary, so including it
-    # would create a duplicate [0, 0, …] producing a useless 1-cell segment.
-    existing_tower_indices = [
-        i for i, h3_idx in enumerate(corridor)
-        if h3_idx in surface.tower_by_h3 and i != 0
-    ]
+        existing_tower_indices = [
+            i for i, h3_idx in enumerate(working_corridor)
+            if h3_idx in surface.tower_by_h3 and i != 0
+        ]
+        if existing_tower_indices:
+            logger.debug("Reusing existing towers as waypoints",
+                         count=len(existing_tower_indices))
 
-    if existing_tower_indices:
-        logger.debug("Reusing existing towers as waypoints",
-                     count=len(existing_tower_indices))
+        last_idx = len(working_corridor) - 1
+        boundaries = [0] + existing_tower_indices
+        if boundaries[-1] != last_idx:
+            boundaries.append(last_idx)
 
-    # Build strictly-increasing segment boundaries: [0, t1, t2, ..., last]
-    last_idx = len(corridor) - 1
-    boundaries = [0] + existing_tower_indices
-    if boundaries[-1] != last_idx:
-        boundaries.append(last_idx)
+        endpoint_anchors = sum(
+            1 for idx in (0, len(working_corridor) - 1)
+            if working_corridor[idx] in surface.tower_by_h3
+        )
+        effective_budget = config.max_towers_per_route + endpoint_anchors
 
-    # Pre-placed anchor towers at corridor endpoints are "free" — don't count
-    # against the user's max_towers_per_route budget.
-    endpoint_anchors = sum(
-        1 for idx in (0, len(corridor) - 1)
-        if corridor[idx] in surface.tower_by_h3
-    )
-    effective_budget = config.max_towers_per_route + endpoint_anchors
+        total_corridor_len = len(working_corridor)
+        all_nodes: List[str] = []
+        seen: set = set()
+        node_meta: Dict[str, dict] = {}
 
-    total_corridor_len = len(corridor)
-    all_nodes: List[str] = []
-    seen: set = set()
-    # Tracks placement metadata for each node placed in this call.
-    node_meta: Dict[str, dict] = {}
+        initial_ring = _radius_to_ring_m(config, search_radius_m, minimum=0)
+        for bi in range(len(boundaries) - 1):
+            seg_start = boundaries[bi]
+            seg_end = boundaries[bi + 1]
+            segment = working_corridor[seg_start:seg_end + 1]
 
-    for bi in range(len(boundaries) - 1):
-        seg_start = boundaries[bi]
-        seg_end = boundaries[bi + 1]
-        segment = corridor[seg_start:seg_end + 1]
-
-        # Allocate tower budget proportionally to segment length.
-        # This prevents a short early segment from consuming the full budget
-        # when the corridor is split at existing tower waypoints.
-        seg_len = seg_end - seg_start
-        seg_k = max(2, round(
-            effective_budget * seg_len / max(total_corridor_len, 1)
-        ))
-
-        if strategy == 'greedy':
-            seg_nodes = _greedy_place_towers(
-                segment, surface, cache, seg_k, out_meta=node_meta
+            _append_search_debug_records(
+                surface=surface,
+                h3_indices=segment,
+                algorithm='greedy' if strategy == 'greedy' else 'dp',
+                phase=phase_label,
+                attempt_id=attempt_id,
+                segment_idx=bi,
+                repair_round=None,
+                search_radius_m=search_radius_m,
+                search_ring=initial_ring,
             )
-            seg_best_t = None
-        else:
-            seg_result = _dp_place_towers_with_meta(segment, surface, cache, seg_k)
-            seg_nodes = seg_result[0] if seg_result is not None else None
-            seg_best_t = seg_result[1] if seg_result is not None else None
 
-            if seg_nodes is None:
-                logger.warning(
-                    "DP found no feasible LOS chain — gap repair will handle it",
-                    seg_len=len(segment),
-                    k=seg_k,
-                    start=segment[0],
-                    end=segment[-1],
+            seg_len = seg_end - seg_start
+            seg_k = max(2, round(
+                effective_budget * seg_len / max(total_corridor_len, 1)
+            ))
+
+            if strategy == 'greedy':
+                seg_nodes = _greedy_place_towers(
+                    segment, surface, cache, seg_k, out_meta=node_meta,
+                    search_radius_m=search_radius_m,
+                    attempt_id=attempt_id,
+                    segment_idx=bi,
                 )
-                # Include only endpoints so the chain is not completely broken;
-                # gap repair rounds will insert relays as needed.
-                seg_nodes = [segment[0], segment[-1]]
                 seg_best_t = None
+            else:
+                seg_result = _dp_place_towers_with_meta(segment, surface, cache, seg_k)
+                seg_nodes = seg_result[0] if seg_result is not None else None
+                seg_best_t = seg_result[1] if seg_result is not None else None
 
-        # Tag placement metadata for nodes in this segment (DP path only).
-        # Greedy sets metadata inside _greedy_place_towers via out_meta.
+                if seg_nodes is None:
+                    logger.warning(
+                        "DP found no feasible LOS chain — gap repair will handle it",
+                        seg_len=len(segment), k=seg_k,
+                        start=segment[0], end=segment[-1],
+                    )
+                    seg_nodes = [segment[0], segment[-1]]
+                    seg_best_t = None
+
+            if strategy != 'greedy':
+                for node_h3 in seg_nodes:
+                    if node_h3 in surface.tower_by_h3:
+                        continue
+                    if seg_best_t is not None:
+                        node_meta[node_h3] = {
+                            'algorithm': 'dp',
+                            'dp_steps': seg_best_t,
+                            'repair_round': None,
+                        }
+                    else:
+                        node_meta[node_h3] = {
+                            'algorithm': 'endpoint_fallback',
+                            'dp_steps': None,
+                            'repair_round': None,
+                        }
+
+            for seg_h3 in segment:
+                if seg_h3 not in corridor_pos:
+                    corridor_pos[seg_h3] = len(working_corridor)
+                    working_corridor.append(seg_h3)
+
+            for n in seg_nodes:
+                if n not in seen:
+                    seen.add(n)
+                    all_nodes.append(n)
+
         if strategy != 'greedy':
-            for node_h3 in seg_nodes:
-                if node_h3 in surface.tower_by_h3:
-                    continue  # reused existing tower, already has its own meta
-                if seg_best_t is not None:
-                    node_meta[node_h3] = {'algorithm': 'dp', 'dp_steps': seg_best_t,
-                                          'repair_round': None}
-                else:
-                    node_meta[node_h3] = {'algorithm': 'endpoint_fallback',
-                                          'dp_steps': None, 'repair_round': None}
+            repair_ladder = _normalize_radii(
+                config.gap_repair_search_radius_ladder_m,
+                default_value=search_radius_m,
+            )
+            for repair_round in range(1, config.gap_repair_rounds + 1):
+                broken = _find_broken_gaps(all_nodes, surface, cache)
+                if not broken:
+                    break
+                repair_radius = repair_ladder[min(repair_round - 1, len(repair_ladder) - 1)]
+                repair_ring = _radius_to_ring_m(config, repair_radius, minimum=1)
+                logger.info(
+                    "Gap repair round %d/%d: %d broken pair(s), ring=%d, radius_m=%.0f",
+                    repair_round, config.gap_repair_rounds, len(broken),
+                    repair_ring, repair_radius,
+                )
+                all_nodes = _repair_broken_gaps(
+                    all_nodes, working_corridor, corridor_pos,
+                    search_radius_m=repair_radius,
+                    repair_round=repair_round,
+                    attempt_id=attempt_id,
+                    surface=surface,
+                    cache=cache,
+                    user_budget=effective_budget - 2,
+                    node_meta=node_meta,
+                )
+            pre_fill_count = len(all_nodes)
+            all_nodes = _fill_visibility_gaps(all_nodes, working_corridor, config.max_visibility_m)
+            if len(all_nodes) > pre_fill_count:
+                logger.debug("After gap-fill", count=len(all_nodes))
 
-        # Sync corridor_pos with any buffer cells injected into segment.
-        for seg_h3 in segment:
-            if seg_h3 not in corridor_pos:
-                corridor_pos[seg_h3] = len(corridor)
-                corridor.append(seg_h3)
+        broken_after = len(_find_broken_gaps(all_nodes, surface, cache))
+        return all_nodes, node_meta, working_corridor, corridor_pos, broken_after
 
-        for n in seg_nodes:
-            if n not in seen:
-                seen.add(n)
-                all_nodes.append(n)
+    initial_search_radius_m = _effective_initial_search_radius_m(config)
+    selected_nodes, selected_meta, _, _, broken_count = _run_attempt(
+        search_radius_m=initial_search_radius_m,
+        attempt_id=0,
+        phase_label='initial',
+    )
 
-    logger.debug("Nodes placed along corridor", strategy=strategy, count=len(all_nodes))
-
-    _debug_hexes: List[dict] = []
-    if strategy != 'greedy':
-        # Phase 2: targeted gap repair.
-        # Find consecutive pairs with no corridor-path LOS and re-run DP on the
-        # sub-corridor between their surrounding anchors with a wider buffer ring.
-        for repair_round in range(1, config.gap_repair_rounds + 1):
-            broken = _find_broken_gaps(all_nodes, surface, cache)
-            if not broken:
+    if strategy != 'greedy' and broken_count > 0:
+        fallback_ladder = _normalize_radii(
+            config.fallback_initial_search_radius_ladder_m,
+            default_value=initial_search_radius_m,
+        )
+        attempt_id = 1
+        for fallback_radius_m in fallback_ladder:
+            if fallback_radius_m <= initial_search_radius_m:
+                continue
+            nodes, meta, _, _, broken = _run_attempt(
+                search_radius_m=fallback_radius_m,
+                attempt_id=attempt_id,
+                phase_label='fallback_initial',
+            )
+            selected_nodes, selected_meta = nodes, meta
+            broken_count = broken
+            if broken_count <= 0:
                 break
-            logger.info(
-                "Gap repair round %d/%d: %d broken pair(s), buffer_ring=%d",
-                repair_round, config.gap_repair_rounds, len(broken),
-                buffer_ring * (repair_round + 1),
-            )
-            all_nodes = _repair_broken_gaps(
-                all_nodes, corridor, corridor_pos,
-                buffer_ring, repair_round, surface, cache,
-                user_budget=effective_budget - 2,
-                node_meta=node_meta,
-                out_debug_hexes=_debug_hexes,
-            )
-        else:
-            still_broken = _find_broken_gaps(all_nodes, surface, cache)
-            for i in still_broken:
+            attempt_id += 1
+
+        if broken_count > 0:
+            for i in _find_broken_gaps(selected_nodes, surface, cache):
                 logger.error(
-                    "No LOS after %d gap repair rounds",
-                    config.gap_repair_rounds,
-                    h3_a=all_nodes[i], h3_b=all_nodes[i + 1],
+                    "No LOS after fallback attempts",
+                    h3_a=selected_nodes[i], h3_b=selected_nodes[i + 1],
                 )
 
-        # Gap-fill: ensure no consecutive pair exceeds max_visibility_m
-        pre_fill_count = len(all_nodes)
-        all_nodes = _fill_visibility_gaps(all_nodes, corridor, config.max_visibility_m)
-        if len(all_nodes) > pre_fill_count:
-            logger.debug("After gap-fill", count=len(all_nodes))
-
+    logger.debug("Nodes placed along corridor", strategy=strategy, count=len(selected_nodes))
     if out_meta is not None:
-        out_meta.update(node_meta)
-
-    if _debug_hexes:
-        surface.gap_repair_debug.extend(_debug_hexes)
-
-    return all_nodes
+        out_meta.update(selected_meta)
+    return selected_nodes
 
 
 def optimize_node_selection(

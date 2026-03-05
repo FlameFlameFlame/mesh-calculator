@@ -7,8 +7,10 @@ from ..core.grid import H3Cell
 from ..core.config import MeshConfig
 from ..core.geometry import h3_distance
 from ..data.cache import LOSCache, LOSResult
-from .fresnel import compute_fresnel_clearance
+from .fresnel import compute_fresnel_clearance, compute_fresnel_clearance_dense
 from .path_loss import compute_path_loss
+
+_LOS_VERIFICATION_MODE = "hybrid_accept_verify"
 
 
 def compute_los(
@@ -50,6 +52,9 @@ def compute_los(
                 antenna_gain_dbi=config.antenna_gain_dbi,
                 receiver_sensitivity_dbm=config.receiver_sensitivity_dbm,
                 min_fresnel_clearance_m=config.min_fresnel_clearance_m,
+                los_dense_sample_step_m=config.los_dense_sample_step_m,
+                los_dense_max_samples=config.los_dense_max_samples,
+                los_verification_mode=_LOS_VERIFICATION_MODE,
             )
         return result
 
@@ -66,6 +71,9 @@ def compute_los(
             antenna_gain_dbi=config.antenna_gain_dbi,
             receiver_sensitivity_dbm=config.receiver_sensitivity_dbm,
             min_fresnel_clearance_m=config.min_fresnel_clearance_m,
+            los_dense_sample_step_m=config.los_dense_sample_step_m,
+            los_dense_max_samples=config.los_dense_max_samples,
+            los_verification_mode=_LOS_VERIFICATION_MODE,
         )
         if cached is not None:
             return cached
@@ -89,6 +97,9 @@ def compute_los(
                 antenna_gain_dbi=config.antenna_gain_dbi,
                 receiver_sensitivity_dbm=config.receiver_sensitivity_dbm,
                 min_fresnel_clearance_m=config.min_fresnel_clearance_m,
+                los_dense_sample_step_m=config.los_dense_sample_step_m,
+                los_dense_max_samples=config.los_dense_max_samples,
+                los_verification_mode=_LOS_VERIFICATION_MODE,
             )
         return result
 
@@ -111,6 +122,27 @@ def compute_los(
     else:
         is_clearance_ok = (clearance >= config.min_fresnel_clearance_m)
 
+    # Hybrid verification: only dense-sample links that pass coarse acceptance.
+    # This removes coarse H3-center false positives while keeping fast rejects.
+    if is_link_budget_ok and is_clearance_ok and elevation_provider is not None:
+        dense_clearance, dense_distance_m, dense_d1, dense_d2 = compute_fresnel_clearance_dense(
+            h3_src, h3_dst, cells, config,
+            elevation_provider=elevation_provider,
+            sample_step_m=config.los_dense_sample_step_m,
+            max_samples=config.los_dense_max_samples,
+        )
+        dense_path_loss = compute_path_loss(
+            dense_distance_m, config.frequency_hz, dense_clearance, dense_d1, dense_d2
+        )
+        clearance = dense_clearance
+        distance_m = dense_distance_m
+        path_loss = dense_path_loss
+        is_link_budget_ok = (path_loss <= config.link_budget_db)
+        if config.min_fresnel_clearance_m is None:
+            is_clearance_ok = True
+        else:
+            is_clearance_ok = (clearance >= config.min_fresnel_clearance_m)
+
     # Create result
     result = LOSResult(
         clearance_m=clearance,
@@ -129,6 +161,9 @@ def compute_los(
             antenna_gain_dbi=config.antenna_gain_dbi,
             receiver_sensitivity_dbm=config.receiver_sensitivity_dbm,
             min_fresnel_clearance_m=config.min_fresnel_clearance_m,
+            los_dense_sample_step_m=config.los_dense_sample_step_m,
+            los_dense_max_samples=config.los_dense_max_samples,
+            los_verification_mode=_LOS_VERIFICATION_MODE,
         )
 
     return result

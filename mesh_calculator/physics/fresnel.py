@@ -12,7 +12,7 @@ import structlog
 
 from ..core.grid import H3Cell
 from ..core.config import MeshConfig
-from ..core.geometry import h3_distance
+from ..core.geometry import h3_distance, great_circle_distance
 
 logger = structlog.get_logger(__name__)
 
@@ -146,6 +146,83 @@ def compute_fresnel_clearance(
     worst_idx = int(np.argmin(clearances))
     return (float(clearances[worst_idx]), total_distance,
             float(d1s[worst_idx]), float(d2s[worst_idx]))
+
+
+def compute_fresnel_clearance_dense(
+    h3_src: str,
+    h3_dst: str,
+    cells: Dict[str, H3Cell],
+    config: MeshConfig,
+    elevation_provider=None,
+    sample_step_m: float | None = None,
+    max_samples: int | None = None,
+) -> Tuple[float, float, float, float]:
+    """
+    Calculate minimum Fresnel clearance using dense DEM profile sampling.
+
+    Samples equidistant points along the straight RF line between endpoint
+    coordinates instead of H3 cell centers on grid_path.
+    """
+    if h3_src not in cells or h3_dst not in cells:
+        raise ValueError(f"Cells not found: {h3_src}, {h3_dst}")
+
+    src_cell = cells[h3_src]
+    dst_cell = cells[h3_dst]
+
+    if h3_src == h3_dst:
+        return (config.mast_height_m, 0.0, 0.0, 0.0)
+
+    src_height = src_cell.elevation + config.mast_height_m
+    dst_height = dst_cell.elevation + config.mast_height_m
+    total_distance = great_circle_distance(
+        src_cell.lat, src_cell.lon, dst_cell.lat, dst_cell.lon
+    )
+    if total_distance <= 0:
+        return (config.mast_height_m, 0.0, 0.0, 0.0)
+
+    step_m = sample_step_m or config.los_dense_sample_step_m
+    cap_samples = max_samples or config.los_dense_max_samples
+    n_samples = max(2, int(total_distance / max(step_m, 1.0)))
+    n_samples = min(n_samples, max(cap_samples, 2))
+
+    fracs = np.linspace(0.0, 1.0, n_samples + 1)
+    lats = src_cell.lat + (dst_cell.lat - src_cell.lat) * fracs
+    lons = src_cell.lon + (dst_cell.lon - src_cell.lon) * fracs
+
+    if elevation_provider is None:
+        # Dense verification needs DEM sampling; fall back to coarse method.
+        return compute_fresnel_clearance(
+            h3_src, h3_dst, cells, config, elevation_provider=elevation_provider
+        )
+
+    elevs = np.array(
+        [elevation_provider.get_elevation(float(lat), float(lon))
+         for lat, lon in zip(lats, lons)],
+        dtype=np.float64,
+    )
+
+    wavelength = config.wavelength_m
+    effective_radius = config.effective_earth_radius_m
+
+    d1s = total_distance * fracs
+    d2s = total_distance - d1s
+    line_alts = src_height + (dst_height - src_height) * fracs
+    earth_curvs = (d1s * d2s) / (2 * effective_radius)
+    valid = (d1s > 0) & (d2s > 0)
+    fresnel_rs = np.where(
+        valid,
+        np.sqrt(np.maximum(wavelength * d1s * d2s / total_distance, 0.0)),
+        0.0,
+    )
+    clearances = line_alts - (elevs + earth_curvs + fresnel_rs)
+
+    worst_idx = int(np.argmin(clearances))
+    return (
+        float(clearances[worst_idx]),
+        float(total_distance),
+        float(d1s[worst_idx]),
+        float(d2s[worst_idx]),
+    )
 
 
 def has_line_of_sight(

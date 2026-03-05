@@ -22,7 +22,7 @@ In this project, Fresnel clearance affects link quality through diffraction loss
 
 For a pair of H3 cells:
 
-1. Build straight RF path samples with `h3.grid_path_cells`.
+1. Build a coarse straight RF path sample with `h3.grid_path_cells`.
 2. For each sample, compute:
    - line altitude between endpoints (endpoint elevation + mast height),
    - earth curvature term,
@@ -30,6 +30,7 @@ For a pair of H3 cells:
 3. Clearance at sample:
    - `clearance = line_altitude - (terrain + earth_curvature + fresnel_radius)`
 4. Keep worst (minimum) clearance along the path.
+5. If coarse evaluation passes policy, run dense DEM verification at fixed metric step (`los_dense_sample_step_m`, capped by `los_dense_max_samples`) and recompute final clearance/path loss from the dense profile.
 
 Interpretation:
 
@@ -63,11 +64,12 @@ In `compute_los()`:
 
 1. Reject immediately if distance exceeds `max_visibility_m`.
 2. Compute `clearance` and `path_loss_db`.
-3. Evaluate policy:
+3. Evaluate policy on coarse result:
    - `budget_ok = path_loss_db <= link_budget_db`
    - `clearance_ok = True` when `min_fresnel_clearance_m is None`
    - otherwise `clearance_ok = clearance_m >= min_fresnel_clearance_m`
-4. Final result:
+4. If coarse policy passes and elevation data is available, run dense profile verification and recompute policy on verified values.
+5. Final result:
    - `is_visible = budget_ok and clearance_ok`
 
 Default behavior:
@@ -106,6 +108,9 @@ Cache keys include:
 - `antenna_gain_dbi`
 - `receiver_sensitivity_dbm`
 - `min_fresnel_clearance_m`
+- `los_dense_sample_step_m`
+- `los_dense_max_samples`
+- verification mode sentinel (`hybrid_accept_verify`)
 
 This prevents stale visibility reuse when radio parameters or clearance policy change.
 
@@ -135,4 +140,7 @@ Tower radial coverage is now an explicit runtime calculation, not an automatic r
 - Output is covered cells only, including the source H3 cell with:
   - `distance_m = 0.0`
   - `path_loss_db = 0.0`
+- Source attribution is RF-serving based:
+  - `serving_tower_id`: strongest received signal (minimum path loss)
+  - `closest_tower_id`: nearest visible source (debug/backward compatibility)
 - `mesh-generator` calls this on demand for selected/all displayed towers and random clicked map points (when elevation is available).

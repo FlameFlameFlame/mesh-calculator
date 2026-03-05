@@ -48,6 +48,9 @@ class LOSCache:
         antenna_gain_dbi: float,
         receiver_sensitivity_dbm: float,
         min_fresnel_clearance_m: Optional[float],
+        los_dense_sample_step_m: float,
+        los_dense_max_samples: int,
+        los_verification_mode: str,
     ) -> Tuple:
         """
         Create normalized cache key (always src <= dst for symmetry).
@@ -60,6 +63,9 @@ class LOSCache:
             antenna_gain_dbi: Antenna gain in dBi
             receiver_sensitivity_dbm: Receiver sensitivity in dBm
             min_fresnel_clearance_m: Optional policy threshold
+            los_dense_sample_step_m: Dense-profile sample interval
+            los_dense_max_samples: Dense-profile sample cap
+            los_verification_mode: LOS verification mode sentinel
 
         Returns:
             Normalized tuple key
@@ -69,12 +75,14 @@ class LOSCache:
                 h3_src, h3_dst, mast_height_src, mast_height_dst, frequency_hz,
                 tx_power_mw, antenna_gain_dbi, receiver_sensitivity_dbm,
                 min_fresnel_clearance_m,
+                los_dense_sample_step_m, los_dense_max_samples, los_verification_mode,
             )
         else:
             return (
                 h3_dst, h3_src, mast_height_dst, mast_height_src, frequency_hz,
                 tx_power_mw, antenna_gain_dbi, receiver_sensitivity_dbm,
                 min_fresnel_clearance_m,
+                los_dense_sample_step_m, los_dense_max_samples, los_verification_mode,
             )
 
     def get(
@@ -88,6 +96,9 @@ class LOSCache:
         antenna_gain_dbi: float = 2.0,
         receiver_sensitivity_dbm: float = -137.0,
         min_fresnel_clearance_m: Optional[float] = None,
+        los_dense_sample_step_m: float = 50.0,
+        los_dense_max_samples: int = 400,
+        los_verification_mode: str = "hybrid_accept_verify",
     ) -> Optional[LOSResult]:
         """
         Get cached LOS result if available.
@@ -100,6 +111,9 @@ class LOSCache:
             antenna_gain_dbi: Antenna gain in dBi
             receiver_sensitivity_dbm: Receiver sensitivity in dBm
             min_fresnel_clearance_m: Optional policy threshold
+            los_dense_sample_step_m: Dense-profile sample interval
+            los_dense_max_samples: Dense-profile sample cap
+            los_verification_mode: LOS verification mode sentinel
 
         Returns:
             LOSResult if cached, None otherwise
@@ -108,6 +122,7 @@ class LOSCache:
             h3_src, h3_dst, mast_height_src, mast_height_dst, frequency_hz,
             tx_power_mw, antenna_gain_dbi, receiver_sensitivity_dbm,
             min_fresnel_clearance_m,
+            los_dense_sample_step_m, los_dense_max_samples, los_verification_mode,
         )
 
         with self._lock:
@@ -130,6 +145,9 @@ class LOSCache:
         antenna_gain_dbi: float = 2.0,
         receiver_sensitivity_dbm: float = -137.0,
         min_fresnel_clearance_m: Optional[float] = None,
+        los_dense_sample_step_m: float = 50.0,
+        los_dense_max_samples: int = 400,
+        los_verification_mode: str = "hybrid_accept_verify",
     ):
         """
         Store LOS result in cache.
@@ -143,11 +161,15 @@ class LOSCache:
             antenna_gain_dbi: Antenna gain in dBi
             receiver_sensitivity_dbm: Receiver sensitivity in dBm
             min_fresnel_clearance_m: Optional policy threshold
+            los_dense_sample_step_m: Dense-profile sample interval
+            los_dense_max_samples: Dense-profile sample cap
+            los_verification_mode: LOS verification mode sentinel
         """
         key = self._make_key(
             h3_src, h3_dst, mast_height_src, mast_height_dst, frequency_hz,
             tx_power_mw, antenna_gain_dbi, receiver_sensitivity_dbm,
             min_fresnel_clearance_m,
+            los_dense_sample_step_m, los_dense_max_samples, los_verification_mode,
         )
 
         with self._lock:

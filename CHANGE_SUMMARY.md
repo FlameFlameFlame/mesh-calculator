@@ -21,3 +21,9 @@
 - 2026-03-05: Added `num_clusters` to `run_route_pipeline` summary output for downstream strict-LOS disconnect messaging.
 - 2026-03-05: Greedy corridor placement no longer force-appends an unreachable endpoint cell; this avoids bogus tail clusters when the last hop has no LOS.
 - 2026-03-05: Added regression test `TestGreedyEndpointAppend.test_unreachable_endpoint_not_appended` in `tests/test_corridor_placement.py`.
+- 2026-03-06: Added search-widening controls to `MeshConfig` (`optimizer_search_radius_m`, gap-repair/fallback radius ladders) and refactored corridor placement to run DP gap-repair first, then fallback initial reruns with wider radii.
+- 2026-03-06: Upgraded search debug export semantics (algorithm/phase/attempt/radius/ring metadata) while keeping `gap_repair_hexes.geojson` file compatibility.
+- 2026-03-06: Added hybrid LOS verification path: coarse H3-center acceptance is now revalidated with dense DEM profile sampling (`los_dense_sample_step_m`, `los_dense_max_samples`) before final visibility decision.
+- 2026-03-06: Expanded LOS cache key further with dense verification parameters/mode to prevent stale results across LOS-fidelity settings.
+- 2026-03-06: Updated runtime tower coverage serving semantics to choose strongest source (`serving_tower_id`) while keeping nearest source (`closest_tower_id`) as debug info; `path_loss_db`/`received_power_dbm` now follow serving source.
+- 2026-03-06: Added/updated regression tests for new cache/LOS/export/tower-coverage behavior and stabilized tower-coverage serving test fixture selection.

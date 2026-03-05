@@ -145,6 +145,32 @@ class TestLOSCache(unittest.TestCase):
         self.assertIsNotNone(cached_none)
         self.assertIsNone(cached_zero)
 
+    def test_cache_key_includes_dense_profile_settings(self):
+        """Different dense-verify settings must not reuse cached LOS."""
+        result = LOSResult(-1.0, 150.0, 12000.0, False)
+        self.cache.put(
+            'h3_a', 'h3_b', 28.0, 28.0, 868e6, result,
+            los_dense_sample_step_m=50.0,
+            los_dense_max_samples=400,
+            los_verification_mode='hybrid_accept_verify',
+        )
+
+        cached_same = self.cache.get(
+            'h3_a', 'h3_b', 28.0, 28.0, 868e6,
+            los_dense_sample_step_m=50.0,
+            los_dense_max_samples=400,
+            los_verification_mode='hybrid_accept_verify',
+        )
+        cached_diff = self.cache.get(
+            'h3_a', 'h3_b', 28.0, 28.0, 868e6,
+            los_dense_sample_step_m=25.0,
+            los_dense_max_samples=400,
+            los_verification_mode='hybrid_accept_verify',
+        )
+
+        self.assertIsNotNone(cached_same)
+        self.assertIsNone(cached_diff)
+
 
 if __name__ == '__main__':
     unittest.main()

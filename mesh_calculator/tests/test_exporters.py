@@ -9,7 +9,10 @@ import unittest
 from ..network.graph import Tower, VisibilityGraph, MeshSurface
 from ..core.grid import H3Cell
 from ..core.config import MeshConfig
-from ..data.exporters import export_visibility_edges_geojson
+from ..data.exporters import (
+    export_gap_repair_hexes_geojson,
+    export_visibility_edges_geojson,
+)
 
 
 def _make_surface_with_edges():
@@ -150,5 +153,34 @@ class TestExportVisibilityEdges(unittest.TestCase):
             with open(path) as f:
                 data = json.load(f)
             self.assertEqual(len(data["features"]), 0)
+        finally:
+            os.unlink(path)
+
+
+class TestExportGapRepairHexes(unittest.TestCase):
+    def test_richer_search_debug_properties_export(self):
+        debug_hexes = [{
+            "h3_index": "8828c00001fffff",
+            "algorithm": "dp",
+            "phase": "gap_repair",
+            "attempt_id": 1,
+            "segment_idx": 3,
+            "repair_round": 2,
+            "search_radius_m": 600.0,
+            "search_ring": 2,
+        }]
+        with tempfile.NamedTemporaryFile(suffix=".geojson", delete=False) as f:
+            path = f.name
+        try:
+            export_gap_repair_hexes_geojson(debug_hexes, path)
+            with open(path) as f:
+                data = json.load(f)
+            props = data["features"][0]["properties"]
+            self.assertEqual(props["algorithm"], "dp")
+            self.assertEqual(props["phase"], "gap_repair")
+            self.assertEqual(props["attempt_id"], 1)
+            self.assertEqual(props["segment_idx"], 3)
+            self.assertEqual(props["search_radius_m"], 600.0)
+            self.assertEqual(props["search_ring"], 2)
         finally:
             os.unlink(path)

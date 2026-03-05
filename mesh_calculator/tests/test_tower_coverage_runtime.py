@@ -72,6 +72,39 @@ class TestTowerCoverageRuntime(unittest.TestCase):
         self.assertEqual(by_h3[neighbor_h3]["path_loss_db"], 110.0)
         self.assertTrue(by_h3[neighbor_h3]["is_covered"])
 
+    @patch("mesh_calculator.network.tower_coverage.compute_los")
+    def test_serving_tower_uses_strongest_link(self, mock_compute_los):
+        ring1 = list(h3.grid_ring(self.src_h3, 1))
+        target_h3 = ring1[0]
+        src2_h3 = next(h for h in ring1 if h != target_h3)
+        src2_lat, src2_lon = h3.cell_to_latlng(src2_h3)
+
+        def _mock_los(h3_src, h3_dst, *_args, **_kwargs):
+            if h3_src == h3_dst:
+                return LOSResult(clearance_m=28.0, path_loss_db=0.0, distance_m=0.0, is_visible=True)
+            if h3_src == target_h3 and h3_dst == self.src_h3:
+                return LOSResult(clearance_m=1.0, path_loss_db=130.0, distance_m=600.0, is_visible=True)
+            if h3_src == target_h3 and h3_dst == src2_h3:
+                return LOSResult(clearance_m=1.0, path_loss_db=100.0, distance_m=900.0, is_visible=True)
+            return LOSResult(clearance_m=-10.0, path_loss_db=999.0, distance_m=20000.0, is_visible=False)
+
+        mock_compute_los.side_effect = _mock_los
+        results = compute_h3_tower_coverage(
+            sources=[
+                CoverageSource(1, self.src_h3, self.src_lat, self.src_lon),
+                CoverageSource(2, src2_h3, src2_lat, src2_lon),
+            ],
+            base_cells={},
+            config=self.config,
+            elevation_provider=None,
+        )
+        by_h3 = {r["h3_index"]: r for r in results}
+        self.assertIn(target_h3, by_h3)
+        target = by_h3[target_h3]
+        self.assertEqual(target["closest_tower_id"], 1)
+        self.assertEqual(target["serving_tower_id"], 2)
+        self.assertEqual(target["path_loss_db"], 100.0)
+
 
 if __name__ == "__main__":
     unittest.main()
