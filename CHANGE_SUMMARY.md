@@ -28,3 +28,7 @@
 - 2026-03-06: Updated runtime tower coverage serving semantics to choose strongest source (`serving_tower_id`) while keeping nearest source (`closest_tower_id`) as debug info; `path_loss_db`/`received_power_dbm` now follow serving source.
 - 2026-03-06: Added/updated regression tests for new cache/LOS/export/tower-coverage behavior and stabilized tower-coverage serving test fixture selection.
 - 2026-03-06: Added additive `progress_callback` support to `run_route_pipeline(...)` with structured, weighted phase progress events (route substeps + visibility + coverage + optional city-links + export + done).
+- 2026-03-06: Fixed runtime tower coverage source normalization: `compute_h3_tower_coverage(...)` now always snaps incoming sources to the requested `config.h3_resolution` before dedupe/LOS checks (prevents stale-resolution `h3_index` mismatches).
+- 2026-03-06: Corrected tower-coverage ring sizing to use H3 center-to-center step (plus one safety ring) instead of raw edge length, removing large candidate over-expansion that caused slow/high-resolution coverage runs.
+- 2026-03-06: Reduced runtime coverage overhead by batching LOS pair checks per worker instead of spawning one future per pair; keeps behavior unchanged but improves high-pair-count performance.
+- 2026-03-06: Added regression test `test_sources_are_snapped_to_requested_resolution` in `tests/test_tower_coverage_runtime.py`.

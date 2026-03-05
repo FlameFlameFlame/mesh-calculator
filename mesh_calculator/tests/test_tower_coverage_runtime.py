@@ -45,6 +45,22 @@ class TestTowerCoverageRuntime(unittest.TestCase):
         self.assertEqual(len(source_rows), 1)
         self.assertEqual(source_rows[0]["closest_tower_id"], 10)
 
+    def test_sources_are_snapped_to_requested_resolution(self):
+        stale_h3 = h3.latlng_to_cell(self.src_lat, self.src_lon, 8)
+        config_res9 = MeshConfig(h3_resolution=9, max_coverage_radius_m=1200.0)
+        expected_h3 = h3.latlng_to_cell(self.src_lat, self.src_lon, 9)
+
+        results = compute_h3_tower_coverage(
+            sources=[CoverageSource(1, stale_h3, self.src_lat, self.src_lon)],
+            base_cells={},
+            config=config_res9,
+            elevation_provider=None,
+        )
+        by_h3 = {r["h3_index"]: r for r in results}
+        self.assertIn(expected_h3, by_h3)
+        self.assertNotIn(stale_h3, by_h3)
+        self.assertEqual(by_h3[expected_h3]["closest_tower_id"], 1)
+
     @patch("mesh_calculator.network.tower_coverage.compute_los")
     def test_negative_clearance_visible_links_are_kept(self, mock_compute_los):
         neighbor_h3 = next(
