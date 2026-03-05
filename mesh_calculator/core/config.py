@@ -27,6 +27,9 @@ class MeshConfig:
     tx_power_mw: float = 500.0              # Transmit power in milliwatts
     antenna_gain_dbi: float = 2.0           # Antenna gain, applied at both TX and RX
     receiver_sensitivity_dbm: float = -137.0  # Minimum receivable signal (LoRa SF12)
+    # Optional policy gate: if set, LOS requires clearance >= threshold.
+    # None keeps visibility decision purely link-budget based.
+    min_fresnel_clearance_m: Optional[float] = None
 
     # Physical constants
     earth_radius_m: float = 6371000.0  # Earth radius in meters
