@@ -193,6 +193,7 @@ def run_route_pipeline(
     elevation_path: str,
     city_boundaries_geojson: Optional[dict] = None,
     output_dir: str = "output",
+    strategy: str = 'dp',
 ) -> dict:
     """
     Run the full route-based tower placement pipeline.
@@ -215,6 +216,8 @@ def run_route_pipeline(
         city_boundaries_geojson: Optional GeoJSON FeatureCollection with city
                                  boundary polygons for city link tagging.
         output_dir: Directory to write output files.
+        strategy: Tower placement algorithm — 'dp' (MaxMin DP, default) or
+                  'greedy' (furthest-clear-LOS, fewer towers, no gap repair).
 
     Returns:
         Summary dict with tower count, route count, etc.
@@ -389,6 +392,7 @@ def run_route_pipeline(
         placement_meta: dict = {}
         placed = place_nodes_along_corridor(
             trimmed_corridor, surface, los_cache, out_meta=placement_meta,
+            strategy=strategy,
         )
         install_nodes(placed, surface, source=route.route_id,
                       placement_meta=placement_meta)
