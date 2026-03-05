@@ -4,6 +4,7 @@ Standalone H3 tower coverage computation.
 from __future__ import annotations
 
 import os
+import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Dict, Iterable, Optional, Union
@@ -53,6 +54,30 @@ def _dedupe_sources(sources: Iterable[CoverageSource]) -> list[CoverageSource]:
     return list(unique.values())
 
 
+def _normalize_sources_to_resolution(
+    sources: Iterable[CoverageSource],
+    resolution: int,
+) -> list[CoverageSource]:
+    """Snap all sources to the requested coverage H3 resolution."""
+    normalized: list[CoverageSource] = []
+    for src in sources:
+        snapped_h3 = h3.latlng_to_cell(src.lat, src.lon, resolution)
+        snapped_lat, snapped_lon = h3.cell_to_latlng(snapped_h3)
+        normalized.append(CoverageSource(
+            source_id=src.source_id,
+            h3_index=snapped_h3,
+            lat=snapped_lat,
+            lon=snapped_lon,
+        ))
+    return normalized
+
+
+def _ring_step_m(resolution: int) -> float:
+    """Approximate center-to-center distance for one H3 ring step."""
+    edge_m = h3.average_hexagon_edge_length(resolution, unit='m')
+    return edge_m * math.sqrt(3.0)
+
+
 def compute_h3_tower_coverage(
     sources: Iterable[CoverageSource],
     base_cells: Dict[str, H3Cell],
@@ -67,17 +92,25 @@ def compute_h3_tower_coverage(
     Returns covered cells only. The source cell itself is always included
     with distance/path-loss set to 0.
     """
-    src_list = _dedupe_sources(sources)
+    src_list = _dedupe_sources(
+        _normalize_sources_to_resolution(sources, config.h3_resolution)
+    )
     if not src_list:
         return []
 
     coverage_radius_m = max_radius_m if max_radius_m is not None else config.max_coverage_radius_m
-    edge_m = h3.average_hexagon_edge_length(config.h3_resolution, unit='m')
-    max_rings = max(1, int(coverage_radius_m / edge_m))
+    if coverage_radius_m <= 0:
+        max_rings = 0
+    else:
+        # One ring roughly advances by center-to-center spacing, not edge length.
+        # Add a safety ring to ensure boundary cells are included, then filter
+        # with exact geodesic radius via KD-tree.
+        ring_step_m = _ring_step_m(config.h3_resolution)
+        max_rings = max(1, int(math.ceil(coverage_radius_m / ring_step_m)) + 1)
 
     logger.info(
-        "Standalone tower coverage: %d source(s), radius=%.0fm, rings=%d",
-        len(src_list), coverage_radius_m, max_rings,
+        "Standalone tower coverage: %d source(s), radius=%.0fm, rings=%d, h3_res=%d",
+        len(src_list), coverage_radius_m, max_rings, config.h3_resolution,
     )
 
     candidate_h3s: set[str] = set()
@@ -154,6 +187,14 @@ def compute_h3_tower_coverage(
             return (ci, si, result.distance_m, result.clearance_m, result.path_loss_db)
         return None
 
+    def _check_pair_batch(batch):
+        out = []
+        for pair in batch:
+            res = _check_pair(pair)
+            if res is not None:
+                out.append(res)
+        return out
+
     # ci -> aggregate metrics
     cell_results: Dict[int, list] = {}
     for ci in cells_with_own_source:
@@ -162,26 +203,33 @@ def compute_h3_tower_coverage(
         # [count, closest_dist, closest_sid, best_ploss, best_sid, best_clear, best_dist]
         cell_results[ci] = [1, 0.0, sid, 0.0, sid, 0.0, 0.0]
 
-    max_workers = os.cpu_count() or 4
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(_check_pair, p) for p in los_pairs]
-        for future in as_completed(futures):
-            res = future.result()
-            if res is None:
-                continue
-            ci, si, dist_m, clear_m, ploss_db = res
-            if ci not in cell_results:
-                cell_results[ci] = [0, float('inf'), None, float('inf'), None, None, None]
-            entry = cell_results[ci]
-            entry[0] += 1
-            if dist_m < entry[1]:
-                entry[1] = dist_m
-                entry[2] = src_list[si].source_id
-            if ploss_db < entry[3]:
-                entry[3] = ploss_db
-                entry[4] = src_list[si].source_id
-                entry[5] = clear_m
-                entry[6] = dist_m
+    def _accumulate_visible_result(ci, si, dist_m, clear_m, ploss_db):
+        if ci not in cell_results:
+            cell_results[ci] = [0, float('inf'), None, float('inf'), None, None, None]
+        entry = cell_results[ci]
+        entry[0] += 1
+        if dist_m < entry[1]:
+            entry[1] = dist_m
+            entry[2] = src_list[si].source_id
+        if ploss_db < entry[3]:
+            entry[3] = ploss_db
+            entry[4] = src_list[si].source_id
+            entry[5] = clear_m
+            entry[6] = dist_m
+
+    if los_pairs:
+        max_workers = min(os.cpu_count() or 4, 32)
+        # Avoid one-future-per-pair overhead on large high-resolution runs.
+        batch_size = max(64, len(los_pairs) // max(max_workers * 8, 1))
+        batches = [
+            los_pairs[i:i + batch_size]
+            for i in range(0, len(los_pairs), batch_size)
+        ]
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_check_pair_batch, b) for b in batches]
+            for future in as_completed(futures):
+                for ci, si, dist_m, clear_m, ploss_db in future.result():
+                    _accumulate_visible_result(ci, si, dist_m, clear_m, ploss_db)
 
     tx_dbm = config.tx_power_dbm
     gain = 2.0 * config.antenna_gain_dbi
