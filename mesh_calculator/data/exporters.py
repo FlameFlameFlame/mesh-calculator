@@ -183,11 +183,12 @@ def export_gap_repair_hexes_geojson(debug_hexes: list, output_path: str):
     """
     Export gap repair search hexagons as GeoJSON polygons.
 
-    Each record in debug_hexes corresponds to an H3 cell that was included
-    in a gap repair sub-corridor during a specific repair round.
+    Each record corresponds to an H3 cell included in an algorithm search pass.
 
     Args:
-        debug_hexes: List of dicts with keys h3_index, repair_round, gap_idx, buffer_ring
+        debug_hexes: List of dicts with keys:
+            h3_index, algorithm, phase, attempt_id, segment_idx,
+            repair_round, search_radius_m, search_ring
         output_path: Output GeoJSON file path
     """
     features = []
@@ -201,9 +202,16 @@ def export_gap_repair_hexes_geojson(debug_hexes: list, output_path: str):
             'geometry': {'type': 'Polygon', 'coordinates': [coords]},
             'properties': {
                 'h3_index': h3_idx,
-                'repair_round': rec['repair_round'],
-                'gap_idx': rec['gap_idx'],
-                'buffer_ring': rec['buffer_ring'],
+                'algorithm': rec.get('algorithm'),
+                'phase': rec.get('phase'),
+                'attempt_id': rec.get('attempt_id'),
+                'segment_idx': rec.get('segment_idx'),
+                'repair_round': rec.get('repair_round'),
+                'search_radius_m': rec.get('search_radius_m'),
+                'search_ring': rec.get('search_ring'),
+                # Legacy compatibility
+                'gap_idx': rec.get('gap_idx', rec.get('segment_idx')),
+                'buffer_ring': rec.get('buffer_ring', rec.get('search_ring')),
             },
         })
 

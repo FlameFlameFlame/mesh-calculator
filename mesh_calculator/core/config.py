@@ -21,6 +21,13 @@ class MeshConfig:
     gap_repair_rounds: int = 5     # Max gap repair rounds (0 = disabled)
     routing_k_ring: int = 2  # k-ring radius for routing graph neighbor search
     road_buffer_m: float = 0.0  # Buffer around road cells in meters (0 = road-only)
+    optimizer_search_radius_m: Optional[float] = None  # Optional planner-only search radius override
+    gap_repair_search_radius_ladder_m: list[float] = field(
+        default_factory=lambda: [0.0, 300.0, 600.0, 900.0]
+    )
+    fallback_initial_search_radius_ladder_m: list[float] = field(
+        default_factory=lambda: [300.0, 600.0, 900.0, 1200.0]
+    )
     max_coverage_radius_m: float = 15000.0  # Max tower coverage search radius in meters
 
     # Link budget parameters
@@ -30,6 +37,8 @@ class MeshConfig:
     # Optional policy gate: if set, LOS requires clearance >= threshold.
     # None keeps visibility decision purely link-budget based.
     min_fresnel_clearance_m: Optional[float] = None
+    los_dense_sample_step_m: float = 50.0
+    los_dense_max_samples: int = 400
 
     # Physical constants
     earth_radius_m: float = 6371000.0  # Earth radius in meters

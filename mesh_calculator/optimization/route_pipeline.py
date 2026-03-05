@@ -20,6 +20,7 @@ from ..core.road_corridor import road_geojson_to_h3_corridor
 from ..data.cache import LOSCache
 from ..data.exporters import (
     export_coverage_geojson,
+    export_gap_repair_hexes_geojson,
     export_grid_cells_geojson,
     export_towers_geojson,
     export_visibility_edges_geojson,
@@ -437,11 +438,14 @@ def run_route_pipeline(
     edges_path = os.path.join(output_dir, 'visibility_edges.geojson')
     report_path = os.path.join(output_dir, 'report.json')
     grid_cells_path = os.path.join(output_dir, 'grid_cells.geojson')
+    gap_repair_hexes_path = os.path.join(output_dir, 'gap_repair_hexes.geojson')
 
     export_towers_geojson(surface, towers_path)
     export_coverage_geojson(surface, coverage_path)
     export_visibility_edges_geojson(surface, edges_path)
     export_grid_cells_geojson(surface.cells, grid_cells_path)
+    if surface.gap_repair_debug:
+        export_gap_repair_hexes_geojson(surface.gap_repair_debug, gap_repair_hexes_path)
     generate_report(surface, report_path)
 
     cache_stats = los_cache.stats()

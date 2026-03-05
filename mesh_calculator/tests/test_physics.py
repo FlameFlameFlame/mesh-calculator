@@ -170,6 +170,29 @@ class TestLOSVisibilityRule(unittest.TestCase):
 
         self.assertFalse(result.is_visible)
 
+    @patch('mesh_calculator.physics.los.compute_path_loss')
+    @patch('mesh_calculator.physics.los.compute_fresnel_clearance_dense')
+    @patch('mesh_calculator.physics.los.compute_fresnel_clearance')
+    @patch('mesh_calculator.physics.los.h3_distance')
+    def test_dense_verification_can_reject_coarse_accept(
+        self, mock_distance, mock_fresnel, mock_fresnel_dense, mock_path_loss
+    ):
+        config = MeshConfig(min_fresnel_clearance_m=0.0)
+        mock_distance.return_value = 1000.0
+        mock_fresnel.return_value = (5.0, 1000.0, 500.0, 500.0)
+        mock_fresnel_dense.return_value = (-2.0, 1000.0, 500.0, 500.0)
+        mock_path_loss.return_value = config.link_budget_db - 1.0
+        cells = {
+            "a": H3Cell("a", 40.0, 44.0, 100.0, has_road=True),
+            "b": H3Cell("b", 40.0, 44.01, 100.0, has_road=True),
+        }
+
+        result = compute_los("a", "b", cells, config, elevation_provider=object())
+
+        self.assertTrue(mock_fresnel_dense.called)
+        self.assertFalse(result.is_visible)
+        self.assertLess(result.clearance_m, 0.0)
+
 
 if __name__ == '__main__':
     unittest.main()

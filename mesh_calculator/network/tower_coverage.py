@@ -154,11 +154,13 @@ def compute_h3_tower_coverage(
             return (ci, si, result.distance_m, result.clearance_m, result.path_loss_db)
         return None
 
-    # ci -> [count, best_dist, best_clear, best_ploss, best_source_id]
+    # ci -> aggregate metrics
     cell_results: Dict[int, list] = {}
     for ci in cells_with_own_source:
         own_source = source_by_h3.get(cand_list[ci].h3_index)
-        cell_results[ci] = [1, 0.0, 0.0, 0.0, own_source.source_id if own_source else None]
+        sid = own_source.source_id if own_source else None
+        # [count, closest_dist, closest_sid, best_ploss, best_sid, best_clear, best_dist]
+        cell_results[ci] = [1, 0.0, sid, 0.0, sid, 0.0, 0.0]
 
     max_workers = os.cpu_count() or 4
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -169,26 +171,29 @@ def compute_h3_tower_coverage(
                 continue
             ci, si, dist_m, clear_m, ploss_db = res
             if ci not in cell_results:
-                cell_results[ci] = [0, float('inf'), None, None, None]
+                cell_results[ci] = [0, float('inf'), None, float('inf'), None, None, None]
             entry = cell_results[ci]
             entry[0] += 1
             if dist_m < entry[1]:
                 entry[1] = dist_m
-                entry[2] = clear_m
+                entry[2] = src_list[si].source_id
+            if ploss_db < entry[3]:
                 entry[3] = ploss_db
                 entry[4] = src_list[si].source_id
+                entry[5] = clear_m
+                entry[6] = dist_m
 
     tx_dbm = config.tx_power_dbm
     gain = 2.0 * config.antenna_gain_dbi
     sens = config.receiver_sensitivity_dbm
 
     results = []
-    for ci, (count, dist, clearance, ploss, closest_sid) in cell_results.items():
+    for ci, (count, closest_dist, closest_sid, best_ploss, best_sid, best_clear, best_dist) in cell_results.items():
         cell = cand_list[ci]
         rx_dbm = None
         is_covered = False
-        if ploss is not None:
-            rx_dbm = tx_dbm + gain - ploss
+        if best_ploss is not None and best_ploss != float('inf'):
+            rx_dbm = tx_dbm + gain - best_ploss
             is_covered = (count > 0 and rx_dbm >= sens)
 
         if not is_covered:
@@ -201,12 +206,14 @@ def compute_h3_tower_coverage(
             'elevation': cell.elevation,
             'has_road': cell.has_road,
             'visible_tower_count': count,
-            'distance_m': dist if dist != float('inf') else None,
-            'clearance_m': clearance if clearance is not None and clearance != float('inf') else None,
-            'path_loss_db': ploss,
+            'distance_m': best_dist if best_dist is not None and best_dist != float('inf') else None,
+            'clearance_m': best_clear if best_clear is not None and best_clear != float('inf') else None,
+            'path_loss_db': best_ploss if best_ploss != float('inf') else None,
             'received_power_dbm': round(rx_dbm, 2) if rx_dbm is not None else None,
             'is_covered': is_covered,
+            'serving_tower_id': best_sid,
             'closest_tower_id': closest_sid,
+            'closest_distance_m': closest_dist if closest_dist != float('inf') else None,
         })
 
     logger.info("Standalone tower coverage computed: %d covered hexes", len(results))
