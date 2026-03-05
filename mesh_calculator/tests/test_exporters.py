@@ -34,7 +34,7 @@ def _make_surface_with_edges():
     surface.visibility_graph.add_tower(t2)
     surface.visibility_graph.add_tower(t3)
     surface.visibility_graph.add_visibility_edge(1, 2, distance_m=12000.0, clearance_m=15.5, path_loss_db=120.3)
-    surface.visibility_graph.add_visibility_edge(2, 3, distance_m=8000.0, clearance_m=22.0, path_loss_db=115.1)
+    surface.visibility_graph.add_visibility_edge(2, 3, distance_m=8000.0, clearance_m=-22.0, path_loss_db=115.1)
 
     return surface
 
@@ -108,6 +108,31 @@ class TestExportVisibilityEdges(unittest.TestCase):
             self.assertAlmostEqual(props["distance_m"], 12000.0)
             self.assertAlmostEqual(props["clearance_m"], 15.5)
             self.assertAlmostEqual(props["path_loss_db"], 120.3)
+        finally:
+            os.unlink(path)
+
+    def test_los_state_properties(self):
+        """Edges export geometric LOS classification from clearance sign."""
+        surface = _make_surface_with_edges()
+        with tempfile.NamedTemporaryFile(suffix=".geojson", delete=False) as f:
+            path = f.name
+        try:
+            export_visibility_edges_geojson(surface, path)
+            with open(path) as f:
+                data = json.load(f)
+
+            by_pair = {
+                (feat["properties"]["source_id"], feat["properties"]["target_id"]): feat["properties"]
+                for feat in data["features"]
+            }
+
+            pos = by_pair[(1, 2)]
+            self.assertFalse(pos["is_nlos"])
+            self.assertEqual(pos["los_state"], "los")
+
+            neg = by_pair[(2, 3)]
+            self.assertTrue(neg["is_nlos"])
+            self.assertEqual(neg["los_state"], "nlos")
         finally:
             os.unlink(path)
 

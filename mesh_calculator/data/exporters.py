@@ -243,6 +243,9 @@ def export_visibility_edges_geojson(surface: MeshSurface, output_path: str):
     for t1_id, t2_id, data in surface.visibility_graph.graph.edges(data=True):
         t1 = surface.towers[t1_id]
         t2 = surface.towers[t2_id]
+        clearance_m = data.get('clearance_m')
+        is_nlos = (clearance_m is not None and clearance_m < 0)
+        los_state = 'nlos' if is_nlos else 'los'
 
         feature = {
             'type': 'Feature',
@@ -262,9 +265,11 @@ def export_visibility_edges_geojson(surface: MeshSurface, output_path: str):
                 'source_source': t1.source,
                 'target_source': t2.source,
                 'distance_m': data.get('distance_m'),
-                'clearance_m': data.get('clearance_m'),
+                'clearance_m': clearance_m,
                 'path_loss_db': data.get('path_loss_db'),
                 'link_type': _link_type(t1, t2),
+                'is_nlos': is_nlos,
+                'los_state': los_state,
             }
         }
         features.append(feature)

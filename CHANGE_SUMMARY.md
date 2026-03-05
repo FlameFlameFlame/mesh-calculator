@@ -15,3 +15,5 @@
 - 2026-03-05: Updated config parsing to ignore legacy unknown output keys (including `outputs.tower_coverage`) and added regression coverage in `tests/test_config_new_params.py`.
 - 2026-03-05: Added runtime coverage regression tests in `tests/test_tower_coverage_runtime.py` (source-cell path loss 0, dedupe behavior, negative-clearance visible link retention).
 - 2026-03-05: Extended `LINK_BUDGET_AND_LOS.md` with runtime tower coverage API behavior and policy notes.
+- 2026-03-05: Added geometric LOS state export fields on visibility edges: `is_nlos` and `los_state` (`los`/`nlos`) derived from clearance sign.
+- 2026-03-05: Added exporter regression test coverage for LOS/NLOS edge-state serialization in `tests/test_exporters.py`.
