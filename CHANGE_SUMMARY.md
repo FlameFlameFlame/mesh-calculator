@@ -27,3 +27,4 @@
 - 2026-03-06: Expanded LOS cache key further with dense verification parameters/mode to prevent stale results across LOS-fidelity settings.
 - 2026-03-06: Updated runtime tower coverage serving semantics to choose strongest source (`serving_tower_id`) while keeping nearest source (`closest_tower_id`) as debug info; `path_loss_db`/`received_power_dbm` now follow serving source.
 - 2026-03-06: Added/updated regression tests for new cache/LOS/export/tower-coverage behavior and stabilized tower-coverage serving test fixture selection.
+- 2026-03-06: Added additive `progress_callback` support to `run_route_pipeline(...)` with structured, weighted phase progress events (route substeps + visibility + coverage + optional city-links + export + done).
