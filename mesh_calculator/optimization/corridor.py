@@ -578,14 +578,36 @@ def _greedy_place_towers(
     current = corridor[0]
     current_road_j = 0
 
+    def _try_append_endpoint_if_reachable() -> None:
+        """Append corridor endpoint only if directly reachable from current tail."""
+        end = corridor[-1]
+        if chain[-1] == end:
+            return
+        tail = chain[-1]
+        los_to_end = compute_los(
+            tail, end, cells, config, cache,
+            elevation_provider=elevation_provider,
+        )
+        if los_to_end.is_visible:
+            chain.append(end)
+            if out_meta is not None and end not in out_meta:
+                out_meta[end] = {
+                    'algorithm': 'greedy',
+                    'dp_steps': None,
+                    'repair_round': None,
+                }
+        else:
+            logger.warning(
+                "Greedy endpoint not reachable; skipping forced endpoint append",
+                tail=tail, endpoint=end, clearance_m=los_to_end.clearance_m,
+            )
+
     while True:
         if len(chain) >= k:
-            if chain[-1] != corridor[-1]:
-                chain.append(corridor[-1])
+            _try_append_endpoint_if_reachable()
             break
         if current_road_j >= len(road_cells) - 1:
-            if chain[-1] != corridor[-1]:
-                chain.append(corridor[-1])
+            _try_append_endpoint_if_reachable()
             break
 
         src_buffer = _get_buffer(current)
@@ -653,8 +675,6 @@ def _greedy_place_towers(
         current = best_dst
         current_road_j = best_j
 
-    if chain[-1] != corridor[-1]:
-        chain.append(corridor[-1])
     return chain
 
 
