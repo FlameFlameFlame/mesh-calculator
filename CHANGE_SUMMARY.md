@@ -19,3 +19,5 @@
 - 2026-03-05: Added exporter regression test coverage for LOS/NLOS edge-state serialization in `tests/test_exporters.py`.
 - 2026-03-05: Added `mast_height_m` to exported `visibility_edges.geojson` edge properties so link-analysis uses the mast value from the optimization run.
 - 2026-03-05: Added `num_clusters` to `run_route_pipeline` summary output for downstream strict-LOS disconnect messaging.
+- 2026-03-05: Greedy corridor placement no longer force-appends an unreachable endpoint cell; this avoids bogus tail clusters when the last hop has no LOS.
+- 2026-03-05: Added regression test `TestGreedyEndpointAppend.test_unreachable_endpoint_not_appended` in `tests/test_corridor_placement.py`.
