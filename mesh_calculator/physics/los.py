@@ -18,7 +18,6 @@ def compute_los(
     config: MeshConfig,
     cache: LOSCache = None,
     elevation_provider=None,
-    corridor_cells=None,
 ) -> LOSResult:
     """
     Compute complete LOS result including clearance and path loss.
@@ -50,8 +49,8 @@ def compute_los(
             )
         return result
 
-    # corridor_cells bypasses cache — result depends on the specific path slice
-    use_cache = cache is not None and corridor_cells is None
+    # All LOS checks use the straight-line RF path — always cacheable
+    use_cache = cache is not None
 
     # Check cache first
     if use_cache:
@@ -85,7 +84,6 @@ def compute_los(
     clearance, distance_m, d1, d2 = compute_fresnel_clearance(
         h3_src, h3_dst, cells, config,
         elevation_provider=elevation_provider,
-        corridor_cells=corridor_cells,
     )
 
     # Compute path loss
@@ -93,15 +91,18 @@ def compute_los(
         distance_m, config.frequency_hz, clearance, d1, d2
     )
 
+    # Link feasibility is determined by end-to-end link budget.
+    # Fresnel clearance still contributes via diffraction loss inside path_loss.
+    is_link_budget_ok = (path_loss <= config.link_budget_db)
+
     # Create result
     result = LOSResult(
         clearance_m=clearance,
         path_loss_db=path_loss,
         distance_m=distance_m,
-        is_visible=(clearance > 0)
+        is_visible=is_link_budget_ok
     )
 
-    # Cache result (only for straight-line path checks)
     if use_cache:
         cache.put(
             h3_src, h3_dst,
