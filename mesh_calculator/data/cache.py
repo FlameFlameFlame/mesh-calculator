@@ -15,7 +15,7 @@ class LOSResult:
         clearance_m: Fresnel clearance in meters
         path_loss_db: Path loss in dB
         distance_m: Distance in meters
-        is_visible: Whether LOS exists (clearance > 0)
+        is_visible: Whether link is accepted by LOS policy.
     """
     clearance_m: float
     path_loss_db: float
@@ -43,7 +43,11 @@ class LOSCache:
         h3_dst: str,
         mast_height_src: float,
         mast_height_dst: float,
-        frequency_hz: float
+        frequency_hz: float,
+        tx_power_mw: float,
+        antenna_gain_dbi: float,
+        receiver_sensitivity_dbm: float,
+        min_fresnel_clearance_m: Optional[float],
     ) -> Tuple:
         """
         Create normalized cache key (always src <= dst for symmetry).
@@ -52,14 +56,26 @@ class LOSCache:
             h3_src, h3_dst: H3 cell indices
             mast_height_src, mast_height_dst: Mast heights
             frequency_hz: Radio frequency
+            tx_power_mw: TX power in mW
+            antenna_gain_dbi: Antenna gain in dBi
+            receiver_sensitivity_dbm: Receiver sensitivity in dBm
+            min_fresnel_clearance_m: Optional policy threshold
 
         Returns:
             Normalized tuple key
         """
         if h3_src <= h3_dst:
-            return (h3_src, h3_dst, mast_height_src, mast_height_dst, frequency_hz)
+            return (
+                h3_src, h3_dst, mast_height_src, mast_height_dst, frequency_hz,
+                tx_power_mw, antenna_gain_dbi, receiver_sensitivity_dbm,
+                min_fresnel_clearance_m,
+            )
         else:
-            return (h3_dst, h3_src, mast_height_dst, mast_height_src, frequency_hz)
+            return (
+                h3_dst, h3_src, mast_height_dst, mast_height_src, frequency_hz,
+                tx_power_mw, antenna_gain_dbi, receiver_sensitivity_dbm,
+                min_fresnel_clearance_m,
+            )
 
     def get(
         self,
@@ -67,7 +83,11 @@ class LOSCache:
         h3_dst: str,
         mast_height_src: float,
         mast_height_dst: float,
-        frequency_hz: float
+        frequency_hz: float,
+        tx_power_mw: float = 500.0,
+        antenna_gain_dbi: float = 2.0,
+        receiver_sensitivity_dbm: float = -137.0,
+        min_fresnel_clearance_m: Optional[float] = None,
     ) -> Optional[LOSResult]:
         """
         Get cached LOS result if available.
@@ -76,11 +96,19 @@ class LOSCache:
             h3_src, h3_dst: H3 cell indices
             mast_height_src, mast_height_dst: Mast heights
             frequency_hz: Radio frequency
+            tx_power_mw: TX power in mW
+            antenna_gain_dbi: Antenna gain in dBi
+            receiver_sensitivity_dbm: Receiver sensitivity in dBm
+            min_fresnel_clearance_m: Optional policy threshold
 
         Returns:
             LOSResult if cached, None otherwise
         """
-        key = self._make_key(h3_src, h3_dst, mast_height_src, mast_height_dst, frequency_hz)
+        key = self._make_key(
+            h3_src, h3_dst, mast_height_src, mast_height_dst, frequency_hz,
+            tx_power_mw, antenna_gain_dbi, receiver_sensitivity_dbm,
+            min_fresnel_clearance_m,
+        )
 
         with self._lock:
             result = self._cache.get(key)
@@ -97,7 +125,11 @@ class LOSCache:
         mast_height_src: float,
         mast_height_dst: float,
         frequency_hz: float,
-        result: LOSResult
+        result: LOSResult,
+        tx_power_mw: float = 500.0,
+        antenna_gain_dbi: float = 2.0,
+        receiver_sensitivity_dbm: float = -137.0,
+        min_fresnel_clearance_m: Optional[float] = None,
     ):
         """
         Store LOS result in cache.
@@ -107,8 +139,16 @@ class LOSCache:
             mast_height_src, mast_height_dst: Mast heights
             frequency_hz: Radio frequency
             result: LOSResult to cache
+            tx_power_mw: TX power in mW
+            antenna_gain_dbi: Antenna gain in dBi
+            receiver_sensitivity_dbm: Receiver sensitivity in dBm
+            min_fresnel_clearance_m: Optional policy threshold
         """
-        key = self._make_key(h3_src, h3_dst, mast_height_src, mast_height_dst, frequency_hz)
+        key = self._make_key(
+            h3_src, h3_dst, mast_height_src, mast_height_dst, frequency_hz,
+            tx_power_mw, antenna_gain_dbi, receiver_sensitivity_dbm,
+            min_fresnel_clearance_m,
+        )
 
         with self._lock:
             self._cache[key] = result

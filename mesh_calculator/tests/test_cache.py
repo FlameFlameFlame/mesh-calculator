@@ -87,6 +87,64 @@ class TestLOSCache(unittest.TestCase):
 
         self.assertEqual(self.cache.stats()['size'], 0)
 
+    def test_cache_key_includes_receiver_sensitivity(self):
+        """Different RX sensitivity values must produce different cache keys."""
+        result = LOSResult(5.0, 140.0, 10000.0, True)
+        self.cache.put(
+            'h3_a', 'h3_b', 28.0, 28.0, 868e6, result,
+            tx_power_mw=500.0,
+            antenna_gain_dbi=2.0,
+            receiver_sensitivity_dbm=-137.0,
+            min_fresnel_clearance_m=None,
+        )
+
+        cached_same = self.cache.get(
+            'h3_a', 'h3_b', 28.0, 28.0, 868e6,
+            tx_power_mw=500.0,
+            antenna_gain_dbi=2.0,
+            receiver_sensitivity_dbm=-137.0,
+            min_fresnel_clearance_m=None,
+        )
+        cached_diff = self.cache.get(
+            'h3_a', 'h3_b', 28.0, 28.0, 868e6,
+            tx_power_mw=500.0,
+            antenna_gain_dbi=2.0,
+            receiver_sensitivity_dbm=-120.0,
+            min_fresnel_clearance_m=None,
+        )
+
+        self.assertIsNotNone(cached_same)
+        self.assertIsNone(cached_diff)
+
+    def test_cache_key_includes_min_fresnel_threshold(self):
+        """Different min clearance policy values must not reuse cached LOS."""
+        result = LOSResult(-3.0, 150.0, 12000.0, True)
+        self.cache.put(
+            'h3_a', 'h3_b', 28.0, 28.0, 868e6, result,
+            tx_power_mw=500.0,
+            antenna_gain_dbi=2.0,
+            receiver_sensitivity_dbm=-137.0,
+            min_fresnel_clearance_m=None,
+        )
+
+        cached_none = self.cache.get(
+            'h3_a', 'h3_b', 28.0, 28.0, 868e6,
+            tx_power_mw=500.0,
+            antenna_gain_dbi=2.0,
+            receiver_sensitivity_dbm=-137.0,
+            min_fresnel_clearance_m=None,
+        )
+        cached_zero = self.cache.get(
+            'h3_a', 'h3_b', 28.0, 28.0, 868e6,
+            tx_power_mw=500.0,
+            antenna_gain_dbi=2.0,
+            receiver_sensitivity_dbm=-137.0,
+            min_fresnel_clearance_m=0.0,
+        )
+
+        self.assertIsNotNone(cached_none)
+        self.assertIsNone(cached_zero)
+
 
 if __name__ == '__main__':
     unittest.main()

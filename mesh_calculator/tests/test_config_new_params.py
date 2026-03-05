@@ -37,6 +37,14 @@ class TestMeshConfigDefaults(unittest.TestCase):
         self.assertAlmostEqual(config.frequency_hz, 868e6)
         self.assertEqual(config.mast_height_m, 28.0)
 
+    def test_min_fresnel_clearance_default_is_none(self):
+        config = MeshConfig()
+        self.assertIsNone(config.min_fresnel_clearance_m)
+
+    def test_min_fresnel_clearance_can_be_set(self):
+        config = MeshConfig(min_fresnel_clearance_m=0.0)
+        self.assertEqual(config.min_fresnel_clearance_m, 0.0)
+
 
 class TestMeshCalculatorConfigFromDict(unittest.TestCase):
     """MeshCalculatorConfig.from_dict() correctly handles new params."""
@@ -92,6 +100,7 @@ class TestMeshCalculatorConfigFromDict(unittest.TestCase):
             'parameters': {
                 'road_buffer_m': 150.0,
                 'max_coverage_radius_m': 10000.0,
+                'min_fresnel_clearance_m': -1.5,
                 'mast_height_m': 35.0,
                 'routing_k_ring': 3,
             }
@@ -99,6 +108,7 @@ class TestMeshCalculatorConfigFromDict(unittest.TestCase):
         cfg = MeshCalculatorConfig.from_dict(d)
         self.assertEqual(cfg.parameters.road_buffer_m, 150.0)
         self.assertEqual(cfg.parameters.max_coverage_radius_m, 10000.0)
+        self.assertEqual(cfg.parameters.min_fresnel_clearance_m, -1.5)
         self.assertEqual(cfg.parameters.mast_height_m, 35.0)
         self.assertEqual(cfg.parameters.routing_k_ring, 3)
 

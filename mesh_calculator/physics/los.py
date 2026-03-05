@@ -46,6 +46,10 @@ def compute_los(
                 config.mast_height_m, config.mast_height_m,
                 config.frequency_hz,
                 result,
+                tx_power_mw=config.tx_power_mw,
+                antenna_gain_dbi=config.antenna_gain_dbi,
+                receiver_sensitivity_dbm=config.receiver_sensitivity_dbm,
+                min_fresnel_clearance_m=config.min_fresnel_clearance_m,
             )
         return result
 
@@ -57,7 +61,11 @@ def compute_los(
         cached = cache.get(
             h3_src, h3_dst,
             config.mast_height_m, config.mast_height_m,
-            config.frequency_hz
+            config.frequency_hz,
+            tx_power_mw=config.tx_power_mw,
+            antenna_gain_dbi=config.antenna_gain_dbi,
+            receiver_sensitivity_dbm=config.receiver_sensitivity_dbm,
+            min_fresnel_clearance_m=config.min_fresnel_clearance_m,
         )
         if cached is not None:
             return cached
@@ -76,7 +84,11 @@ def compute_los(
                 h3_src, h3_dst,
                 config.mast_height_m, config.mast_height_m,
                 config.frequency_hz,
-                result
+                result,
+                tx_power_mw=config.tx_power_mw,
+                antenna_gain_dbi=config.antenna_gain_dbi,
+                receiver_sensitivity_dbm=config.receiver_sensitivity_dbm,
+                min_fresnel_clearance_m=config.min_fresnel_clearance_m,
             )
         return result
 
@@ -94,13 +106,17 @@ def compute_los(
     # Link feasibility is determined by end-to-end link budget.
     # Fresnel clearance still contributes via diffraction loss inside path_loss.
     is_link_budget_ok = (path_loss <= config.link_budget_db)
+    if config.min_fresnel_clearance_m is None:
+        is_clearance_ok = True
+    else:
+        is_clearance_ok = (clearance >= config.min_fresnel_clearance_m)
 
     # Create result
     result = LOSResult(
         clearance_m=clearance,
         path_loss_db=path_loss,
         distance_m=distance_m,
-        is_visible=is_link_budget_ok
+        is_visible=(is_link_budget_ok and is_clearance_ok)
     )
 
     if use_cache:
@@ -108,7 +124,11 @@ def compute_los(
             h3_src, h3_dst,
             config.mast_height_m, config.mast_height_m,
             config.frequency_hz,
-            result
+            result,
+            tx_power_mw=config.tx_power_mw,
+            antenna_gain_dbi=config.antenna_gain_dbi,
+            receiver_sensitivity_dbm=config.receiver_sensitivity_dbm,
+            min_fresnel_clearance_m=config.min_fresnel_clearance_m,
         )
 
     return result
