@@ -8,3 +8,4 @@
 - 2026-03-05: Updated LOS acceptance to require link budget and, when configured, `clearance_m >= min_fresnel_clearance_m`.
 - 2026-03-05: Expanded LOS cache key with radio/policy parameters (`tx_power_mw`, `antenna_gain_dbi`, `receiver_sensitivity_dbm`, `min_fresnel_clearance_m`) to prevent stale visibility reuse across policy changes.
 - 2026-03-05: Added cache and config regression tests plus dual-mode scenario validation (`default_none` vs `strict_zero`) on `gyumri-greedy-bad`, `gyumri-vanadzor-random`, and `yerevan_gyumri`.
+- 2026-03-05: Added `LINK_BUDGET_AND_LOS.md` documenting Fresnel clearance, path loss, link budget policy, cache semantics, and how LOS decisions affect tower placement.
