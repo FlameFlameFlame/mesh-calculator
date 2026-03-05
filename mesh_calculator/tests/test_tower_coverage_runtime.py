@@ -7,7 +7,6 @@ from unittest.mock import patch
 import h3
 
 from ..core.config import MeshConfig
-from ..data.cache import LOSResult
 from ..network.tower_coverage import CoverageSource, compute_h3_tower_coverage
 
 
@@ -61,21 +60,21 @@ class TestTowerCoverageRuntime(unittest.TestCase):
         self.assertNotIn(stale_h3, by_h3)
         self.assertEqual(by_h3[expected_h3]["closest_tower_id"], 1)
 
-    @patch("mesh_calculator.network.tower_coverage.compute_los")
-    def test_negative_clearance_visible_links_are_kept(self, mock_compute_los):
+    @patch("mesh_calculator.network.tower_coverage._compute_shadow_link")
+    def test_negative_clearance_links_are_blocked(self, mock_shadow_link):
         neighbor_h3 = next(
             h for h in h3.grid_disk(self.src_h3, 1)
             if h != self.src_h3
         )
 
-        def _mock_los(h3_src, h3_dst, *_args, **_kwargs):
-            if h3_src == self.src_h3 and h3_dst == self.src_h3:
-                return LOSResult(clearance_m=28.0, path_loss_db=0.0, distance_m=0.0, is_visible=True)
-            if h3_src == neighbor_h3 and h3_dst == self.src_h3:
-                return LOSResult(clearance_m=-2.0, path_loss_db=110.0, distance_m=800.0, is_visible=True)
-            return LOSResult(clearance_m=-10.0, path_loss_db=999.0, distance_m=20000.0, is_visible=False)
+        def _mock_shadow_link(source_cell, target_cell, *_args, **_kwargs):
+            if source_cell.h3_index == target_cell.h3_index:
+                return (0.0, 1.5, 0.0, True)
+            if source_cell.h3_index == self.src_h3 and target_cell.h3_index == neighbor_h3:
+                return (800.0, -2.0, float("inf"), False)
+            return (20000.0, -10.0, float("inf"), False)
 
-        mock_compute_los.side_effect = _mock_los
+        mock_shadow_link.side_effect = _mock_shadow_link
         results = compute_h3_tower_coverage(
             sources=[CoverageSource(1, self.src_h3, self.src_lat, self.src_lon)],
             base_cells={},
@@ -83,28 +82,25 @@ class TestTowerCoverageRuntime(unittest.TestCase):
             elevation_provider=None,
         )
         by_h3 = {r["h3_index"]: r for r in results}
-        self.assertIn(neighbor_h3, by_h3)
-        self.assertEqual(by_h3[neighbor_h3]["clearance_m"], -2.0)
-        self.assertEqual(by_h3[neighbor_h3]["path_loss_db"], 110.0)
-        self.assertTrue(by_h3[neighbor_h3]["is_covered"])
+        self.assertNotIn(neighbor_h3, by_h3)
 
-    @patch("mesh_calculator.network.tower_coverage.compute_los")
-    def test_serving_tower_uses_strongest_link(self, mock_compute_los):
+    @patch("mesh_calculator.network.tower_coverage._compute_shadow_link")
+    def test_serving_tower_uses_strongest_link(self, mock_shadow_link):
         ring1 = list(h3.grid_ring(self.src_h3, 1))
         target_h3 = ring1[0]
         src2_h3 = next(h for h in ring1 if h != target_h3)
         src2_lat, src2_lon = h3.cell_to_latlng(src2_h3)
 
-        def _mock_los(h3_src, h3_dst, *_args, **_kwargs):
-            if h3_src == h3_dst:
-                return LOSResult(clearance_m=28.0, path_loss_db=0.0, distance_m=0.0, is_visible=True)
-            if h3_src == target_h3 and h3_dst == self.src_h3:
-                return LOSResult(clearance_m=1.0, path_loss_db=130.0, distance_m=600.0, is_visible=True)
-            if h3_src == target_h3 and h3_dst == src2_h3:
-                return LOSResult(clearance_m=1.0, path_loss_db=100.0, distance_m=900.0, is_visible=True)
-            return LOSResult(clearance_m=-10.0, path_loss_db=999.0, distance_m=20000.0, is_visible=False)
+        def _mock_shadow_link(source_cell, target_cell, *_args, **_kwargs):
+            if source_cell.h3_index == target_cell.h3_index:
+                return (0.0, 1.5, 0.0, True)
+            if source_cell.h3_index == self.src_h3 and target_cell.h3_index == target_h3:
+                return (600.0, 1.0, 130.0, True)
+            if source_cell.h3_index == src2_h3 and target_cell.h3_index == target_h3:
+                return (900.0, 1.0, 100.0, True)
+            return (20000.0, -10.0, float("inf"), False)
 
-        mock_compute_los.side_effect = _mock_los
+        mock_shadow_link.side_effect = _mock_shadow_link
         results = compute_h3_tower_coverage(
             sources=[
                 CoverageSource(1, self.src_h3, self.src_lat, self.src_lon),

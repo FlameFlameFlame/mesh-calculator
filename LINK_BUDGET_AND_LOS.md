@@ -9,7 +9,7 @@ This document explains how radio feasibility is computed and how that affects to
 - `Link budget`: maximum allowed path loss based on TX power, antenna gains, and receiver sensitivity.
 - `Visibility` (`is_visible`): whether a link is accepted by policy.
 
-In this project, Fresnel clearance affects link quality through diffraction loss, and visibility is decided by policy in `compute_los()`.
+In this project, Fresnel clearance affects link quality through diffraction loss, and route-planning visibility is decided by policy in `compute_los()`.
 
 ## 2) Where calculations happen
 
@@ -136,7 +136,11 @@ Tower radial coverage is now an explicit runtime calculation, not an automatic r
 - Standalone compute entrypoint: `mesh_calculator/network/tower_coverage.py`
   - `CoverageSource(source_id, h3_index, lat, lon)`
   - `compute_h3_tower_coverage(...)`
-- The same LOS function (`compute_los`) is reused, so Fresnel, diffraction, link budget, and optional clearance threshold are identical to placement logic.
+- Runtime tower coverage now uses a strict terrain-shadow model:
+  - hard geometric LOS (`clearance >= 0`) from tower top to coverage receiver height
+  - no diffraction-based pass-through for blocked cells
+  - FSPL-only budget check after LOS passes
+- Coverage receiver endpoint height is controlled by `coverage_receiver_height_m` (default `1.5 m`), while source endpoint uses `mast_height_m`.
 - Output is covered cells only, including the source H3 cell with:
   - `distance_m = 0.0`
   - `path_loss_db = 0.0`

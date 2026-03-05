@@ -29,6 +29,7 @@ class MeshConfig:
         default_factory=lambda: [300.0, 600.0, 900.0, 1200.0]
     )
     max_coverage_radius_m: float = 15000.0  # Max tower coverage search radius in meters
+    coverage_receiver_height_m: float = 1.5  # RX height above ground for tower-coverage maps
 
     # Link budget parameters
     tx_power_mw: float = 500.0              # Transmit power in milliwatts

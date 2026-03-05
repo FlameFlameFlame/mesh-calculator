@@ -17,7 +17,8 @@ import structlog
 from ..core.config import MeshConfig
 from ..core.grid import H3Cell
 from ..data.cache import LOSCache
-from ..physics.los import compute_los
+from ..core.geometry import great_circle_distance
+from ..physics.path_loss import fspl_only
 
 logger = structlog.get_logger(__name__)
 
@@ -76,6 +77,63 @@ def _ring_step_m(resolution: int) -> float:
     """Approximate center-to-center distance for one H3 ring step."""
     edge_m = h3.average_hexagon_edge_length(resolution, unit='m')
     return edge_m * math.sqrt(3.0)
+
+
+def _compute_shadow_link(
+    source_cell: H3Cell,
+    target_cell: H3Cell,
+    config: MeshConfig,
+    elevation_provider=None,
+) -> tuple[float, float, float, bool]:
+    """
+    Compute strict terrain-shadow viability for tower coverage.
+
+    This is intentionally stricter than optimization LOS policy:
+    - hard geometric LOS requirement (no diffraction acceptance)
+    - FSPL-only budget check once LOS is clear
+    - receiver endpoint height uses coverage_receiver_height_m
+    """
+    distance_m = great_circle_distance(
+        source_cell.lat, source_cell.lon, target_cell.lat, target_cell.lon
+    )
+    if distance_m <= 0.0:
+        return 0.0, config.coverage_receiver_height_m, 0.0, True
+
+    src_height_asl = source_cell.elevation + config.mast_height_m
+    dst_height_asl = target_cell.elevation + config.coverage_receiver_height_m
+
+    step_m = max(float(config.los_dense_sample_step_m), 1.0)
+    max_samples = max(int(config.los_dense_max_samples), 2)
+    n_samples = max(2, int(distance_m / step_m))
+    n_samples = min(n_samples, max_samples)
+
+    fracs = np.linspace(0.0, 1.0, n_samples + 1)
+    lats = source_cell.lat + (target_cell.lat - source_cell.lat) * fracs
+    lons = source_cell.lon + (target_cell.lon - source_cell.lon) * fracs
+
+    if elevation_provider is not None:
+        elevs = np.array(
+            [elevation_provider.get_elevation(float(lat), float(lon))
+             for lat, lon in zip(lats, lons)],
+            dtype=np.float64,
+        )
+    else:
+        # Fallback for tests/edge paths without DEM provider.
+        elevs = np.linspace(source_cell.elevation, target_cell.elevation, n_samples + 1)
+
+    d1s = distance_m * fracs
+    d2s = distance_m - d1s
+    line_alts = src_height_asl + (dst_height_asl - src_height_asl) * fracs
+    earth_curvs = (d1s * d2s) / (2.0 * config.effective_earth_radius_m)
+    clearances = line_alts - (elevs + earth_curvs)
+    worst_clearance = float(clearances[np.argmin(clearances)])
+
+    if worst_clearance < 0.0:
+        return distance_m, worst_clearance, float("inf"), False
+
+    path_loss_db = fspl_only(distance_m, config.frequency_hz)
+    is_visible = path_loss_db <= config.link_budget_db
+    return distance_m, worst_clearance, path_loss_db, is_visible
 
 
 def compute_h3_tower_coverage(
@@ -177,14 +235,15 @@ def compute_h3_tower_coverage(
     def _check_pair(pair):
         ci, si = pair
         c = cand_list[ci]
-        s = src_list[si]
-        result = compute_los(
-            c.h3_index, s.h3_index,
-            augmented_cells, config, los_cache,
+        src_cell = src_cells[si]
+        distance_m, clearance_m, path_loss_db, is_visible = _compute_shadow_link(
+            source_cell=src_cell,
+            target_cell=c,
+            config=config,
             elevation_provider=elevation_provider,
         )
-        if result.is_visible:
-            return (ci, si, result.distance_m, result.clearance_m, result.path_loss_db)
+        if is_visible:
+            return (ci, si, distance_m, clearance_m, path_loss_db)
         return None
 
     def _check_pair_batch(batch):
