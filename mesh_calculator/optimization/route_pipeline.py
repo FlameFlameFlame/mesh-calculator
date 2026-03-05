@@ -452,6 +452,7 @@ def run_route_pipeline(
         'total_towers': len(surface.towers),
         'total_cells': len(surface.cells),
         'visibility_edges': surface.visibility_graph.edge_count(),
+        'num_clusters': len(surface.visibility_graph.connected_components()),
         'route_summaries': route_summaries,
         'los_cache': cache_stats,
         'elevation_cache': elev_stats,

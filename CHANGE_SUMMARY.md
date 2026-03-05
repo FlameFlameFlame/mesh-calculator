@@ -18,3 +18,4 @@
 - 2026-03-05: Added geometric LOS state export fields on visibility edges: `is_nlos` and `los_state` (`los`/`nlos`) derived from clearance sign.
 - 2026-03-05: Added exporter regression test coverage for LOS/NLOS edge-state serialization in `tests/test_exporters.py`.
 - 2026-03-05: Added `mast_height_m` to exported `visibility_edges.geojson` edge properties so link-analysis uses the mast value from the optimization run.
+- 2026-03-05: Added `num_clusters` to `run_route_pipeline` summary output for downstream strict-LOS disconnect messaging.
