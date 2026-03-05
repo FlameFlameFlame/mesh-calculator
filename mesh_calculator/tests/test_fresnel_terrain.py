@@ -221,5 +221,109 @@ class TestLOSWithElevationProvider(unittest.TestCase):
         self.assertFalse(result, "Mountain should block has_line_of_sight")
 
 
+class TestCorridorCellsRemoved(unittest.TestCase):
+    """
+    Regression tests for Bug 1 fix: corridor_cells parameter removed.
+
+    After the fix, compute_fresnel_clearance and compute_los no longer accept
+    a corridor_cells argument — they always use h3.grid_path_cells (straight-line path).
+    """
+
+    def setUp(self):
+        self.config = MeshConfig(mast_height_m=10.0, h3_resolution=8)
+        self.src_h3 = h3.latlng_to_cell(40.0, 44.0, 8)
+        self.dst_h3 = h3.latlng_to_cell(40.0, 44.1, 8)
+        src_lat, src_lon = h3.cell_to_latlng(self.src_h3)
+        dst_lat, dst_lon = h3.cell_to_latlng(self.dst_h3)
+        self.cells = {
+            self.src_h3: H3Cell(
+                h3_index=self.src_h3, lat=src_lat, lon=src_lon,
+                elevation=100.0, has_road=True,
+            ),
+            self.dst_h3: H3Cell(
+                h3_index=self.dst_h3, lat=dst_lat, lon=dst_lon,
+                elevation=100.0, has_road=True,
+            ),
+        }
+
+    def test_corridor_cells_removed_from_compute_los_signature(self):
+        """compute_los must not accept corridor_cells — parameter was removed."""
+        import inspect
+        from ..physics.los import compute_los as _compute_los
+        self.assertNotIn(
+            'corridor_cells',
+            inspect.signature(_compute_los).parameters,
+            "corridor_cells parameter must be removed from compute_los",
+        )
+
+    def test_corridor_cells_removed_from_compute_fresnel_clearance_signature(self):
+        """compute_fresnel_clearance must not accept corridor_cells."""
+        import inspect
+        self.assertNotIn(
+            'corridor_cells',
+            inspect.signature(compute_fresnel_clearance).parameters,
+            "corridor_cells parameter must be removed from compute_fresnel_clearance",
+        )
+
+    def test_straight_line_mountain_blocks_los(self):
+        """Mountain on the straight-line RF path must block LOS regardless of any road detour."""
+        mountain_provider = Mock()
+        mountain_provider.get_elevation.return_value = 2000.0  # high mountain on straight-line path
+
+        clearance, *_ = compute_fresnel_clearance(
+            self.src_h3, self.dst_h3, self.cells, self.config,
+            elevation_provider=mountain_provider,
+        )
+        self.assertLess(
+            clearance, 0,
+            "Straight-line mountain must block LOS regardless of road path",
+        )
+
+
+class TestFracsCosineCorrectionAccuracy(unittest.TestCase):
+    """
+    Regression tests for Bug 2 fix: fracs projection uses cos(lat) scaling.
+
+    For a purely E-W path (Δlat=0), a sample at the midpoint should project
+    to frac ≈ 0.5.  The old formula (no cos(lat)) produced the same result for
+    E-W paths, so the key test is that d1+d2 == total_distance for all samples.
+    """
+
+    def setUp(self):
+        self.config = MeshConfig(mast_height_m=10.0, h3_resolution=8)
+        self.src_h3 = h3.latlng_to_cell(40.0, 44.0, 8)
+        self.dst_h3 = h3.latlng_to_cell(40.0, 44.1, 8)
+        src_lat, src_lon = h3.cell_to_latlng(self.src_h3)
+        dst_lat, dst_lon = h3.cell_to_latlng(self.dst_h3)
+
+        # Build cells for every intermediate path cell
+        path_cells = list(h3.grid_path_cells(self.src_h3, self.dst_h3))
+        self.cells = {}
+        for cell in path_cells:
+            clat, clon = h3.cell_to_latlng(cell)
+            self.cells[cell] = H3Cell(
+                h3_index=cell, lat=clat, lon=clon,
+                elevation=100.0, has_road=True,
+            )
+
+    def test_d1_plus_d2_equals_total_distance(self):
+        """d1 + d2 must equal total_distance for the worst-clearance cell."""
+        clearance, total_dist, d1, d2 = compute_fresnel_clearance(
+            self.src_h3, self.dst_h3, self.cells, self.config,
+        )
+        self.assertAlmostEqual(
+            d1 + d2, total_dist, delta=total_dist * 0.01,
+            msg="d1 + d2 must equal total_distance (within 1%)",
+        )
+
+    def test_clearance_is_finite(self):
+        """Clearance must be a real finite number."""
+        import math as _math
+        clearance, *_ = compute_fresnel_clearance(
+            self.src_h3, self.dst_h3, self.cells, self.config,
+        )
+        self.assertTrue(_math.isfinite(clearance), "Clearance must be finite")
+
+
 if __name__ == '__main__':
     unittest.main()

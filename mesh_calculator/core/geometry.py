@@ -75,12 +75,14 @@ def calculate_line_fraction(point_h3: str, start_h3: str, end_h3: str) -> float:
     pl, plo = h3_to_lat_lon(point_h3)
     sl, slo = h3_to_lat_lon(start_h3)
     el, elo = h3_to_lat_lon(end_h3)
-    dx = elo - slo
+    lat_mid = (sl + el) / 2.0
+    cos_lat = math.cos(math.radians(lat_mid))
+    dx = (elo - slo) * cos_lat
     dy = el - sl
     denom = dx * dx + dy * dy
     if denom < 1e-12:
         return 0.0
-    frac = ((plo - slo) * dx + (pl - sl) * dy) / denom
+    frac = ((plo - slo) * cos_lat * dx + (pl - sl) * dy) / denom
     return max(0.0, min(1.0, frac))
 
 
