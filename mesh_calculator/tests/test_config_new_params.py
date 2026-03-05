@@ -112,6 +112,21 @@ class TestMeshCalculatorConfigFromDict(unittest.TestCase):
         self.assertEqual(cfg.parameters.mast_height_m, 35.0)
         self.assertEqual(cfg.parameters.routing_k_ring, 3)
 
+    def test_legacy_output_tower_coverage_key_is_ignored(self):
+        d = {
+            'outputs': {
+                'towers': 'towers.geojson',
+                'coverage': 'coverage.geojson',
+                'tower_coverage': 'tower_coverage.geojson',
+                'report': 'report.json',
+            }
+        }
+        cfg = MeshCalculatorConfig.from_dict(d)
+        self.assertEqual(cfg.outputs.towers, 'towers.geojson')
+        self.assertEqual(cfg.outputs.coverage, 'coverage.geojson')
+        self.assertEqual(cfg.outputs.report, 'report.json')
+        self.assertFalse(hasattr(cfg.outputs, 'tower_coverage'))
+
 
 if __name__ == '__main__':
     unittest.main()

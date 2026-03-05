@@ -92,7 +92,6 @@ class OutputPaths:
 
     towers: str = "output/towers.geojson"
     coverage: str = "output/coverage.geojson"
-    tower_coverage: str = "output/tower_coverage.geojson"
     report: str = "output/report.json"
     visibility_edges: str = "output/visibility_edges.geojson"
 
@@ -127,6 +126,9 @@ class MeshCalculatorConfig:
         inputs = InputPaths(**inputs_dict) if inputs_dict else None
 
         outputs_dict = config_dict.get('outputs', {})
-        outputs = OutputPaths(**outputs_dict)
+        outputs = OutputPaths(**{
+            k: v for k, v in outputs_dict.items()
+            if k in OutputPaths.__dataclass_fields__
+        })
 
         return cls(parameters=params, inputs=inputs, outputs=outputs)

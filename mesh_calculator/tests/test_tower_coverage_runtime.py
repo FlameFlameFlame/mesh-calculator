@@ -1,0 +1,77 @@
+"""
+Tests for standalone runtime tower coverage computation.
+"""
+import unittest
+from unittest.mock import patch
+
+import h3
+
+from ..core.config import MeshConfig
+from ..data.cache import LOSResult
+from ..network.tower_coverage import CoverageSource, compute_h3_tower_coverage
+
+
+class TestTowerCoverageRuntime(unittest.TestCase):
+    def setUp(self):
+        self.config = MeshConfig(h3_resolution=8, max_coverage_radius_m=1200.0)
+        self.src_h3 = h3.latlng_to_cell(40.1772, 44.5035, self.config.h3_resolution)
+        self.src_lat, self.src_lon = h3.cell_to_latlng(self.src_h3)
+
+    def test_source_cell_included_with_zero_path_loss(self):
+        results = compute_h3_tower_coverage(
+            sources=[CoverageSource(1, self.src_h3, self.src_lat, self.src_lon)],
+            base_cells={},
+            config=self.config,
+            elevation_provider=None,
+        )
+        by_h3 = {r["h3_index"]: r for r in results}
+        self.assertIn(self.src_h3, by_h3)
+        self.assertEqual(by_h3[self.src_h3]["distance_m"], 0.0)
+        self.assertEqual(by_h3[self.src_h3]["path_loss_db"], 0.0)
+        self.assertEqual(by_h3[self.src_h3]["closest_tower_id"], 1)
+        self.assertTrue(by_h3[self.src_h3]["is_covered"])
+
+    def test_duplicate_sources_are_deduped_by_h3(self):
+        results = compute_h3_tower_coverage(
+            sources=[
+                CoverageSource(10, self.src_h3, self.src_lat, self.src_lon),
+                CoverageSource(99, self.src_h3, self.src_lat, self.src_lon),
+            ],
+            base_cells={},
+            config=self.config,
+            elevation_provider=None,
+        )
+        source_rows = [r for r in results if r["h3_index"] == self.src_h3]
+        self.assertEqual(len(source_rows), 1)
+        self.assertEqual(source_rows[0]["closest_tower_id"], 10)
+
+    @patch("mesh_calculator.network.tower_coverage.compute_los")
+    def test_negative_clearance_visible_links_are_kept(self, mock_compute_los):
+        neighbor_h3 = next(
+            h for h in h3.grid_disk(self.src_h3, 1)
+            if h != self.src_h3
+        )
+
+        def _mock_los(h3_src, h3_dst, *_args, **_kwargs):
+            if h3_src == self.src_h3 and h3_dst == self.src_h3:
+                return LOSResult(clearance_m=28.0, path_loss_db=0.0, distance_m=0.0, is_visible=True)
+            if h3_src == neighbor_h3 and h3_dst == self.src_h3:
+                return LOSResult(clearance_m=-2.0, path_loss_db=110.0, distance_m=800.0, is_visible=True)
+            return LOSResult(clearance_m=-10.0, path_loss_db=999.0, distance_m=20000.0, is_visible=False)
+
+        mock_compute_los.side_effect = _mock_los
+        results = compute_h3_tower_coverage(
+            sources=[CoverageSource(1, self.src_h3, self.src_lat, self.src_lon)],
+            base_cells={},
+            config=self.config,
+            elevation_provider=None,
+        )
+        by_h3 = {r["h3_index"]: r for r in results}
+        self.assertIn(neighbor_h3, by_h3)
+        self.assertEqual(by_h3[neighbor_h3]["clearance_m"], -2.0)
+        self.assertEqual(by_h3[neighbor_h3]["path_loss_db"], 110.0)
+        self.assertTrue(by_h3[neighbor_h3]["is_covered"])
+
+
+if __name__ == "__main__":
+    unittest.main()

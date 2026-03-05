@@ -3,7 +3,7 @@ Route-based tower placement pipeline.
 
 Processes user-chosen routes sequentially, placing towers on each corridor
 while reusing towers from previously processed routes. Computes visibility
-edges, cell coverage, and optionally tags city links.
+edges, road-cell coverage, and optionally tags city links.
 """
 import json
 import logging
@@ -21,7 +21,6 @@ from ..data.cache import LOSCache
 from ..data.exporters import (
     export_coverage_geojson,
     export_grid_cells_geojson,
-    export_tower_coverage_geojson,
     export_towers_geojson,
     export_visibility_edges_geojson,
     generate_report,
@@ -428,10 +427,6 @@ def run_route_pipeline(
     logger.info("Computing cell coverage...")
     surface.compute_cell_coverage(los_cache)
 
-    # Compute tower radial coverage (all hexes within signal range, not just roads)
-    logger.info("Computing tower radial coverage...")
-    radial_hexes = surface.compute_tower_radial_coverage(los_cache)
-
     # Tag city links
     if city_boundaries_geojson:
         tag_city_links(surface, city_boundaries_geojson, threshold=0.20)
@@ -439,14 +434,12 @@ def run_route_pipeline(
     # Export results
     towers_path = os.path.join(output_dir, 'towers.geojson')
     coverage_path = os.path.join(output_dir, 'coverage.geojson')
-    tower_coverage_path = os.path.join(output_dir, 'tower_coverage.geojson')
     edges_path = os.path.join(output_dir, 'visibility_edges.geojson')
     report_path = os.path.join(output_dir, 'report.json')
     grid_cells_path = os.path.join(output_dir, 'grid_cells.geojson')
 
     export_towers_geojson(surface, towers_path)
     export_coverage_geojson(surface, coverage_path)
-    export_tower_coverage_geojson(radial_hexes, tower_coverage_path)
     export_visibility_edges_geojson(surface, edges_path)
     export_grid_cells_geojson(surface.cells, grid_cells_path)
     generate_report(surface, report_path)
