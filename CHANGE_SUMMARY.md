@@ -32,3 +32,5 @@
 - 2026-03-06: Corrected tower-coverage ring sizing to use H3 center-to-center step (plus one safety ring) instead of raw edge length, removing large candidate over-expansion that caused slow/high-resolution coverage runs.
 - 2026-03-06: Reduced runtime coverage overhead by batching LOS pair checks per worker instead of spawning one future per pair; keeps behavior unchanged but improves high-pair-count performance.
 - 2026-03-06: Added regression test `test_sources_are_snapped_to_requested_resolution` in `tests/test_tower_coverage_runtime.py`.
+- 2026-03-06: Added deterministic physics ground-truth suite `tests/test_physics_ground_truth.py` with one-tower/three-point synthetic terrain checks for strict LOS, budget-mode cross-check, and runtime tower-coverage integration behavior.
+- 2026-03-06: Verified physics regression gates via: `test_physics_ground_truth.py` (3 passed), focused physics set (`test_physics.py`, `test_fresnel_terrain.py`, `test_cache.py`: 32 passed), and full mesh_calculator suite (123 passed).
