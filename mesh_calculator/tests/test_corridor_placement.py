@@ -355,5 +355,104 @@ class TestGreedyEndpointAppend(unittest.TestCase):
         self.assertNotIn("cell_4", nodes)
 
 
+class TestDPFallbackBeforeGapRepair(unittest.TestCase):
+    """DP should exhaust fallback initial attempts before running gap repair."""
+
+    def setUp(self):
+        self.config = MeshConfig(
+            mast_height_m=10.0,
+            max_towers_per_route=6,
+            road_buffer_m=100.0,
+            gap_repair_rounds=2,
+            fallback_initial_search_radius_ladder_m=[300.0],
+            gap_repair_search_radius_ladder_m=[0.0, 200.0],
+        )
+
+    @patch('mesh_calculator.optimization.corridor.h3.grid_disk')
+    @patch('mesh_calculator.optimization.corridor._repair_broken_gaps')
+    @patch('mesh_calculator.optimization.corridor._dp_place_towers_with_meta')
+    @patch('mesh_calculator.optimization.corridor.compute_los')
+    @patch('mesh_calculator.core.geometry.h3_distance')
+    def test_gap_repair_radius_starts_from_fallback_radius(
+        self,
+        mock_distance,
+        mock_compute_los,
+        mock_dp,
+        mock_repair,
+        mock_grid_disk,
+    ):
+        corridor = make_corridor(3)
+        cells = make_cells(3)
+        surface = MeshSurface(cells, self.config)
+
+        mock_grid_disk.side_effect = lambda cell, ring: [cell]
+        mock_distance.return_value = 1000.0
+        mock_dp.side_effect = lambda segment, *_a, **_k: ([segment[0], segment[-1]], 2)
+        mock_compute_los.return_value = LOSResult(
+            clearance_m=-999.0, path_loss_db=999.0,
+            distance_m=1000.0, is_visible=False,
+        )
+
+        used_radii = []
+
+        def _repair_passthrough(
+            chain, _corridor, _corridor_pos, *,
+            search_radius_m, repair_round, attempt_id,
+            surface, cache, user_budget, node_meta=None,
+        ):
+            used_radii.append(float(search_radius_m))
+            return chain
+
+        mock_repair.side_effect = _repair_passthrough
+
+        place_nodes_along_corridor(corridor, surface)
+
+        self.assertEqual(
+            used_radii,
+            [300.0, 500.0],
+            "Gap repair must start at selected fallback radius and then widen from it",
+        )
+
+    @patch('mesh_calculator.optimization.corridor.h3.grid_disk')
+    @patch('mesh_calculator.optimization.corridor._repair_broken_gaps')
+    @patch('mesh_calculator.optimization.corridor._dp_place_towers_with_meta')
+    @patch('mesh_calculator.optimization.corridor.compute_los')
+    @patch('mesh_calculator.core.geometry.h3_distance')
+    def test_fallback_success_skips_gap_repair(
+        self,
+        mock_distance,
+        mock_compute_los,
+        mock_dp,
+        mock_repair,
+        mock_grid_disk,
+    ):
+        corridor = make_corridor(3)
+        cells = make_cells(3)
+        surface = MeshSurface(cells, self.config)
+
+        mock_grid_disk.side_effect = lambda cell, ring: [cell]
+        mock_distance.return_value = 1000.0
+        mock_dp.side_effect = [
+            (["cell_0", "cell_2"], 2),     # initial attempt fails
+            (["cell_0", "cell_1", "cell_2"], 3),  # fallback attempt succeeds
+        ]
+
+        def _los(src, dst, *_a, **_k):
+            visible = (src, dst) in {("cell_0", "cell_1"), ("cell_1", "cell_2")}
+            return LOSResult(
+                clearance_m=10.0 if visible else -999.0,
+                path_loss_db=50.0 if visible else 999.0,
+                distance_m=1000.0,
+                is_visible=visible,
+            )
+
+        mock_compute_los.side_effect = _los
+
+        nodes = place_nodes_along_corridor(corridor, surface)
+
+        self.assertEqual(nodes, ["cell_0", "cell_1", "cell_2"])
+        self.assertEqual(mock_repair.call_count, 0, "Gap repair should be last resort only")
+
+
 if __name__ == '__main__':
     unittest.main()
