@@ -111,6 +111,8 @@ class TestExportVisibilityEdges(unittest.TestCase):
             self.assertIn("clearance_m", props)
             self.assertIn("path_loss_db", props)
             self.assertIn("mast_height_m", props)
+            self.assertIn("source_elevation_m", props)
+            self.assertIn("target_elevation_m", props)
             self.assertIn("source_antenna_height_m", props)
             self.assertIn("target_antenna_height_m", props)
             self.assertAlmostEqual(props["distance_m"], 12000.0)
@@ -125,6 +127,8 @@ class TestExportVisibilityEdges(unittest.TestCase):
                 props["target_antenna_height_m"],
                 surface.config.mast_height_m + 1.5,
             )
+            self.assertAlmostEqual(props["source_elevation_m"], 500.0)
+            self.assertAlmostEqual(props["target_elevation_m"], 600.0)
         finally:
             os.unlink(path)
 

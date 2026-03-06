@@ -303,6 +303,8 @@ def export_visibility_edges_geojson(surface: MeshSurface, output_path: str):
                 'clearance_m': clearance_m,
                 'path_loss_db': data.get('path_loss_db'),
                 'mast_height_m': surface.config.mast_height_m,
+                'source_elevation_m': c1.elevation if c1 is not None else None,
+                'target_elevation_m': c2.elevation if c2 is not None else None,
                 'source_antenna_height_m': h1,
                 'target_antenna_height_m': h2,
                 'link_type': _link_type(t1, t2),
