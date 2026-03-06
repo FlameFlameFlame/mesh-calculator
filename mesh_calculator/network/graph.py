@@ -224,7 +224,7 @@ class MeshSurface:
         """
         tower_list = list(self.towers.values())
         n = len(tower_list)
-        logger.info("Updating visibility edges", towers=n)
+        logger.info("Updating visibility edges for %d towers", n)
 
         if n < 2:
             return
@@ -244,9 +244,11 @@ class MeshSurface:
 
         max_dist = self.config.max_visibility_m
         candidate_pairs = tree.query_pairs(r=max_dist, output_type='ndarray')
-        logger.info("Visibility candidates after spatial filter",
-                     total_pairs=n * (n - 1) // 2,
-                     candidate_pairs=len(candidate_pairs))
+        logger.info(
+            "Visibility candidates after spatial filter: %d/%d",
+            len(candidate_pairs),
+            n * (n - 1) // 2,
+        )
 
         # Compute LOS in parallel for candidate pairs
         cells = self.cells
@@ -285,7 +287,7 @@ class MeshSurface:
                     )
                     edges_added += 1
 
-        logger.info("Visibility edges added", count=edges_added)
+        logger.info("Visibility edges added: %d", edges_added)
 
     def compute_cell_coverage(self, cache: LOSCache = None):
         """Compute per-cell coverage metrics from placed towers.

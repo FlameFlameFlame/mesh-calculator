@@ -68,7 +68,7 @@ def export_towers_geojson(surface: MeshSurface, output_path: str):
     with open(output_path, 'w') as f:
         json.dump(geojson, f, indent=2)
 
-    logger.info("Exported towers", count=len(features), path=output_path)
+    logger.info("Exported towers: count=%d path=%s", len(features), output_path)
 
 
 def export_coverage_geojson(surface: MeshSurface, output_path: str):
@@ -123,7 +123,11 @@ def export_coverage_geojson(surface: MeshSurface, output_path: str):
     with open(output_path, 'w') as f:
         json.dump(geojson, f, indent=2)
 
-    logger.info("Exported coverage cells", count=len(features), path=output_path)
+    logger.info(
+        "Exported coverage cells: count=%d path=%s",
+        len(features),
+        output_path,
+    )
 
 
 def export_tower_coverage_geojson(hex_results: list, output_path: str):
@@ -153,7 +157,11 @@ def export_tower_coverage_geojson(hex_results: list, output_path: str):
     with open(output_path, 'w') as f:
         json.dump(geojson, f, indent=2)
 
-    logger.info("Exported tower coverage hexes", count=len(features), path=output_path)
+    logger.info(
+        "Exported tower coverage hexes: count=%d path=%s",
+        len(features),
+        output_path,
+    )
 
 
 def export_grid_cells_geojson(cells: Dict, output_path: str):
@@ -183,7 +191,7 @@ def export_grid_cells_geojson(cells: Dict, output_path: str):
     geojson = {'type': 'FeatureCollection', 'features': features}
     with open(output_path, 'w') as f:
         json.dump(geojson, f, indent=2)
-    logger.info("Exported grid cells", count=len(features), path=output_path)
+    logger.info("Exported grid cells: count=%d path=%s", len(features), output_path)
 
 
 def export_gap_repair_hexes_geojson(debug_hexes: list, output_path: str):
@@ -225,7 +233,11 @@ def export_gap_repair_hexes_geojson(debug_hexes: list, output_path: str):
     geojson = {'type': 'FeatureCollection', 'features': features}
     with open(output_path, 'w') as f:
         json.dump(geojson, f, indent=2)
-    logger.info("Exported gap repair hexes", count=len(features), path=output_path)
+    logger.info(
+        "Exported gap repair hexes: count=%d path=%s",
+        len(features),
+        output_path,
+    )
 
 
 def export_visibility_edges_geojson(surface: MeshSurface, output_path: str):
@@ -308,7 +320,11 @@ def export_visibility_edges_geojson(surface: MeshSurface, output_path: str):
     with open(output_path, 'w') as f:
         json.dump(geojson, f, indent=2)
 
-    logger.info("Exported visibility edges", count=len(features), path=output_path)
+    logger.info(
+        "Exported visibility edges: count=%d path=%s",
+        len(features),
+        output_path,
+    )
 
 
 def generate_report(surface: MeshSurface, output_path: str):
