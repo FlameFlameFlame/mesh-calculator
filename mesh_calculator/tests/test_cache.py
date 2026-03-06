@@ -2,7 +2,12 @@
 Unit tests for caching.
 """
 import unittest
+from unittest.mock import patch
+
+from ..core.config import MeshConfig
+from ..core.grid import H3Cell
 from ..data.cache import LOSCache, LOSResult
+from ..parallel.los_compute import compute_los_batch
 
 
 class TestLOSCache(unittest.TestCase):
@@ -194,6 +199,58 @@ class TestLOSCache(unittest.TestCase):
 
         self.assertIsNotNone(cached_same)
         self.assertIsNone(cached_diff)
+
+class TestLOSBatchExecution(unittest.TestCase):
+    """Batch LOS computation is deterministic and reuses canonical pair work."""
+
+    def setUp(self):
+        self.config = MeshConfig()
+        self.cells = {
+            "a": H3Cell("a", 40.0, 44.0, 100.0, has_road=True),
+            "b": H3Cell("b", 40.1, 44.1, 100.0, has_road=True),
+            "c": H3Cell("c", 40.2, 44.2, 100.0, has_road=True),
+        }
+
+    @patch('mesh_calculator.parallel.los_compute.compute_los')
+    def test_batch_returns_results_for_duplicate_and_symmetric_pairs(self, mock_compute_los):
+        def _fake(src, dst, *_args, **_kwargs):
+            is_visible = {src, dst} != {"a", "c"}
+            return LOSResult(
+                clearance_m=1.0,
+                path_loss_db=100.0,
+                distance_m=1000.0,
+                is_visible=is_visible,
+            )
+
+        mock_compute_los.side_effect = _fake
+        pairs = [("a", "b"), ("b", "a"), ("a", "b"), ("a", "c")]
+
+        results = compute_los_batch(pairs, self.cells, self.config)
+
+        self.assertEqual(set(results.keys()), set(pairs))
+        self.assertTrue(results[("a", "b")].is_visible)
+        self.assertTrue(results[("b", "a")].is_visible)
+        self.assertFalse(results[("a", "c")].is_visible)
+        self.assertEqual(mock_compute_los.call_count, 2)
+
+    @patch('mesh_calculator.parallel.los_compute.compute_los')
+    def test_batch_matches_serial_result_objects(self, mock_compute_los):
+        def _fake(src, dst, *_args, **_kwargs):
+            distance = 1000.0 if {src, dst} == {"a", "b"} else 2000.0
+            return LOSResult(
+                clearance_m=5.0,
+                path_loss_db=95.0,
+                distance_m=distance,
+                is_visible=True,
+            )
+
+        mock_compute_los.side_effect = _fake
+        pairs = [("a", "b"), ("b", "c")]
+
+        results = compute_los_batch(pairs, self.cells, self.config, max_workers=2)
+
+        self.assertEqual(results[("a", "b")].distance_m, 1000.0)
+        self.assertEqual(results[("b", "c")].distance_m, 2000.0)
 
 
 if __name__ == '__main__':

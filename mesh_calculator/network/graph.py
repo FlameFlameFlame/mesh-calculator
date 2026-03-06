@@ -1,8 +1,6 @@
 """
 Network graph representation for towers and visibility.
 """
-import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Set
 
@@ -16,6 +14,7 @@ from ..core.grid import H3Cell
 from ..core.config import MeshConfig
 from ..data.cache import LOSCache
 from ..physics.los import compute_los
+from ..parallel.los_compute import compute_los_batch
 from .tower_coverage import CoverageSource, compute_h3_tower_coverage
 
 logger = structlog.get_logger(__name__)
@@ -27,30 +26,27 @@ _EARTH_R = 6_371_000
 def _los_decision_debug(result, config: MeshConfig, edge_origin: str) -> dict:
     """Build explicit edge-acceptance debug metadata from LOS result + policy."""
     path_loss = getattr(result, "path_loss_db", None)
-    clearance = getattr(result, "clearance_m", None)
-    threshold = config.min_fresnel_clearance_m
+    obstruction_ratio = getattr(result, "fresnel_obstruction_ratio", None)
+    allowed_ratio = getattr(result, "max_allowed_fresnel_obstruction_ratio", 0.4)
     budget_ok = (path_loss is not None and path_loss <= config.link_budget_db)
-    clearance_ok = True if threshold is None else (
-        clearance is not None and clearance >= threshold
+    fresnel_ok = (
+        obstruction_ratio is not None and obstruction_ratio <= allowed_ratio
     )
-    clearance_margin = None
-    if clearance is not None:
-        clearance_margin = clearance if threshold is None else (clearance - threshold)
+    obstruction_margin = None
+    if obstruction_ratio is not None:
+        obstruction_margin = float(allowed_ratio - obstruction_ratio)
     return {
         "edge_origin": edge_origin,
-        "visibility_policy": (
-            "budget_only"
-            if threshold is None
-            else "budget_and_min_clearance"
-        ),
+        "visibility_policy": "budget_and_fresnel_40pct",
         "link_budget_db": float(config.link_budget_db),
         "path_loss_margin_db": (
             float(config.link_budget_db - path_loss) if path_loss is not None else None
         ),
-        "min_required_clearance_m": threshold,
-        "clearance_margin_m": clearance_margin,
+        "max_allowed_fresnel_obstruction_ratio": float(allowed_ratio),
+        "fresnel_obstruction_ratio": obstruction_ratio,
+        "fresnel_obstruction_margin_ratio": obstruction_margin,
         "accepted_by_budget": bool(budget_ok),
-        "accepted_by_clearance_policy": bool(clearance_ok),
+        "accepted_by_fresnel_policy": bool(fresnel_ok),
     }
 
 
@@ -116,10 +112,11 @@ class VisibilityGraph:
         visibility_policy: str = None,
         link_budget_db: float = None,
         path_loss_margin_db: float = None,
-        min_required_clearance_m: float = None,
-        clearance_margin_m: float = None,
+        max_allowed_fresnel_obstruction_ratio: float = None,
+        fresnel_obstruction_ratio: float = None,
+        fresnel_obstruction_margin_ratio: float = None,
         accepted_by_budget: bool = None,
-        accepted_by_clearance_policy: bool = None,
+        accepted_by_fresnel_policy: bool = None,
     ):
         """
         Add a visibility edge between two towers.
@@ -141,10 +138,11 @@ class VisibilityGraph:
             visibility_policy=visibility_policy,
             link_budget_db=link_budget_db,
             path_loss_margin_db=path_loss_margin_db,
-            min_required_clearance_m=min_required_clearance_m,
-            clearance_margin_m=clearance_margin_m,
+            max_allowed_fresnel_obstruction_ratio=max_allowed_fresnel_obstruction_ratio,
+            fresnel_obstruction_ratio=fresnel_obstruction_ratio,
+            fresnel_obstruction_margin_ratio=fresnel_obstruction_margin_ratio,
             accepted_by_budget=accepted_by_budget,
-            accepted_by_clearance_policy=accepted_by_clearance_policy,
+            accepted_by_fresnel_policy=accepted_by_fresnel_policy,
         )
 
     def has_edge(self, tower1_id: int, tower2_id: int) -> bool:
@@ -296,48 +294,37 @@ class MeshSurface:
             n * (n - 1) // 2,
         )
 
-        # Compute LOS in parallel for candidate pairs
-        cells = self.cells
-        config = self.config
-        elev = self.elevation_provider
-
-        def _check_pair(idx_pair):
-            i, j = idx_pair
-            t1, t2 = tower_list[i], tower_list[j]
-            result = compute_los(
-                t1.h3_index, t2.h3_index,
-                cells, config, cache,
-                elevation_provider=elev,
-            )
-            if result.is_visible:
-                debug = _los_decision_debug(
-                    result,
-                    config,
-                    edge_origin='global_visibility',
-                )
-                return (t1.tower_id, t2.tower_id,
-                        result.distance_m, result.clearance_m,
-                        result.path_loss_db, debug)
-            return None
-
         edges_added = 0
-        max_workers = os.cpu_count() or 4
-
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(_check_pair, pair)
-                       for pair in candidate_pairs]
-            for future in as_completed(futures):
-                edge = future.result()
-                if edge is not None:
-                    tid1, tid2, dist, clearance, ploss, debug = edge
-                    self.visibility_graph.add_visibility_edge(
-                        tid1, tid2,
-                        distance_m=dist,
-                        clearance_m=clearance,
-                        path_loss_db=ploss,
-                        **debug,
-                    )
-                    edges_added += 1
+        h3_pairs = [
+            (tower_list[i].h3_index, tower_list[j].h3_index)
+            for i, j in candidate_pairs
+        ]
+        los_results = compute_los_batch(
+            h3_pairs,
+            self.cells,
+            self.config,
+            cache,
+            elevation_provider=self.elevation_provider,
+            compute_fn=compute_los,
+        )
+        for i, j in candidate_pairs:
+            t1, t2 = tower_list[i], tower_list[j]
+            result = los_results.get((t1.h3_index, t2.h3_index))
+            if result is None or not result.is_visible:
+                continue
+            debug = _los_decision_debug(
+                result,
+                self.config,
+                edge_origin='global_visibility',
+            )
+            self.visibility_graph.add_visibility_edge(
+                t1.tower_id, t2.tower_id,
+                distance_m=result.distance_m,
+                clearance_m=result.clearance_m,
+                path_loss_db=result.path_loss_db,
+                **debug,
+            )
+            edges_added += 1
 
         logger.info("Visibility edges added: %d", edges_added)
 
@@ -405,21 +392,6 @@ class MeshSurface:
         logger.info("Cell coverage: %d cells, %d towers, %d LOS checks",
                     len(cell_list), len(tower_list), len(los_pairs))
 
-        # Compute LOS in parallel
-        def _check_cell_tower(pair):
-            ci, ti = pair
-            c = cell_list[ci]
-            t = tower_list[ti]
-            result = compute_los(
-                c.h3_index, t.h3_index,
-                cells, config, cache,
-                elevation_provider=elev,
-            )
-            if result.is_visible:
-                return (ci, ti, result.distance_m,
-                        result.clearance_m, result.path_loss_db)
-            return None
-
         # Accumulate per-cell results
         # ci → [visible_count, best_dist, best_clear, best_ploss, best_tower_id]
         cell_results = {}
@@ -429,22 +401,33 @@ class MeshSurface:
             own_id = own_tower.tower_id if own_tower else None
             cell_results[ci] = [1, 0.0, 0.0, 0.0, own_id]
 
-        max_workers = os.cpu_count() or 4
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(_check_cell_tower, p) for p in los_pairs]
-            for future in as_completed(futures):
-                res = future.result()
-                if res is None:
-                    continue
-                ci, ti, dist_m, clear_m, ploss_db = res
+        h3_pair_refs: Dict[tuple[str, str], list[tuple[int, int]]] = {}
+        for ci, ti in los_pairs:
+            c = cell_list[ci]
+            t = tower_list[ti]
+            h3_pair_refs.setdefault((c.h3_index, t.h3_index), []).append((ci, ti))
+
+        los_results = compute_los_batch(
+            list(h3_pair_refs.keys()),
+            cells,
+            config,
+            cache,
+            elevation_provider=elev,
+            compute_fn=compute_los,
+        )
+        for h3_pair, refs in h3_pair_refs.items():
+            result = los_results.get(h3_pair)
+            if result is None or not result.is_visible:
+                continue
+            for ci, ti in refs:
                 if ci not in cell_results:
                     cell_results[ci] = [0, float('inf'), None, None, None]
                 entry = cell_results[ci]
                 entry[0] += 1
-                if dist_m < entry[1]:
-                    entry[1] = dist_m
-                    entry[2] = clear_m
-                    entry[3] = ploss_db
+                if result.distance_m < entry[1]:
+                    entry[1] = result.distance_m
+                    entry[2] = result.clearance_m
+                    entry[3] = result.path_loss_db
                     entry[4] = tower_list[ti].tower_id
 
         # Apply results to cells

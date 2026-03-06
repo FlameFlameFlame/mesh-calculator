@@ -66,19 +66,21 @@ In `compute_los()`:
 2. Compute `clearance` and `path_loss_db`.
 3. Evaluate policy on coarse result:
    - `budget_ok = path_loss_db <= link_budget_db`
-   - `clearance_ok = True` when `min_fresnel_clearance_m is None`
-   - otherwise `clearance_ok = clearance_m >= min_fresnel_clearance_m`
-4. If coarse policy passes and elevation data is available, run dense profile verification and recompute policy on verified values.
+   - `fresnel_ok = max_obstruction_ratio <= 0.4`
+4. If coarse policy passes and elevation data is available, run dense DEM profile verification and recompute policy on verified values.
 5. Final result:
-   - `is_visible = budget_ok and clearance_ok`
+   - `is_visible = budget_ok and fresnel_ok`
 
 Default behavior:
 
-- `min_fresnel_clearance_m = None` (no hard clearance gate).
+- hardcoded practical Fresnel policy: first-Fresnel obstruction must not exceed 40%.
 
-Optional stricter behavior:
+Dense verification behavior:
 
-- Set `min_fresnel_clearance_m` (for example `0.0`) to require non-negative clearance in addition to budget.
+- first dense pass samples the DEM along the straight RF line
+- worst local intervals are then refined at higher density before final acceptance
+- `los_dense_sample_step_m` controls the first dense pass step
+- `los_dense_max_samples` caps the total adaptive sample count
 
 ## 7) How this affects tower placement
 
@@ -92,8 +94,8 @@ Tower placement consumes `compute_los()` everywhere:
 
 Practical effect:
 
-- More permissive policy (`min_fresnel_clearance_m=None`) usually increases feasible links, improves route continuity, and reduces fragmented clusters.
-- Stricter policy (`min_fresnel_clearance_m=0.0` or higher) reduces feasible links and can force fallback layouts with fewer connecting edges.
+- Compared with budget-only acceptance, the 40% Fresnel rule rejects more terrain-obstructed links while still allowing moderate Fresnel intrusion common in practical RF planning.
+- Dense DEM verification reduces false positives from coarse H3-center sampling without paying the cost of ultra-dense sampling on every candidate link.
 
 ## 8) Cache behavior
 
@@ -116,18 +118,16 @@ This prevents stale visibility reuse when radio parameters or clearance policy c
 
 ## 9) Tuning guidance
 
-For better connectivity in difficult terrain:
+For better connectivity or stricter acceptance in difficult terrain, tune:
 
-- Keep `min_fresnel_clearance_m: null` (or omit it), and tune:
-  - `mast_height_m`
-  - `tx_power_mw`
-  - `antenna_gain_dbi`
-  - `receiver_sensitivity_dbm`
+- `mast_height_m`
+- `tx_power_mw`
+- `antenna_gain_dbi`
+- `receiver_sensitivity_dbm`
+- `los_dense_sample_step_m`
+- `los_dense_max_samples`
 
-For stricter geometric LOS compliance:
-
-- Set `min_fresnel_clearance_m` to `0.0` or higher.
-- Expect fewer feasible links and potentially more disconnected routes unless compensated by higher towers or better radio budget.
+`min_fresnel_clearance_m` remains in config for backward-compatible parsing and cache identity, but route-planning LOS now uses the hardcoded 40% Fresnel obstruction rule instead of a fixed clearance threshold.
 
 ## 10) Runtime tower coverage API
 
