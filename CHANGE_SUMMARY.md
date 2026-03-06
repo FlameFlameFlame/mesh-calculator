@@ -51,3 +51,5 @@
 - 2026-03-06: Updated runtime tower-coverage shadow checks to use minimum clearance across sampled line profile instead of single peak-terrain point, aligning coverage blocking with LOS physics.
 - 2026-03-06: Added regression test `TestWorstClearanceNotEqualMaxTerrain` in `test_fresnel_terrain.py`; full suites pass (`mesh_calculator` 128/128, `mesh-generator` 79/79).
 - 2026-03-07: Added edge endpoint terrain fields to `visibility_edges.geojson` (`source_elevation_m`, `target_elevation_m`) so downstream profile rendering can use the same cell-max endpoint elevations as LOS optimization.
+- 2026-03-07: Added explicit edge-decision debug metadata at visibility-edge creation time (`edge_origin`, policy mode, budget/path-loss margin, clearance threshold/margin, acceptance booleans) for both global visibility checks and corridor-chain wiring.
+- 2026-03-07: Exported source/target placement algorithms on edges (`source_algorithm`, `target_algorithm`) to explain why links appear in final graph.
