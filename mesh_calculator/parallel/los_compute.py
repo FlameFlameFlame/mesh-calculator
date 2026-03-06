@@ -58,7 +58,7 @@ def compute_los_batch(
                 pair, result = future.result()
                 results[pair] = result
             except Exception as e:
-                logger.warning("LOS computation failed", error=str(e))
+                logger.warning("LOS computation failed: %s", str(e))
 
     return results
 
@@ -90,7 +90,11 @@ def compute_los_batch_progress(
     if max_workers is None:
         max_workers = os.cpu_count() or 4
 
-    logger.info("Computing LOS batch", pairs=len(pairs), workers=max_workers)
+    logger.info(
+        "Computing LOS batch: pairs=%d workers=%d",
+        len(pairs),
+        max_workers,
+    )
 
     results = {}
     completed = 0
@@ -113,22 +117,31 @@ def compute_los_batch_progress(
 
                 completed += 1
                 if completed % progress_interval == 0:
-                    logger.debug("LOS progress",
-                                 completed=completed, total=len(pairs),
-                                 pct=round(100 * completed / len(pairs), 1))
+                    logger.debug(
+                        "LOS progress: completed=%d total=%d pct=%.1f",
+                        completed,
+                        len(pairs),
+                        round(100 * completed / len(pairs), 1),
+                    )
 
             except Exception as e:
-                logger.warning("LOS computation failed", error=str(e))
+                logger.warning("LOS computation failed: %s", str(e))
                 completed += 1
 
-    logger.info("LOS computation complete",
-                successful=len(results), total=len(pairs))
+    logger.info(
+        "LOS computation complete: successful=%d total=%d",
+        len(results),
+        len(pairs),
+    )
 
     # Log cache stats if available
     if cache is not None:
         stats = cache.stats()
-        logger.debug("LOS cache stats",
-                     hits=stats['hits'], misses=stats['misses'],
-                     hit_rate=f"{stats['hit_rate']:.1%}")
+        logger.debug(
+            "LOS cache stats: hits=%d misses=%d hit_rate=%.1f%%",
+            stats['hits'],
+            stats['misses'],
+            stats['hit_rate'] * 100.0,
+        )
 
     return results
