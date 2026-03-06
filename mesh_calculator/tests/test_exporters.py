@@ -94,8 +94,10 @@ class TestExportVisibilityEdges(unittest.TestCase):
             os.unlink(path)
 
     def test_properties(self):
-        """Edge properties include source_id, target_id, distance_m, clearance_m, path_loss_db, mast_height_m."""
+        """Edge properties include IDs, RF metrics, and endpoint antenna heights."""
         surface = _make_surface_with_edges()
+        surface.cells["8828c00001fffff"].antenna_height_offset_m = 3.0
+        surface.cells["8828c00003fffff"].antenna_height_offset_m = 1.5
         with tempfile.NamedTemporaryFile(suffix=".geojson", delete=False) as f:
             path = f.name
         try:
@@ -109,10 +111,20 @@ class TestExportVisibilityEdges(unittest.TestCase):
             self.assertIn("clearance_m", props)
             self.assertIn("path_loss_db", props)
             self.assertIn("mast_height_m", props)
+            self.assertIn("source_antenna_height_m", props)
+            self.assertIn("target_antenna_height_m", props)
             self.assertAlmostEqual(props["distance_m"], 12000.0)
             self.assertAlmostEqual(props["clearance_m"], 15.5)
             self.assertAlmostEqual(props["path_loss_db"], 120.3)
             self.assertAlmostEqual(props["mast_height_m"], surface.config.mast_height_m)
+            self.assertAlmostEqual(
+                props["source_antenna_height_m"],
+                surface.config.mast_height_m + 3.0,
+            )
+            self.assertAlmostEqual(
+                props["target_antenna_height_m"],
+                surface.config.mast_height_m + 1.5,
+            )
         finally:
             os.unlink(path)
 

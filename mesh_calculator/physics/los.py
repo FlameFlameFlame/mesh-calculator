@@ -13,6 +13,19 @@ from .path_loss import compute_path_loss
 _LOS_VERIFICATION_MODE = "hybrid_accept_verify"
 
 
+def _endpoint_mast_height_m(
+    h3_idx: str,
+    cells: Dict[str, H3Cell],
+    config: MeshConfig,
+) -> float:
+    """Resolve endpoint mast height: global mast + optional cell-specific offset."""
+    cell = cells.get(h3_idx)
+    if cell is None:
+        return config.mast_height_m
+    offset = float(getattr(cell, "antenna_height_offset_m", 0.0) or 0.0)
+    return config.mast_height_m + offset
+
+
 def compute_los(
     h3_src: str,
     h3_dst: str,
@@ -34,10 +47,13 @@ def compute_los(
     Returns:
         LOSResult with clearance, path loss, distance, and visibility
     """
+    src_mast_height_m = _endpoint_mast_height_m(h3_src, cells, config)
+    dst_mast_height_m = _endpoint_mast_height_m(h3_dst, cells, config)
+
     # Same-cell: trivially visible at zero distance, skip path loss calculation
     if h3_src == h3_dst:
         result = LOSResult(
-            clearance_m=config.mast_height_m,
+            clearance_m=min(src_mast_height_m, dst_mast_height_m),
             path_loss_db=0.0,
             distance_m=0.0,
             is_visible=True,
@@ -45,7 +61,7 @@ def compute_los(
         if cache is not None:
             cache.put(
                 h3_src, h3_dst,
-                config.mast_height_m, config.mast_height_m,
+                src_mast_height_m, dst_mast_height_m,
                 config.frequency_hz,
                 result,
                 tx_power_mw=config.tx_power_mw,
@@ -65,7 +81,7 @@ def compute_los(
     if use_cache:
         cached = cache.get(
             h3_src, h3_dst,
-            config.mast_height_m, config.mast_height_m,
+            src_mast_height_m, dst_mast_height_m,
             config.frequency_hz,
             tx_power_mw=config.tx_power_mw,
             antenna_gain_dbi=config.antenna_gain_dbi,
@@ -90,7 +106,7 @@ def compute_los(
         if use_cache:
             cache.put(
                 h3_src, h3_dst,
-                config.mast_height_m, config.mast_height_m,
+                src_mast_height_m, dst_mast_height_m,
                 config.frequency_hz,
                 result,
                 tx_power_mw=config.tx_power_mw,
@@ -107,6 +123,8 @@ def compute_los(
     clearance, distance_m, d1, d2 = compute_fresnel_clearance(
         h3_src, h3_dst, cells, config,
         elevation_provider=elevation_provider,
+        mast_height_src_m=src_mast_height_m,
+        mast_height_dst_m=dst_mast_height_m,
     )
 
     # Compute path loss
@@ -130,6 +148,8 @@ def compute_los(
             elevation_provider=elevation_provider,
             sample_step_m=config.los_dense_sample_step_m,
             max_samples=config.los_dense_max_samples,
+            mast_height_src_m=src_mast_height_m,
+            mast_height_dst_m=dst_mast_height_m,
         )
         dense_path_loss = compute_path_loss(
             dense_distance_m, config.frequency_hz, dense_clearance, dense_d1, dense_d2
@@ -154,7 +174,7 @@ def compute_los(
     if use_cache:
         cache.put(
             h3_src, h3_dst,
-            config.mast_height_m, config.mast_height_m,
+            src_mast_height_m, dst_mast_height_m,
             config.frequency_hz,
             result,
             tx_power_mw=config.tx_power_mw,

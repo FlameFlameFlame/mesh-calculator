@@ -23,6 +23,8 @@ def compute_fresnel_clearance(
     cells: Dict[str, H3Cell],
     config: MeshConfig,
     elevation_provider=None,
+    mast_height_src_m: float | None = None,
+    mast_height_dst_m: float | None = None,
 ) -> Tuple[float, float, float, float]:
     """
     Calculate minimum Fresnel clearance between two H3 cells.
@@ -52,19 +54,22 @@ def compute_fresnel_clearance(
     src_cell = cells[h3_src]
     dst_cell = cells[h3_dst]
 
-    # Source and destination heights (elevation + mast)
-    src_height = src_cell.elevation + config.mast_height_m
-    dst_height = dst_cell.elevation + config.mast_height_m
+    src_mast = config.mast_height_m if mast_height_src_m is None else mast_height_src_m
+    dst_mast = config.mast_height_m if mast_height_dst_m is None else mast_height_dst_m
+
+    # Source and destination heights (elevation + endpoint mast)
+    src_height = src_cell.elevation + src_mast
+    dst_height = dst_cell.elevation + dst_mast
 
     # Same cell - return mast height as clearance
     if h3_src == h3_dst:
-        return (config.mast_height_m, 0.0, 0.0, 0.0)
+        return (min(src_mast, dst_mast), 0.0, 0.0, 0.0)
 
     # Total distance
     total_distance = h3_distance(h3_src, h3_dst)
 
     if total_distance <= 0:
-        return (config.mast_height_m, 0.0, 0.0, 0.0)
+        return (min(src_mast, dst_mast), 0.0, 0.0, 0.0)
 
     # Wavelength for Fresnel zone calculation
     wavelength = config.wavelength_m
@@ -156,6 +161,8 @@ def compute_fresnel_clearance_dense(
     elevation_provider=None,
     sample_step_m: float | None = None,
     max_samples: int | None = None,
+    mast_height_src_m: float | None = None,
+    mast_height_dst_m: float | None = None,
 ) -> Tuple[float, float, float, float]:
     """
     Calculate minimum Fresnel clearance using dense DEM profile sampling.
@@ -169,16 +176,19 @@ def compute_fresnel_clearance_dense(
     src_cell = cells[h3_src]
     dst_cell = cells[h3_dst]
 
-    if h3_src == h3_dst:
-        return (config.mast_height_m, 0.0, 0.0, 0.0)
+    src_mast = config.mast_height_m if mast_height_src_m is None else mast_height_src_m
+    dst_mast = config.mast_height_m if mast_height_dst_m is None else mast_height_dst_m
 
-    src_height = src_cell.elevation + config.mast_height_m
-    dst_height = dst_cell.elevation + config.mast_height_m
+    if h3_src == h3_dst:
+        return (min(src_mast, dst_mast), 0.0, 0.0, 0.0)
+
+    src_height = src_cell.elevation + src_mast
+    dst_height = dst_cell.elevation + dst_mast
     total_distance = great_circle_distance(
         src_cell.lat, src_cell.lon, dst_cell.lat, dst_cell.lon
     )
     if total_distance <= 0:
-        return (config.mast_height_m, 0.0, 0.0, 0.0)
+        return (min(src_mast, dst_mast), 0.0, 0.0, 0.0)
 
     step_m = sample_step_m or config.los_dense_sample_step_m
     cap_samples = max_samples or config.los_dense_max_samples
@@ -192,7 +202,10 @@ def compute_fresnel_clearance_dense(
     if elevation_provider is None:
         # Dense verification needs DEM sampling; fall back to coarse method.
         return compute_fresnel_clearance(
-            h3_src, h3_dst, cells, config, elevation_provider=elevation_provider
+            h3_src, h3_dst, cells, config,
+            elevation_provider=elevation_provider,
+            mast_height_src_m=src_mast,
+            mast_height_dst_m=dst_mast,
         )
 
     elevs = np.array(

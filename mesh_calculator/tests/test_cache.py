@@ -171,6 +171,30 @@ class TestLOSCache(unittest.TestCase):
         self.assertIsNotNone(cached_same)
         self.assertIsNone(cached_diff)
 
+    def test_cache_key_distinguishes_endpoint_mast_heights(self):
+        """Per-endpoint mast heights must be part of cache identity."""
+        result = LOSResult(2.0, 120.0, 5000.0, True)
+        self.cache.put(
+            'h3_a', 'h3_b',
+            28.0, 30.0,
+            868e6,
+            result,
+        )
+
+        cached_same = self.cache.get(
+            'h3_a', 'h3_b',
+            28.0, 30.0,
+            868e6,
+        )
+        cached_diff = self.cache.get(
+            'h3_a', 'h3_b',
+            28.0, 31.0,
+            868e6,
+        )
+
+        self.assertIsNotNone(cached_same)
+        self.assertIsNone(cached_diff)
+
 
 if __name__ == '__main__':
     unittest.main()

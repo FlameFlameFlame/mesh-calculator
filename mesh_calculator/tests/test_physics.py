@@ -171,6 +171,41 @@ class TestLOSVisibilityRule(unittest.TestCase):
         self.assertFalse(result.is_visible)
 
     @patch('mesh_calculator.physics.los.compute_path_loss')
+    @patch('mesh_calculator.physics.los.compute_fresnel_clearance')
+    @patch('mesh_calculator.physics.los.h3_distance')
+    def test_endpoint_height_offset_changes_visibility(
+        self, mock_distance, mock_fresnel, mock_path_loss
+    ):
+        config = MeshConfig(
+            mast_height_m=5.0,
+            min_fresnel_clearance_m=0.0,
+        )
+        mock_distance.return_value = 1000.0
+        mock_path_loss.return_value = config.link_budget_db - 1.0
+
+        def _mock_fresnel(_src, _dst, _cells, _cfg, **kwargs):
+            src_m = kwargs.get('mast_height_src_m', config.mast_height_m)
+            dst_m = kwargs.get('mast_height_dst_m', config.mast_height_m)
+            clearance = src_m + dst_m - 20.0
+            return (clearance, 1000.0, 500.0, 500.0)
+
+        mock_fresnel.side_effect = _mock_fresnel
+
+        cells = {
+            "a": H3Cell("a", 40.0, 44.0, 100.0, has_road=True),
+            "b": H3Cell("b", 40.0, 44.01, 100.0, has_road=True),
+        }
+
+        no_offset = compute_los("a", "b", cells, config)
+        self.assertFalse(no_offset.is_visible)
+        self.assertLess(no_offset.clearance_m, 0.0)
+
+        cells["a"].antenna_height_offset_m = 10.0
+        with_offset = compute_los("a", "b", cells, config)
+        self.assertTrue(with_offset.is_visible)
+        self.assertGreaterEqual(with_offset.clearance_m, 0.0)
+
+    @patch('mesh_calculator.physics.los.compute_path_loss')
     @patch('mesh_calculator.physics.los.compute_fresnel_clearance_dense')
     @patch('mesh_calculator.physics.los.compute_fresnel_clearance')
     @patch('mesh_calculator.physics.los.h3_distance')
