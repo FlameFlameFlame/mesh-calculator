@@ -50,3 +50,4 @@
 - 2026-03-06: Fixed LOS terrain regression where clearance was evaluated at `argmax(terrain)` only; Fresnel now evaluates sampled straight-line profile and uses `argmin(clearance)` (terrain + curvature + Fresnel vs LOS line), preventing false LOS links that visually cut through terrain.
 - 2026-03-06: Updated runtime tower-coverage shadow checks to use minimum clearance across sampled line profile instead of single peak-terrain point, aligning coverage blocking with LOS physics.
 - 2026-03-06: Added regression test `TestWorstClearanceNotEqualMaxTerrain` in `test_fresnel_terrain.py`; full suites pass (`mesh_calculator` 128/128, `mesh-generator` 79/79).
+- 2026-03-07: Added edge endpoint terrain fields to `visibility_edges.geojson` (`source_elevation_m`, `target_elevation_m`) so downstream profile rendering can use the same cell-max endpoint elevations as LOS optimization.
