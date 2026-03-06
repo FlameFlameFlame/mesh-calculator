@@ -60,43 +60,38 @@ def _cell_elevation(elevation_provider, h3_index: str, lat: float, lon: float) -
     return 0.0
 
 
-def _line_peak_fallback(
+def _sample_shadow_profile(
     source_cell: H3Cell,
     target_cell: H3Cell,
+    distance_m: float,
     config: MeshConfig,
     elevation_provider=None,
-) -> tuple[float, float]:
-    """Fallback peak elevation using sampled provider elevations along the line."""
-    peak_elev = max(source_cell.elevation, target_cell.elevation)
-    frac = 0.0 if source_cell.elevation >= target_cell.elevation else 1.0
+) -> list[tuple[float, float]]:
+    """Sample terrain elevations along source->target for shadow-casting check."""
+    samples: list[tuple[float, float]] = [
+        (0.0, float(source_cell.elevation)),
+        (1.0, float(target_cell.elevation)),
+    ]
     if elevation_provider is None:
-        return peak_elev, frac
+        return samples
     get_elevation = getattr(elevation_provider, "get_elevation", None)
-    if not callable(get_elevation):
-        return peak_elev, frac
-
-    distance_m = great_circle_distance(
-        source_cell.lat, source_cell.lon, target_cell.lat, target_cell.lon
-    )
-    if distance_m <= 0.0:
-        return peak_elev, 0.0
+    if not callable(get_elevation) or distance_m <= 0.0:
+        return samples
 
     step_m = max(float(config.los_dense_sample_step_m), 1.0)
     max_samples = max(int(config.los_dense_max_samples), 2)
     n_samples = max(2, int(distance_m / step_m))
     n_samples = min(n_samples, max_samples)
-    for i in range(n_samples + 1):
-        sample_frac = i / n_samples
-        sample_lat = source_cell.lat + (target_cell.lat - source_cell.lat) * sample_frac
-        sample_lon = source_cell.lon + (target_cell.lon - source_cell.lon) * sample_frac
+    for i in range(1, n_samples):
+        frac = i / n_samples
+        lat = source_cell.lat + (target_cell.lat - source_cell.lat) * frac
+        lon = source_cell.lon + (target_cell.lon - source_cell.lon) * frac
         try:
-            sample_elev = float(get_elevation(sample_lat, sample_lon))
+            elev = float(get_elevation(lat, lon))
         except Exception:
             continue
-        if sample_elev > peak_elev:
-            peak_elev = sample_elev
-            frac = sample_frac
-    return peak_elev, frac
+        samples.append((frac, elev))
+    return samples
 
 
 def _to_xyz(lats: np.ndarray, lons: np.ndarray) -> np.ndarray:
@@ -165,21 +160,22 @@ def _compute_shadow_link(
     src_height_asl = source_cell.elevation + config.mast_height_m
     dst_height_asl = target_cell.elevation + config.coverage_receiver_height_m
 
-    if _provider_supports(elevation_provider, "get_line_peak_elevation"):
-        try:
-            peak_elev, _peak_lat, _peak_lon, frac = elevation_provider.get_line_peak_elevation(
-                source_cell.lat, source_cell.lon, target_cell.lat, target_cell.lon
-            )
-        except Exception:
-            peak_elev, frac = _line_peak_fallback(source_cell, target_cell, config, elevation_provider)
-    else:
-        peak_elev, frac = _line_peak_fallback(source_cell, target_cell, config, elevation_provider)
-
-    d1 = distance_m * frac
-    d2 = distance_m - d1
-    line_alt = src_height_asl + (dst_height_asl - src_height_asl) * frac
-    earth_curv = (d1 * d2) / (2.0 * config.effective_earth_radius_m)
-    worst_clearance = float(line_alt - (peak_elev + earth_curv))
+    profile = _sample_shadow_profile(
+        source_cell=source_cell,
+        target_cell=target_cell,
+        distance_m=distance_m,
+        config=config,
+        elevation_provider=elevation_provider,
+    )
+    worst_clearance = float("inf")
+    for frac, terrain_elev in profile:
+        d1 = distance_m * frac
+        d2 = distance_m - d1
+        line_alt = src_height_asl + (dst_height_asl - src_height_asl) * frac
+        earth_curv = (d1 * d2) / (2.0 * config.effective_earth_radius_m)
+        clearance = float(line_alt - (terrain_elev + earth_curv))
+        if clearance < worst_clearance:
+            worst_clearance = clearance
 
     if worst_clearance < 0.0:
         return distance_m, worst_clearance, float("inf"), False

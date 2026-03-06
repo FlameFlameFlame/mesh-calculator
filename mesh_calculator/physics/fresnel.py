@@ -16,13 +16,6 @@ from ..core.geometry import h3_distance, great_circle_distance
 logger = structlog.get_logger(__name__)
 
 
-def _provider_supports(provider, method_name: str) -> bool:
-    """Return True only when method is explicitly implemented on provider type."""
-    if provider is None:
-        return False
-    return callable(getattr(type(provider), method_name, None))
-
-
 def _fraction_along_line(
     src_lat: float,
     src_lon: float,
@@ -41,6 +34,128 @@ def _fraction_along_line(
         return 0.0
     frac = (((lon - src_lon) * cos_lat * dx) + ((lat - src_lat) * dy)) / denom
     return max(0.0, min(1.0, frac))
+
+
+def _coarse_profile_samples(
+    h3_src: str,
+    h3_dst: str,
+    src_cell: H3Cell,
+    dst_cell: H3Cell,
+    cells: Dict[str, H3Cell],
+    elevation_provider=None,
+) -> list[tuple[float, float]]:
+    """
+    Build coarse terrain samples along the RF line.
+
+    Endpoints come from already-built cell elevations; intermediate points use
+    H3 grid-path centers and provider elevation if available.
+    """
+    samples: list[tuple[float, float]] = [
+        (0.0, float(src_cell.elevation)),
+        (1.0, float(dst_cell.elevation)),
+    ]
+
+    try:
+        path_cells = list(h3.grid_path_cells(h3_src, h3_dst))
+    except Exception:
+        path_cells = [h3_src, h3_dst]
+
+    get_elevation = getattr(elevation_provider, "get_elevation", None)
+    use_provider = callable(get_elevation)
+
+    for cell_h3 in path_cells[1:-1]:
+        c = cells.get(cell_h3)
+        if c is not None:
+            frac = _fraction_along_line(
+                src_cell.lat, src_cell.lon, dst_cell.lat, dst_cell.lon, c.lat, c.lon
+            )
+            samples.append((frac, float(c.elevation)))
+            continue
+        if not use_provider:
+            continue
+        try:
+            lat, lon = h3.cell_to_latlng(cell_h3)
+            elev = float(get_elevation(lat, lon))
+        except Exception:
+            continue
+        frac = _fraction_along_line(
+            src_cell.lat, src_cell.lon, dst_cell.lat, dst_cell.lon, lat, lon
+        )
+        samples.append((frac, elev))
+
+    # Merge near-identical fractions conservatively by keeping higher terrain.
+    merged: dict[float, float] = {}
+    for frac, elev in samples:
+        key = round(float(frac), 6)
+        prev = merged.get(key)
+        if prev is None or elev > prev:
+            merged[key] = float(elev)
+    return sorted(merged.items(), key=lambda x: x[0])
+
+
+def _dense_profile_samples(
+    src_cell: H3Cell,
+    dst_cell: H3Cell,
+    total_distance_m: float,
+    elevation_provider,
+    sample_step_m: float,
+    max_samples: int,
+) -> list[tuple[float, float]]:
+    """Build dense terrain samples over straight RF line using DEM interpolation."""
+    get_elevation = getattr(elevation_provider, "get_elevation", None)
+    if not callable(get_elevation) or total_distance_m <= 0.0:
+        return [
+            (0.0, float(src_cell.elevation)),
+            (1.0, float(dst_cell.elevation)),
+        ]
+
+    n_samples = max(2, int(total_distance_m / max(sample_step_m, 1.0)))
+    n_samples = min(n_samples, max(max_samples, 2))
+
+    samples: list[tuple[float, float]] = [
+        (0.0, float(src_cell.elevation)),
+        (1.0, float(dst_cell.elevation)),
+    ]
+    for i in range(1, n_samples):
+        frac = i / n_samples
+        lat = src_cell.lat + (dst_cell.lat - src_cell.lat) * frac
+        lon = src_cell.lon + (dst_cell.lon - src_cell.lon) * frac
+        try:
+            elev = float(get_elevation(lat, lon))
+        except Exception:
+            continue
+        samples.append((frac, elev))
+    return samples
+
+
+def _min_clearance_over_samples(
+    samples: list[tuple[float, float]],
+    src_height_asl: float,
+    dst_height_asl: float,
+    total_distance_m: float,
+    wavelength_m: float,
+    effective_radius_m: float,
+) -> tuple[float, float, float]:
+    """Evaluate clearance at each sample and return minimum clearance and distances."""
+    min_clearance = float("inf")
+    best_d1 = 0.0
+    best_d2 = total_distance_m
+
+    for frac, terrain_elev in samples:
+        d1 = total_distance_m * frac
+        d2 = total_distance_m - d1
+        line_alt = src_height_asl + (dst_height_asl - src_height_asl) * frac
+        earth_curv = (d1 * d2) / (2 * effective_radius_m)
+        fresnel_r = 0.0
+        if d1 > 0.0 and d2 > 0.0:
+            fresnel_r = math.sqrt(max(wavelength_m * d1 * d2 / total_distance_m, 0.0))
+        clearance = line_alt - (terrain_elev + earth_curv + fresnel_r)
+        if clearance < min_clearance:
+            min_clearance = float(clearance)
+            best_d1 = float(d1)
+            best_d2 = float(d2)
+
+    return float(min_clearance), float(best_d1), float(best_d2)
 
 
 def compute_fresnel_clearance(
@@ -99,78 +214,23 @@ def compute_fresnel_clearance(
     if total_distance <= 0:
         return (min(src_mast, dst_mast), 0.0, 0.0, 0.0)
 
-    # Wavelength for Fresnel zone calculation
-    wavelength = config.wavelength_m
-
-    # Effective earth radius (accounts for radio refraction)
-    effective_radius = config.effective_earth_radius_m
-
-    peak_elev = max(src_cell.elevation, dst_cell.elevation)
-    peak_lat = src_cell.lat if src_cell.elevation >= dst_cell.elevation else dst_cell.lat
-    peak_lon = src_cell.lon if src_cell.elevation >= dst_cell.elevation else dst_cell.lon
-    frac = _fraction_along_line(
-        src_cell.lat, src_cell.lon, dst_cell.lat, dst_cell.lon, peak_lat, peak_lon
+    samples = _coarse_profile_samples(
+        h3_src=h3_src,
+        h3_dst=h3_dst,
+        src_cell=src_cell,
+        dst_cell=dst_cell,
+        cells=cells,
+        elevation_provider=elevation_provider,
     )
-
-    used_provider_peak = False
-    if _provider_supports(elevation_provider, "get_line_peak_elevation"):
-        try:
-            peak_elev, peak_lat, peak_lon, frac = elevation_provider.get_line_peak_elevation(
-                src_cell.lat, src_cell.lon, dst_cell.lat, dst_cell.lon
-            )
-            used_provider_peak = True
-        except Exception as e:
-            logger.warning("Failed to get line peak elevation", error=str(e))
-
-    if (not used_provider_peak) and elevation_provider is not None and callable(
-        getattr(elevation_provider, "get_elevation", None)
-    ):
-        # Conservative fallback: sample DEM along line and take maximum.
-        step_m = max(float(config.los_dense_sample_step_m), 1.0)
-        max_samples = max(int(config.los_dense_max_samples), 2)
-        n_samples = max(2, int(total_distance / step_m))
-        n_samples = min(n_samples, max_samples)
-        # Endpoints already come from cell elevations; sample interior points only.
-        for i in range(1, n_samples):
-            sample_frac = i / n_samples
-            sample_lat = src_cell.lat + (dst_cell.lat - src_cell.lat) * sample_frac
-            sample_lon = src_cell.lon + (dst_cell.lon - src_cell.lon) * sample_frac
-            try:
-                sample_elev = float(elevation_provider.get_elevation(sample_lat, sample_lon))
-            except Exception:
-                continue
-            if sample_elev > peak_elev:
-                peak_elev = sample_elev
-                peak_lat = sample_lat
-                peak_lon = sample_lon
-                frac = sample_frac
-    elif not used_provider_peak:
-        # Final fallback to max over H3 grid-path sample points when DEM profile API is unavailable.
-        try:
-            path_cells = list(h3.grid_path_cells(h3_src, h3_dst))
-        except Exception:
-            path_cells = [h3_src, h3_dst]
-        for cell_h3 in path_cells:
-            c = cells.get(cell_h3)
-            if c is None:
-                continue
-            if c.elevation > peak_elev:
-                peak_elev = c.elevation
-                peak_lat = c.lat
-                peak_lon = c.lon
-                frac = _fraction_along_line(
-                    src_cell.lat, src_cell.lon, dst_cell.lat, dst_cell.lon, peak_lat, peak_lon
-                )
-
-    d1 = total_distance * frac
-    d2 = total_distance - d1
-    line_alt = src_height + (dst_height - src_height) * frac
-    earth_curv = (d1 * d2) / (2 * effective_radius)
-    fresnel_r = 0.0
-    if d1 > 0 and d2 > 0:
-        fresnel_r = math.sqrt(max(wavelength * d1 * d2 / total_distance, 0.0))
-    clearance = line_alt - (peak_elev + earth_curv + fresnel_r)
-    return (float(clearance), float(total_distance), float(d1), float(d2))
+    clearance, d1, d2 = _min_clearance_over_samples(
+        samples=samples,
+        src_height_asl=src_height,
+        dst_height_asl=dst_height,
+        total_distance_m=total_distance,
+        wavelength_m=config.wavelength_m,
+        effective_radius_m=config.effective_earth_radius_m,
+    )
+    return (clearance, float(total_distance), d1, d2)
 
 
 def compute_fresnel_clearance_dense(
@@ -190,16 +250,47 @@ def compute_fresnel_clearance_dense(
     Samples equidistant points along the straight RF line between endpoint
     coordinates instead of H3 cell centers on grid_path.
     """
-    # Peak-point conservative model keeps coarse/dense semantics identical.
-    return compute_fresnel_clearance(
-        h3_src=h3_src,
-        h3_dst=h3_dst,
-        cells=cells,
-        config=config,
-        elevation_provider=elevation_provider,
-        mast_height_src_m=mast_height_src_m,
-        mast_height_dst_m=mast_height_dst_m,
+    if h3_src not in cells or h3_dst not in cells:
+        raise ValueError(f"Cells not found: {h3_src}, {h3_dst}")
+
+    src_cell = cells[h3_src]
+    dst_cell = cells[h3_dst]
+
+    src_mast = config.mast_height_m if mast_height_src_m is None else mast_height_src_m
+    dst_mast = config.mast_height_m if mast_height_dst_m is None else mast_height_dst_m
+
+    if h3_src == h3_dst:
+        return (min(src_mast, dst_mast), 0.0, 0.0, 0.0)
+
+    src_height = src_cell.elevation + src_mast
+    dst_height = dst_cell.elevation + dst_mast
+    total_distance = great_circle_distance(
+        src_cell.lat, src_cell.lon, dst_cell.lat, dst_cell.lon
     )
+    if total_distance <= 0:
+        return (min(src_mast, dst_mast), 0.0, 0.0, 0.0)
+
+    dense_samples = _dense_profile_samples(
+        src_cell=src_cell,
+        dst_cell=dst_cell,
+        total_distance_m=total_distance,
+        elevation_provider=elevation_provider,
+        sample_step_m=(
+            config.los_dense_sample_step_m if sample_step_m is None else sample_step_m
+        ),
+        max_samples=(
+            config.los_dense_max_samples if max_samples is None else max_samples
+        ),
+    )
+    clearance, d1, d2 = _min_clearance_over_samples(
+        samples=dense_samples,
+        src_height_asl=src_height,
+        dst_height_asl=dst_height,
+        total_distance_m=total_distance,
+        wavelength_m=config.wavelength_m,
+        effective_radius_m=config.effective_earth_radius_m,
+    )
+    return (clearance, float(total_distance), d1, d2)
 
 
 def has_line_of_sight(

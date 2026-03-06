@@ -47,3 +47,6 @@
 - 2026-03-06: Updated DP endpoint-fallback handling to prune unreachable `algorithm=endpoint_fallback` artifacts while preserving true endpoints/anchors, eliminating duplicate near-endpoint leftovers.
 - 2026-03-06: Updated standalone tower coverage to return all radius cells (covered + uncovered), keep strict terrain-shadow acceptance, and expose nearest-source debug attribution for uncovered cells.
 - 2026-03-06: Updated LOS/coverage regression tests for new conservative terrain + all-cells radius semantics; full `mesh_calculator` suite now passes (127 passed).
+- 2026-03-06: Fixed LOS terrain regression where clearance was evaluated at `argmax(terrain)` only; Fresnel now evaluates sampled straight-line profile and uses `argmin(clearance)` (terrain + curvature + Fresnel vs LOS line), preventing false LOS links that visually cut through terrain.
+- 2026-03-06: Updated runtime tower-coverage shadow checks to use minimum clearance across sampled line profile instead of single peak-terrain point, aligning coverage blocking with LOS physics.
+- 2026-03-06: Added regression test `TestWorstClearanceNotEqualMaxTerrain` in `test_fresnel_terrain.py`; full suites pass (`mesh_calculator` 128/128, `mesh-generator` 79/79).
