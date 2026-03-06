@@ -23,15 +23,14 @@ In this project, Fresnel clearance affects link quality through diffraction loss
 For a pair of H3 cells:
 
 1. Cell elevations are conservative: each H3 cell stores the **maximum DEM elevation** inside the cell polygon (not centroid sample).
-2. For LOS/Fresnel, terrain along the RF line is conservative too:
-   - use the **maximum elevation point on the source→destination line**,
-   - evaluate clearance at that peak position (`d1`, `d2` from source/destination).
-3. At peak location, compute:
+2. For LOS/Fresnel, terrain along the RF line is sampled along the straight path.
+3. At each sample, compute:
    - line altitude between endpoints (endpoint elevation + antenna height),
    - earth curvature term,
    - first Fresnel radius.
-4. Clearance:
-   - `clearance = line_altitude - (line_peak_terrain + earth_curvature + fresnel_radius)`
+4. Clearance at sample:
+   - `clearance = line_altitude - (terrain + earth_curvature + fresnel_radius)`
+5. Final link clearance is the **minimum clearance across all samples** (`argmin clearance`), not the point of maximum terrain height.
 
 Interpretation:
 
@@ -141,7 +140,8 @@ Tower radial coverage is now an explicit runtime calculation, not an automatic r
   - hard geometric LOS (`clearance >= 0`) from tower top to coverage receiver height
   - no diffraction-based pass-through for blocked cells
   - FSPL-only budget check after LOS passes
-- Terrain blocking is evaluated conservatively at line-peak elevation (max terrain on the RF line).
+- Terrain blocking uses sampled straight-line terrain and takes the minimum
+  shadow clearance along the path.
 - Coverage receiver endpoint height is controlled by `coverage_receiver_height_m` (default `1.5 m`), while source endpoint uses `mast_height_m`.
 - Output includes **all cells in radius** (covered and uncovered), including source H3 cell with:
   - `distance_m = 0.0`

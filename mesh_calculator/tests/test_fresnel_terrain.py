@@ -9,6 +9,7 @@ The fix: accept an optional elevation_provider parameter. When a path cell
 is not in the grid, query elevation from the provider instead of skipping it.
 """
 import unittest
+import math
 from unittest.mock import Mock
 import h3
 
@@ -323,6 +324,65 @@ class TestFracsCosineCorrectionAccuracy(unittest.TestCase):
             self.src_h3, self.dst_h3, self.cells, self.config,
         )
         self.assertTrue(_math.isfinite(clearance), "Clearance must be finite")
+
+
+class TestWorstClearanceNotEqualMaxTerrain(unittest.TestCase):
+    """Regression: worst obstruction is argmin(clearance), not argmax(terrain)."""
+
+    class _SlopedTerrainWithRidge:
+        def __init__(self, src_lon: float, dst_lon: float):
+            self.src_lon = src_lon
+            self.dst_lon = dst_lon
+
+        def _frac(self, lon: float) -> float:
+            denom = (self.dst_lon - self.src_lon)
+            if abs(denom) < 1e-12:
+                return 0.0
+            return max(0.0, min(1.0, (lon - self.src_lon) / denom))
+
+        def get_elevation(self, lat: float, lon: float) -> float:
+            frac = self._frac(lon)
+            # Monotonic rise to destination (destination is global max terrain).
+            base = 120.0 + 650.0 * frac
+            # Mid/late ridge that is lower than destination but blocks Fresnel.
+            ridge = 120.0 * math.exp(-((frac - 0.75) / 0.04) ** 2)
+            return base + ridge
+
+    def test_midpath_ridge_can_block_even_if_max_terrain_is_at_endpoint(self):
+        config = MeshConfig(mast_height_m=12.0, h3_resolution=8)
+        src_h3 = h3.latlng_to_cell(40.0, 44.0, 8)
+        dst_h3 = h3.latlng_to_cell(40.0, 44.35, 8)
+        src_lat, src_lon = h3.cell_to_latlng(src_h3)
+        dst_lat, dst_lon = h3.cell_to_latlng(dst_h3)
+
+        terrain = self._SlopedTerrainWithRidge(src_lon, dst_lon)
+        src_elev = terrain.get_elevation(src_lat, src_lon)
+        dst_elev = terrain.get_elevation(dst_lat, dst_lon)
+
+        cells = {
+            src_h3: H3Cell(
+                h3_index=src_h3, lat=src_lat, lon=src_lon,
+                elevation=src_elev, has_road=True,
+            ),
+            dst_h3: H3Cell(
+                h3_index=dst_h3, lat=dst_lat, lon=dst_lon,
+                elevation=dst_elev, has_road=True,
+            ),
+        }
+
+        clearance, total_dist, d1, d2 = compute_fresnel_clearance(
+            src_h3, dst_h3, cells, config, elevation_provider=terrain
+        )
+
+        self.assertLess(
+            clearance, 0.0,
+            "Midpath ridge must block link even when destination has highest terrain.",
+        )
+        self.assertLess(
+            d1 / total_dist, 0.98,
+            "Worst-clearance point should not collapse to endpoint-only max-terrain check.",
+        )
+        self.assertAlmostEqual(d1 + d2, total_dist, delta=1e-6)
 
 
 if __name__ == '__main__':
