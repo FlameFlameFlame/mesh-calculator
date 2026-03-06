@@ -56,3 +56,4 @@
 - 2026-03-07: Expanded search-debug capture in corridor placement with `search_scope` and `step_idx`, including full DP initial/fallback buffer candidate sets, selected injected cells, gap-repair subcorridor scope, and greedy per-step candidate scopes.
 - 2026-03-07: Extended `gap_repair_hexes.geojson` export schema additively with `search_scope` and `step_idx` while preserving legacy fields.
 - 2026-03-07: Added `h3_resolution` and `effective_h3_resolution` metadata to `grid_cells.geojson` and `grid_cells_full.geojson` exports, and passed run effective resolution from route pipeline exports.
+- 2026-03-07: Updated planning defaults in `MeshConfig` to `mast_height_m=5.0` and `road_buffer_m=100.0`, and aligned default-value regression tests accordingly.
