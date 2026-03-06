@@ -327,10 +327,15 @@ def export_visibility_edges_geojson(surface: MeshSurface, output_path: str):
                 'visibility_policy': data.get('visibility_policy'),
                 'link_budget_db': data.get('link_budget_db'),
                 'path_loss_margin_db': data.get('path_loss_margin_db'),
-                'min_required_clearance_m': data.get('min_required_clearance_m'),
-                'clearance_margin_m': data.get('clearance_margin_m'),
+                'max_allowed_fresnel_obstruction_ratio': data.get(
+                    'max_allowed_fresnel_obstruction_ratio'
+                ),
+                'fresnel_obstruction_ratio': data.get('fresnel_obstruction_ratio'),
+                'fresnel_obstruction_margin_ratio': data.get(
+                    'fresnel_obstruction_margin_ratio'
+                ),
                 'accepted_by_budget': data.get('accepted_by_budget'),
-                'accepted_by_clearance_policy': data.get('accepted_by_clearance_policy'),
+                'accepted_by_fresnel_policy': data.get('accepted_by_fresnel_policy'),
                 'source_algorithm': (t1.placement_meta or {}).get(
                     'algorithm',
                     'site' if t1.source == 'site' else None,

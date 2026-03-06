@@ -6,6 +6,7 @@ import math
 from unittest.mock import patch
 from ..physics.path_loss import compute_path_loss, fspl_only
 from ..physics.los import compute_los
+from ..physics.fresnel import FresnelProfileSummary
 from ..core.config import MeshConfig
 from ..core.grid import H3Cell
 
@@ -96,13 +97,13 @@ class TestFresnelClearance(unittest.TestCase):
 
 
 class TestLOSVisibilityRule(unittest.TestCase):
-    """Visibility should follow link budget, not only positive clearance."""
+    """Visibility follows link budget plus the 40% Fresnel obstruction rule."""
 
     @patch('mesh_calculator.physics.los.compute_path_loss')
-    @patch('mesh_calculator.physics.los.compute_fresnel_clearance')
+    @patch('mesh_calculator.physics.los.compute_fresnel_profile_summary')
     @patch('mesh_calculator.physics.los.h3_distance')
-    def test_negative_clearance_can_still_be_visible_if_budget_allows(
-        self, mock_distance, mock_fresnel, mock_path_loss
+    def test_negative_clearance_can_still_be_visible_if_obstruction_within_40pct(
+        self, mock_distance, mock_summary, mock_path_loss
     ):
         config = MeshConfig(
             frequency_hz=868e6,
@@ -110,10 +111,16 @@ class TestLOSVisibilityRule(unittest.TestCase):
             tx_power_mw=500.0,
             antenna_gain_dbi=2.0,
             receiver_sensitivity_dbm=-137.0,
-            min_fresnel_clearance_m=None,
         )
         mock_distance.return_value = 1000.0
-        mock_fresnel.return_value = (-10.0, 1000.0, 500.0, 500.0)
+        mock_summary.return_value = FresnelProfileSummary(
+            clearance_m=-10.0,
+            distance_m=1000.0,
+            d1_m=500.0,
+            d2_m=500.0,
+            max_obstruction_ratio=0.25,
+            worst_obstruction_frac=0.5,
+        )
         mock_path_loss.return_value = config.link_budget_db - 5.0
         cells = {
             "a": H3Cell("a", 40.0, 44.0, 100.0, has_road=True),
@@ -124,12 +131,13 @@ class TestLOSVisibilityRule(unittest.TestCase):
 
         self.assertTrue(result.is_visible)
         self.assertLess(result.clearance_m, 0.0)
+        self.assertAlmostEqual(result.fresnel_obstruction_ratio, 0.25)
 
     @patch('mesh_calculator.physics.los.compute_path_loss')
-    @patch('mesh_calculator.physics.los.compute_fresnel_clearance')
+    @patch('mesh_calculator.physics.los.compute_fresnel_profile_summary')
     @patch('mesh_calculator.physics.los.h3_distance')
-    def test_negative_clearance_blocked_when_threshold_is_zero(
-        self, mock_distance, mock_fresnel, mock_path_loss
+    def test_link_blocked_when_obstruction_exceeds_40pct(
+        self, mock_distance, mock_summary, mock_path_loss
     ):
         config = MeshConfig(
             frequency_hz=868e6,
@@ -137,10 +145,16 @@ class TestLOSVisibilityRule(unittest.TestCase):
             tx_power_mw=500.0,
             antenna_gain_dbi=2.0,
             receiver_sensitivity_dbm=-137.0,
-            min_fresnel_clearance_m=0.0,
         )
         mock_distance.return_value = 1000.0
-        mock_fresnel.return_value = (-0.5, 1000.0, 500.0, 500.0)
+        mock_summary.return_value = FresnelProfileSummary(
+            clearance_m=1.0,
+            distance_m=1000.0,
+            d1_m=500.0,
+            d2_m=500.0,
+            max_obstruction_ratio=0.41,
+            worst_obstruction_frac=0.5,
+        )
         mock_path_loss.return_value = config.link_budget_db - 5.0
         cells = {
             "a": H3Cell("a", 40.0, 44.0, 100.0, has_road=True),
@@ -152,14 +166,21 @@ class TestLOSVisibilityRule(unittest.TestCase):
         self.assertFalse(result.is_visible)
 
     @patch('mesh_calculator.physics.los.compute_path_loss')
-    @patch('mesh_calculator.physics.los.compute_fresnel_clearance')
+    @patch('mesh_calculator.physics.los.compute_fresnel_profile_summary')
     @patch('mesh_calculator.physics.los.h3_distance')
     def test_link_budget_exceeded_is_not_visible_even_if_clearance_positive(
-        self, mock_distance, mock_fresnel, mock_path_loss
+        self, mock_distance, mock_summary, mock_path_loss
     ):
         config = MeshConfig()
         mock_distance.return_value = 1000.0
-        mock_fresnel.return_value = (10.0, 1000.0, 500.0, 500.0)
+        mock_summary.return_value = FresnelProfileSummary(
+            clearance_m=10.0,
+            distance_m=1000.0,
+            d1_m=500.0,
+            d2_m=500.0,
+            max_obstruction_ratio=0.0,
+            worst_obstruction_frac=0.5,
+        )
         mock_path_loss.return_value = config.link_budget_db + 1.0
         cells = {
             "a": H3Cell("a", 40.0, 44.0, 100.0, has_road=True),
@@ -171,25 +192,30 @@ class TestLOSVisibilityRule(unittest.TestCase):
         self.assertFalse(result.is_visible)
 
     @patch('mesh_calculator.physics.los.compute_path_loss')
-    @patch('mesh_calculator.physics.los.compute_fresnel_clearance')
+    @patch('mesh_calculator.physics.los.compute_fresnel_profile_summary')
     @patch('mesh_calculator.physics.los.h3_distance')
     def test_endpoint_height_offset_changes_visibility(
-        self, mock_distance, mock_fresnel, mock_path_loss
+        self, mock_distance, mock_summary, mock_path_loss
     ):
-        config = MeshConfig(
-            mast_height_m=5.0,
-            min_fresnel_clearance_m=0.0,
-        )
+        config = MeshConfig(mast_height_m=5.0)
         mock_distance.return_value = 1000.0
         mock_path_loss.return_value = config.link_budget_db - 1.0
 
-        def _mock_fresnel(_src, _dst, _cells, _cfg, **kwargs):
+        def _mock_summary(_src, _dst, _cells, _cfg, **kwargs):
             src_m = kwargs.get('mast_height_src_m', config.mast_height_m)
             dst_m = kwargs.get('mast_height_dst_m', config.mast_height_m)
             clearance = src_m + dst_m - 20.0
-            return (clearance, 1000.0, 500.0, 500.0)
+            obstruction = 0.0 if clearance >= 0.0 else 0.5
+            return FresnelProfileSummary(
+                clearance_m=clearance,
+                distance_m=1000.0,
+                d1_m=500.0,
+                d2_m=500.0,
+                max_obstruction_ratio=obstruction,
+                worst_obstruction_frac=0.5,
+            )
 
-        mock_fresnel.side_effect = _mock_fresnel
+        mock_summary.side_effect = _mock_summary
 
         cells = {
             "a": H3Cell("a", 40.0, 44.0, 100.0, has_road=True),
@@ -206,16 +232,16 @@ class TestLOSVisibilityRule(unittest.TestCase):
         self.assertGreaterEqual(with_offset.clearance_m, 0.0)
 
     @patch('mesh_calculator.physics.los.compute_path_loss')
-    @patch('mesh_calculator.physics.los.compute_fresnel_clearance_dense')
-    @patch('mesh_calculator.physics.los.compute_fresnel_clearance')
+    @patch('mesh_calculator.physics.los.compute_fresnel_profile_summary_dense')
+    @patch('mesh_calculator.physics.los.compute_fresnel_profile_summary')
     @patch('mesh_calculator.physics.los.h3_distance')
     def test_dense_verification_can_reject_coarse_accept(
-        self, mock_distance, mock_fresnel, mock_fresnel_dense, mock_path_loss
+        self, mock_distance, mock_summary, mock_summary_dense, mock_path_loss
     ):
-        config = MeshConfig(min_fresnel_clearance_m=0.0)
+        config = MeshConfig()
         mock_distance.return_value = 1000.0
-        mock_fresnel.return_value = (5.0, 1000.0, 500.0, 500.0)
-        mock_fresnel_dense.return_value = (-2.0, 1000.0, 500.0, 500.0)
+        mock_summary.return_value = FresnelProfileSummary(5.0, 1000.0, 500.0, 500.0, 0.1, 0.5)
+        mock_summary_dense.return_value = FresnelProfileSummary(-2.0, 1000.0, 500.0, 500.0, 0.6, 0.5)
         mock_path_loss.return_value = config.link_budget_db - 1.0
         cells = {
             "a": H3Cell("a", 40.0, 44.0, 100.0, has_road=True),
@@ -224,9 +250,29 @@ class TestLOSVisibilityRule(unittest.TestCase):
 
         result = compute_los("a", "b", cells, config, elevation_provider=object())
 
-        self.assertTrue(mock_fresnel_dense.called)
+        self.assertTrue(mock_summary_dense.called)
         self.assertFalse(result.is_visible)
         self.assertLess(result.clearance_m, 0.0)
+
+    @patch('mesh_calculator.physics.los.compute_path_loss')
+    @patch('mesh_calculator.physics.los.compute_fresnel_profile_summary')
+    @patch('mesh_calculator.physics.los.h3_distance')
+    def test_exactly_40pct_obstruction_is_accepted(
+        self, mock_distance, mock_summary, mock_path_loss
+    ):
+        config = MeshConfig()
+        mock_distance.return_value = 1000.0
+        mock_summary.return_value = FresnelProfileSummary(0.5, 1000.0, 500.0, 500.0, 0.4, 0.5)
+        mock_path_loss.return_value = config.link_budget_db - 1.0
+        cells = {
+            "a": H3Cell("a", 40.0, 44.0, 100.0, has_road=True),
+            "b": H3Cell("b", 40.0, 44.01, 100.0, has_road=True),
+        }
+
+        result = compute_los("a", "b", cells, config)
+
+        self.assertTrue(result.is_visible)
+        self.assertAlmostEqual(result.fresnel_obstruction_ratio, 0.4)
 
 
 if __name__ == '__main__':

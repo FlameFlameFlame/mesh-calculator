@@ -7,7 +7,12 @@ from ..core.grid import H3Cell
 from ..core.config import MeshConfig
 from ..core.geometry import h3_distance
 from ..data.cache import LOSCache, LOSResult
-from .fresnel import compute_fresnel_clearance, compute_fresnel_clearance_dense
+from .fresnel import (
+    compute_fresnel_profile_summary,
+    compute_fresnel_profile_summary_dense,
+    fresnel_obstruction_ratio_accepts,
+    max_allowed_fresnel_obstruction_ratio,
+)
 from .path_loss import compute_path_loss
 
 _LOS_VERIFICATION_MODE = "hybrid_accept_verify"
@@ -49,6 +54,7 @@ def compute_los(
     """
     src_mast_height_m = _endpoint_mast_height_m(h3_src, cells, config)
     dst_mast_height_m = _endpoint_mast_height_m(h3_dst, cells, config)
+    max_allowed_ratio = max_allowed_fresnel_obstruction_ratio()
 
     # Same-cell: trivially visible at zero distance, skip path loss calculation
     if h3_src == h3_dst:
@@ -58,6 +64,9 @@ def compute_los(
             distance_m=0.0,
             is_visible=True,
         )
+        setattr(result, "fresnel_obstruction_ratio", 0.0)
+        setattr(result, "max_allowed_fresnel_obstruction_ratio", max_allowed_ratio)
+        setattr(result, "fresnel_obstruction_margin_ratio", max_allowed_ratio)
         if cache is not None:
             cache.put(
                 h3_src, h3_dst,
@@ -119,31 +128,31 @@ def compute_los(
             )
         return result
 
-    # Compute Fresnel clearance
-    clearance, distance_m, d1, d2 = compute_fresnel_clearance(
+    # Compute coarse-profile Fresnel clearance + obstruction ratio
+    coarse_summary = compute_fresnel_profile_summary(
         h3_src, h3_dst, cells, config,
         elevation_provider=elevation_provider,
         mast_height_src_m=src_mast_height_m,
         mast_height_dst_m=dst_mast_height_m,
     )
+    clearance = coarse_summary.clearance_m
+    distance_m = coarse_summary.distance_m
+    d1 = coarse_summary.d1_m
+    d2 = coarse_summary.d2_m
+    obstruction_ratio = coarse_summary.max_obstruction_ratio
 
     # Compute path loss
     path_loss = compute_path_loss(
         distance_m, config.frequency_hz, clearance, d1, d2
     )
 
-    # Link feasibility is determined by end-to-end link budget.
-    # Fresnel clearance still contributes via diffraction loss inside path_loss.
     is_link_budget_ok = (path_loss <= config.link_budget_db)
-    if config.min_fresnel_clearance_m is None:
-        is_clearance_ok = True
-    else:
-        is_clearance_ok = (clearance >= config.min_fresnel_clearance_m)
+    is_fresnel_ok = fresnel_obstruction_ratio_accepts(obstruction_ratio)
 
     # Hybrid verification: only dense-sample links that pass coarse acceptance.
     # This removes coarse H3-center false positives while keeping fast rejects.
-    if is_link_budget_ok and is_clearance_ok and elevation_provider is not None:
-        dense_clearance, dense_distance_m, dense_d1, dense_d2 = compute_fresnel_clearance_dense(
+    if is_link_budget_ok and is_fresnel_ok and elevation_provider is not None:
+        dense_summary = compute_fresnel_profile_summary_dense(
             h3_src, h3_dst, cells, config,
             elevation_provider=elevation_provider,
             sample_step_m=config.los_dense_sample_step_m,
@@ -151,24 +160,33 @@ def compute_los(
             mast_height_src_m=src_mast_height_m,
             mast_height_dst_m=dst_mast_height_m,
         )
+        dense_clearance = dense_summary.clearance_m
+        dense_distance_m = dense_summary.distance_m
+        dense_d1 = dense_summary.d1_m
+        dense_d2 = dense_summary.d2_m
         dense_path_loss = compute_path_loss(
             dense_distance_m, config.frequency_hz, dense_clearance, dense_d1, dense_d2
         )
         clearance = dense_clearance
         distance_m = dense_distance_m
         path_loss = dense_path_loss
+        obstruction_ratio = dense_summary.max_obstruction_ratio
         is_link_budget_ok = (path_loss <= config.link_budget_db)
-        if config.min_fresnel_clearance_m is None:
-            is_clearance_ok = True
-        else:
-            is_clearance_ok = (clearance >= config.min_fresnel_clearance_m)
+        is_fresnel_ok = fresnel_obstruction_ratio_accepts(obstruction_ratio)
 
     # Create result
     result = LOSResult(
         clearance_m=clearance,
         path_loss_db=path_loss,
         distance_m=distance_m,
-        is_visible=(is_link_budget_ok and is_clearance_ok)
+        is_visible=(is_link_budget_ok and is_fresnel_ok)
+    )
+    setattr(result, "fresnel_obstruction_ratio", float(obstruction_ratio))
+    setattr(result, "max_allowed_fresnel_obstruction_ratio", float(max_allowed_ratio))
+    setattr(
+        result,
+        "fresnel_obstruction_margin_ratio",
+        float(max_allowed_ratio - obstruction_ratio),
     )
 
     if use_cache:

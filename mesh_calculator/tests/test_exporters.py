@@ -43,13 +43,14 @@ def _make_surface_with_edges():
         clearance_m=15.5,
         path_loss_db=120.3,
         edge_origin="global_visibility",
-        visibility_policy="budget_and_min_clearance",
+        visibility_policy="budget_and_fresnel_40pct",
         link_budget_db=130.0,
         path_loss_margin_db=9.7,
-        min_required_clearance_m=0.0,
-        clearance_margin_m=15.5,
+        max_allowed_fresnel_obstruction_ratio=0.4,
+        fresnel_obstruction_ratio=0.12,
+        fresnel_obstruction_margin_ratio=0.28,
         accepted_by_budget=True,
-        accepted_by_clearance_policy=True,
+        accepted_by_fresnel_policy=True,
     )
     surface.visibility_graph.add_visibility_edge(2, 3, distance_m=8000.0, clearance_m=-22.0, path_loss_db=115.1)
 
@@ -133,10 +134,11 @@ class TestExportVisibilityEdges(unittest.TestCase):
             self.assertIn("visibility_policy", props)
             self.assertIn("link_budget_db", props)
             self.assertIn("path_loss_margin_db", props)
-            self.assertIn("min_required_clearance_m", props)
-            self.assertIn("clearance_margin_m", props)
+            self.assertIn("max_allowed_fresnel_obstruction_ratio", props)
+            self.assertIn("fresnel_obstruction_ratio", props)
+            self.assertIn("fresnel_obstruction_margin_ratio", props)
             self.assertIn("accepted_by_budget", props)
-            self.assertIn("accepted_by_clearance_policy", props)
+            self.assertIn("accepted_by_fresnel_policy", props)
             self.assertIn("source_algorithm", props)
             self.assertIn("target_algorithm", props)
             self.assertAlmostEqual(props["distance_m"], 12000.0)
@@ -154,13 +156,14 @@ class TestExportVisibilityEdges(unittest.TestCase):
             self.assertAlmostEqual(props["source_elevation_m"], 500.0)
             self.assertAlmostEqual(props["target_elevation_m"], 600.0)
             self.assertEqual(props["edge_origin"], "global_visibility")
-            self.assertEqual(props["visibility_policy"], "budget_and_min_clearance")
+            self.assertEqual(props["visibility_policy"], "budget_and_fresnel_40pct")
             self.assertAlmostEqual(props["link_budget_db"], 130.0)
             self.assertAlmostEqual(props["path_loss_margin_db"], 9.7)
-            self.assertAlmostEqual(props["min_required_clearance_m"], 0.0)
-            self.assertAlmostEqual(props["clearance_margin_m"], 15.5)
+            self.assertAlmostEqual(props["max_allowed_fresnel_obstruction_ratio"], 0.4)
+            self.assertAlmostEqual(props["fresnel_obstruction_ratio"], 0.12)
+            self.assertAlmostEqual(props["fresnel_obstruction_margin_ratio"], 0.28)
             self.assertTrue(props["accepted_by_budget"])
-            self.assertTrue(props["accepted_by_clearance_policy"])
+            self.assertTrue(props["accepted_by_fresnel_policy"])
         finally:
             os.unlink(path)
 

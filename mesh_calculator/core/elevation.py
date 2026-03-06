@@ -86,6 +86,60 @@ class ElevationProvider:
 
         return self._cache[cache_key]
 
+    def get_elevation_bilinear(self, lat: float, lon: float) -> float:
+        """
+        Get elevation via bilinear interpolation at a specific latitude/longitude.
+
+        Falls back to nearest-pixel sampling near raster edges or on read errors.
+        """
+        cache_key = ("bilinear", round(lat, 6), round(lon, 6))
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+
+        try:
+            col_f, row_f = (~self.transform) * (lon, lat)
+            row0 = int(np.floor(row_f))
+            col0 = int(np.floor(col_f))
+            row1 = row0 + 1
+            col1 = col0 + 1
+
+            if (
+                row0 < 0 or col0 < 0
+                or row1 >= self.dataset.height
+                or col1 >= self.dataset.width
+            ):
+                value = self.get_elevation(lat, lon)
+                self._cache[cache_key] = float(value)
+                return float(value)
+
+            with self._lock:
+                window = rasterio.windows.Window(col0, row0, 2, 2)
+                band = self.dataset.read(1, window=window, masked=True)
+
+            mask = np.ma.getmaskarray(band)
+            if np.any(mask):
+                value = self.get_elevation(lat, lon)
+                self._cache[cache_key] = float(value)
+                return float(value)
+
+            dx = float(col_f - col0)
+            dy = float(row_f - row0)
+            v00 = float(band[0, 0])
+            v01 = float(band[0, 1])
+            v10 = float(band[1, 0])
+            v11 = float(band[1, 1])
+
+            top = v00 * (1.0 - dx) + v01 * dx
+            bottom = v10 * (1.0 - dx) + v11 * dx
+            value = top * (1.0 - dy) + bottom * dy
+            self._cache[cache_key] = float(value)
+            return float(value)
+        except Exception as e:
+            logger.warning("Failed to get bilinear elevation", lat=lat, lon=lon, error=str(e))
+            value = self.get_elevation(lat, lon)
+            self._cache[cache_key] = float(value)
+            return float(value)
+
     def get_elevation_bulk(self, coords: list[Tuple[float, float]]) -> np.ndarray:
         """
         Get elevations for multiple coordinates efficiently.
