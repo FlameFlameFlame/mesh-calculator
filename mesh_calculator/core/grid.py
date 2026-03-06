@@ -17,6 +17,16 @@ from .geometry import h3_to_lat_lon
 logger = structlog.get_logger(__name__)
 
 
+def _cell_elevation(provider: ElevationProvider, h3_idx: str, lat: float, lon: float) -> float:
+    """Get cell elevation with backward-compatible provider fallback."""
+    if callable(getattr(type(provider), "get_h3_cell_max_elevation", None)):
+        try:
+            return provider.get_h3_cell_max_elevation(h3_idx)
+        except Exception:
+            pass
+    return provider.get_elevation(lat, lon)
+
+
 def shapely_to_h3_cells(shapely_geom, resolution: int) -> set:
     """Convert a Shapely polygon to H3 cells using h3 v4 API."""
     coords = list(shapely_geom.exterior.coords)
@@ -229,7 +239,7 @@ def generate_road_grid(
     logger.debug("Loading elevation data for cells")
     for i, h3_idx in enumerate(valid_cells):
         lat, lon = h3_to_lat_lon(h3_idx)
-        elevation = elevation_provider.get_elevation(lat, lon)
+        elevation = _cell_elevation(elevation_provider, h3_idx, lat, lon)
 
         cell = H3Cell(
             h3_index=h3_idx,
@@ -292,7 +302,7 @@ def generate_full_grid(
     logger.debug("Loading elevation data for cells")
     for i, h3_idx in enumerate(all_cells):
         lat, lon = h3_to_lat_lon(h3_idx)
-        elevation = elevation_provider.get_elevation(lat, lon)
+        elevation = _cell_elevation(elevation_provider, h3_idx, lat, lon)
 
         cell = H3Cell(
             h3_index=h3_idx,

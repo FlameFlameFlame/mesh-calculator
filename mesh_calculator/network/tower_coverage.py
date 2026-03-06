@@ -36,6 +36,69 @@ class CoverageSource:
     lon: float
 
 
+def _provider_supports(provider, method_name: str) -> bool:
+    """True only if provider type explicitly implements the method."""
+    if provider is None:
+        return False
+    return callable(getattr(type(provider), method_name, None))
+
+
+def _cell_elevation(elevation_provider, h3_index: str, lat: float, lon: float) -> float:
+    if elevation_provider is None:
+        return 0.0
+    if _provider_supports(elevation_provider, "get_h3_cell_max_elevation"):
+        try:
+            return float(elevation_provider.get_h3_cell_max_elevation(h3_index))
+        except Exception:
+            pass
+    get_elevation = getattr(elevation_provider, "get_elevation", None)
+    if callable(get_elevation):
+        try:
+            return float(get_elevation(lat, lon))
+        except Exception:
+            return 0.0
+    return 0.0
+
+
+def _line_peak_fallback(
+    source_cell: H3Cell,
+    target_cell: H3Cell,
+    config: MeshConfig,
+    elevation_provider=None,
+) -> tuple[float, float]:
+    """Fallback peak elevation using sampled provider elevations along the line."""
+    peak_elev = max(source_cell.elevation, target_cell.elevation)
+    frac = 0.0 if source_cell.elevation >= target_cell.elevation else 1.0
+    if elevation_provider is None:
+        return peak_elev, frac
+    get_elevation = getattr(elevation_provider, "get_elevation", None)
+    if not callable(get_elevation):
+        return peak_elev, frac
+
+    distance_m = great_circle_distance(
+        source_cell.lat, source_cell.lon, target_cell.lat, target_cell.lon
+    )
+    if distance_m <= 0.0:
+        return peak_elev, 0.0
+
+    step_m = max(float(config.los_dense_sample_step_m), 1.0)
+    max_samples = max(int(config.los_dense_max_samples), 2)
+    n_samples = max(2, int(distance_m / step_m))
+    n_samples = min(n_samples, max_samples)
+    for i in range(n_samples + 1):
+        sample_frac = i / n_samples
+        sample_lat = source_cell.lat + (target_cell.lat - source_cell.lat) * sample_frac
+        sample_lon = source_cell.lon + (target_cell.lon - source_cell.lon) * sample_frac
+        try:
+            sample_elev = float(get_elevation(sample_lat, sample_lon))
+        except Exception:
+            continue
+        if sample_elev > peak_elev:
+            peak_elev = sample_elev
+            frac = sample_frac
+    return peak_elev, frac
+
+
 def _to_xyz(lats: np.ndarray, lons: np.ndarray) -> np.ndarray:
     lats_rad = np.radians(lats)
     lons_rad = np.radians(lons)
@@ -102,31 +165,21 @@ def _compute_shadow_link(
     src_height_asl = source_cell.elevation + config.mast_height_m
     dst_height_asl = target_cell.elevation + config.coverage_receiver_height_m
 
-    step_m = max(float(config.los_dense_sample_step_m), 1.0)
-    max_samples = max(int(config.los_dense_max_samples), 2)
-    n_samples = max(2, int(distance_m / step_m))
-    n_samples = min(n_samples, max_samples)
-
-    fracs = np.linspace(0.0, 1.0, n_samples + 1)
-    lats = source_cell.lat + (target_cell.lat - source_cell.lat) * fracs
-    lons = source_cell.lon + (target_cell.lon - source_cell.lon) * fracs
-
-    if elevation_provider is not None:
-        elevs = np.array(
-            [elevation_provider.get_elevation(float(lat), float(lon))
-             for lat, lon in zip(lats, lons)],
-            dtype=np.float64,
-        )
+    if _provider_supports(elevation_provider, "get_line_peak_elevation"):
+        try:
+            peak_elev, _peak_lat, _peak_lon, frac = elevation_provider.get_line_peak_elevation(
+                source_cell.lat, source_cell.lon, target_cell.lat, target_cell.lon
+            )
+        except Exception:
+            peak_elev, frac = _line_peak_fallback(source_cell, target_cell, config, elevation_provider)
     else:
-        # Fallback for tests/edge paths without DEM provider.
-        elevs = np.linspace(source_cell.elevation, target_cell.elevation, n_samples + 1)
+        peak_elev, frac = _line_peak_fallback(source_cell, target_cell, config, elevation_provider)
 
-    d1s = distance_m * fracs
-    d2s = distance_m - d1s
-    line_alts = src_height_asl + (dst_height_asl - src_height_asl) * fracs
-    earth_curvs = (d1s * d2s) / (2.0 * config.effective_earth_radius_m)
-    clearances = line_alts - (elevs + earth_curvs)
-    worst_clearance = float(clearances[np.argmin(clearances)])
+    d1 = distance_m * frac
+    d2 = distance_m - d1
+    line_alt = src_height_asl + (dst_height_asl - src_height_asl) * frac
+    earth_curv = (d1 * d2) / (2.0 * config.effective_earth_radius_m)
+    worst_clearance = float(line_alt - (peak_elev + earth_curv))
 
     if worst_clearance < 0.0:
         return distance_m, worst_clearance, float("inf"), False
@@ -147,8 +200,8 @@ def compute_h3_tower_coverage(
     """
     Compute radial H3 coverage for one or more explicit source points.
 
-    Returns covered cells only. The source cell itself is always included
-    with distance/path-loss set to 0.
+    Returns all cells within radius (covered and uncovered). The source cell
+    itself is always included with distance/path-loss set to 0.
     """
     src_list = _dedupe_sources(
         _normalize_sources_to_resolution(sources, config.h3_resolution)
@@ -178,7 +231,7 @@ def compute_h3_tower_coverage(
     augmented_cells = dict(base_cells)
     for src in src_list:
         if src.h3_index not in augmented_cells:
-            elev = elevation_provider.get_elevation(src.lat, src.lon) if elevation_provider else 0.0
+            elev = _cell_elevation(elevation_provider, src.h3_index, src.lat, src.lon)
             augmented_cells[src.h3_index] = H3Cell(
                 h3_index=src.h3_index,
                 lat=src.lat,
@@ -191,7 +244,7 @@ def compute_h3_tower_coverage(
     for h3_idx in candidate_h3s:
         if h3_idx not in augmented_cells:
             lat, lon = h3.cell_to_latlng(h3_idx)
-            elev = elevation_provider.get_elevation(lat, lon) if elevation_provider else 0.0
+            elev = _cell_elevation(elevation_provider, h3_idx, lat, lon)
             augmented_cells[h3_idx] = H3Cell(
                 h3_index=h3_idx,
                 lat=lat,
@@ -254,7 +307,7 @@ def compute_h3_tower_coverage(
                 out.append(res)
         return out
 
-    # ci -> aggregate metrics
+    # ci -> aggregate visible-link metrics
     cell_results: Dict[int, list] = {}
     for ci in cells_with_own_source:
         own_source = source_by_h3.get(cand_list[ci].h3_index)
@@ -290,21 +343,38 @@ def compute_h3_tower_coverage(
                 for ci, si, dist_m, clear_m, ploss_db in future.result():
                     _accumulate_visible_result(ci, si, dist_m, clear_m, ploss_db)
 
+    nearest_any: Dict[int, tuple[float, Union[int, str, None]]] = {}
+    for ci, src_ids in enumerate(nearby_sources):
+        best_dist = float("inf")
+        best_sid = None
+        cell = cand_list[ci]
+        for si in src_ids:
+            source = src_cells[si]
+            d = great_circle_distance(cell.lat, cell.lon, source.lat, source.lon)
+            if d < best_dist:
+                best_dist = d
+                best_sid = src_list[si].source_id
+        nearest_any[ci] = (best_dist, best_sid)
+
     tx_dbm = config.tx_power_dbm
     gain = 2.0 * config.antenna_gain_dbi
     sens = config.receiver_sensitivity_dbm
 
     results = []
-    for ci, (count, closest_dist, closest_sid, best_ploss, best_sid, best_clear, best_dist) in cell_results.items():
+    for ci, cell in enumerate(cand_list):
+        count, closest_dist, closest_sid, best_ploss, best_sid, best_clear, best_dist = cell_results.get(
+            ci, [0, float('inf'), None, float('inf'), None, None, None]
+        )
+        nearest_dist, nearest_sid = nearest_any.get(ci, (float('inf'), None))
+        if closest_sid is None and nearest_sid is not None:
+            closest_sid = nearest_sid
+            closest_dist = nearest_dist
         cell = cand_list[ci]
         rx_dbm = None
         is_covered = False
         if best_ploss is not None and best_ploss != float('inf'):
             rx_dbm = tx_dbm + gain - best_ploss
             is_covered = (count > 0 and rx_dbm >= sens)
-
-        if not is_covered:
-            continue
 
         results.append({
             'h3_index': cell.h3_index,
@@ -313,15 +383,32 @@ def compute_h3_tower_coverage(
             'elevation': cell.elevation,
             'has_road': cell.has_road,
             'visible_tower_count': count,
-            'distance_m': best_dist if best_dist is not None and best_dist != float('inf') else None,
-            'clearance_m': best_clear if best_clear is not None and best_clear != float('inf') else None,
-            'path_loss_db': best_ploss if best_ploss != float('inf') else None,
+            'distance_m': (
+                best_dist
+                if is_covered and best_dist is not None and best_dist != float('inf')
+                else None
+            ),
+            'clearance_m': (
+                best_clear
+                if is_covered and best_clear is not None and best_clear != float('inf')
+                else None
+            ),
+            'path_loss_db': (
+                best_ploss
+                if is_covered and best_ploss != float('inf')
+                else None
+            ),
             'received_power_dbm': round(rx_dbm, 2) if rx_dbm is not None else None,
             'is_covered': is_covered,
-            'serving_tower_id': best_sid,
+            'serving_tower_id': best_sid if is_covered else None,
             'closest_tower_id': closest_sid,
             'closest_distance_m': closest_dist if closest_dist != float('inf') else None,
         })
 
-    logger.info("Standalone tower coverage computed: %d covered hexes", len(results))
+    covered_count = sum(1 for r in results if r.get('is_covered'))
+    logger.info(
+        "Standalone tower coverage computed: %d total hexes (%d covered)",
+        len(results),
+        covered_count,
+    )
     return results

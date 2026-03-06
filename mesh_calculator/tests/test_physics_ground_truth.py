@@ -127,7 +127,7 @@ class TestTowerPhysicsGroundTruth(unittest.TestCase):
         )
         self.assertGreater(east.path_loss_db, self.config_budget.link_budget_db)
 
-    def test_tower_coverage_includes_clear_points_excludes_blocked_point(self):
+    def test_tower_coverage_marks_blocked_point_uncovered(self):
         coverage = compute_h3_tower_coverage(
             sources=[
                 CoverageSource(
@@ -142,12 +142,16 @@ class TestTowerPhysicsGroundTruth(unittest.TestCase):
             elevation_provider=self.terrain,
             max_radius_m=4000.0,
         )
-        covered_h3 = {rec["h3_index"] for rec in coverage}
+        by_h3 = {rec["h3_index"]: rec for rec in coverage}
 
-        self.assertIn(self.tower_h3, covered_h3)
-        self.assertIn(self.point_h3["west_clear"], covered_h3)
-        self.assertIn(self.point_h3["north_clear"], covered_h3)
-        self.assertNotIn(self.point_h3["east_blocked"], covered_h3)
+        self.assertIn(self.tower_h3, by_h3)
+        self.assertTrue(by_h3[self.tower_h3]["is_covered"])
+        self.assertIn(self.point_h3["west_clear"], by_h3)
+        self.assertTrue(by_h3[self.point_h3["west_clear"]]["is_covered"])
+        self.assertIn(self.point_h3["north_clear"], by_h3)
+        self.assertTrue(by_h3[self.point_h3["north_clear"]]["is_covered"])
+        self.assertIn(self.point_h3["east_blocked"], by_h3)
+        self.assertFalse(by_h3[self.point_h3["east_blocked"]]["is_covered"])
 
 
 if __name__ == "__main__":
