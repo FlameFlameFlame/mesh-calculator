@@ -24,6 +24,36 @@ logger = structlog.get_logger(__name__)
 _EARTH_R = 6_371_000
 
 
+def _los_decision_debug(result, config: MeshConfig, edge_origin: str) -> dict:
+    """Build explicit edge-acceptance debug metadata from LOS result + policy."""
+    path_loss = getattr(result, "path_loss_db", None)
+    clearance = getattr(result, "clearance_m", None)
+    threshold = config.min_fresnel_clearance_m
+    budget_ok = (path_loss is not None and path_loss <= config.link_budget_db)
+    clearance_ok = True if threshold is None else (
+        clearance is not None and clearance >= threshold
+    )
+    clearance_margin = None
+    if clearance is not None:
+        clearance_margin = clearance if threshold is None else (clearance - threshold)
+    return {
+        "edge_origin": edge_origin,
+        "visibility_policy": (
+            "budget_only"
+            if threshold is None
+            else "budget_and_min_clearance"
+        ),
+        "link_budget_db": float(config.link_budget_db),
+        "path_loss_margin_db": (
+            float(config.link_budget_db - path_loss) if path_loss is not None else None
+        ),
+        "min_required_clearance_m": threshold,
+        "clearance_margin_m": clearance_margin,
+        "accepted_by_budget": bool(budget_ok),
+        "accepted_by_clearance_policy": bool(clearance_ok),
+    }
+
+
 @dataclass
 class Tower:
     """
@@ -81,7 +111,15 @@ class VisibilityGraph:
         tower2_id: int,
         distance_m: float,
         clearance_m: float = None,
-        path_loss_db: float = None
+        path_loss_db: float = None,
+        edge_origin: str = None,
+        visibility_policy: str = None,
+        link_budget_db: float = None,
+        path_loss_margin_db: float = None,
+        min_required_clearance_m: float = None,
+        clearance_margin_m: float = None,
+        accepted_by_budget: bool = None,
+        accepted_by_clearance_policy: bool = None,
     ):
         """
         Add a visibility edge between two towers.
@@ -98,7 +136,15 @@ class VisibilityGraph:
             tower2_id,
             distance_m=distance_m,
             clearance_m=clearance_m,
-            path_loss_db=path_loss_db
+            path_loss_db=path_loss_db,
+            edge_origin=edge_origin,
+            visibility_policy=visibility_policy,
+            link_budget_db=link_budget_db,
+            path_loss_margin_db=path_loss_margin_db,
+            min_required_clearance_m=min_required_clearance_m,
+            clearance_margin_m=clearance_margin_m,
+            accepted_by_budget=accepted_by_budget,
+            accepted_by_clearance_policy=accepted_by_clearance_policy,
         )
 
     def has_edge(self, tower1_id: int, tower2_id: int) -> bool:
@@ -264,9 +310,14 @@ class MeshSurface:
                 elevation_provider=elev,
             )
             if result.is_visible:
+                debug = _los_decision_debug(
+                    result,
+                    config,
+                    edge_origin='global_visibility',
+                )
                 return (t1.tower_id, t2.tower_id,
                         result.distance_m, result.clearance_m,
-                        result.path_loss_db)
+                        result.path_loss_db, debug)
             return None
 
         edges_added = 0
@@ -278,12 +329,13 @@ class MeshSurface:
             for future in as_completed(futures):
                 edge = future.result()
                 if edge is not None:
-                    tid1, tid2, dist, clearance, ploss = edge
+                    tid1, tid2, dist, clearance, ploss, debug = edge
                     self.visibility_graph.add_visibility_edge(
                         tid1, tid2,
                         distance_m=dist,
                         clearance_m=clearance,
                         path_loss_db=ploss,
+                        **debug,
                     )
                     edges_added += 1
 

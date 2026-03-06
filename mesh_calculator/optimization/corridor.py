@@ -10,7 +10,7 @@ from ..core.grid import H3Cell
 from ..core.config import MeshConfig
 from ..data.cache import LOSCache
 from ..physics.los import has_los, compute_los
-from ..network.graph import MeshSurface
+from ..network.graph import MeshSurface, _los_decision_debug
 
 logger = structlog.get_logger(__name__)
 
@@ -1263,6 +1263,11 @@ def wire_corridor_edges(
                 distance_m=los.distance_m,
                 clearance_m=los.clearance_m,
                 path_loss_db=los.path_loss_db,
+                **_los_decision_debug(
+                    los,
+                    surface.config,
+                    edge_origin='corridor_chain',
+                ),
             )
             edges_added += 1
         else:
