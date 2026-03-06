@@ -14,13 +14,13 @@ class MeshConfig:
 
     # Radio frequency parameters
     frequency_hz: float = 868e6  # 868 MHz
-    mast_height_m: float = 28.0  # Tower mast height in meters
+    mast_height_m: float = 5.0  # Tower mast height in meters
 
     # Network topology parameters
     max_towers_per_route: int = 10  # Maximum towers per route
     gap_repair_rounds: int = 5     # Max gap repair rounds (0 = disabled)
     routing_k_ring: int = 2  # k-ring radius for routing graph neighbor search
-    road_buffer_m: float = 0.0  # Buffer around road cells in meters (0 = road-only)
+    road_buffer_m: float = 100.0  # Buffer around road cells in meters (0 = road-only)
     optimizer_search_radius_m: Optional[float] = None  # Optional planner-only search radius override
     gap_repair_search_radius_ladder_m: list[float] = field(
         default_factory=lambda: [0.0, 300.0, 600.0, 900.0]

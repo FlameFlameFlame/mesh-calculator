@@ -14,9 +14,9 @@ from ..core.config import MeshConfig, MeshCalculatorConfig
 class TestMeshConfigDefaults(unittest.TestCase):
     """New MeshConfig fields have the right default values."""
 
-    def test_road_buffer_m_default_is_zero(self):
+    def test_road_buffer_m_default_is_100(self):
         config = MeshConfig()
-        self.assertEqual(config.road_buffer_m, 0.0)
+        self.assertEqual(config.road_buffer_m, 100.0)
 
     def test_max_coverage_radius_m_default_is_15000(self):
         config = MeshConfig()
@@ -35,7 +35,7 @@ class TestMeshConfigDefaults(unittest.TestCase):
         config = MeshConfig()
         self.assertEqual(config.h3_resolution, 8)
         self.assertAlmostEqual(config.frequency_hz, 868e6)
-        self.assertEqual(config.mast_height_m, 28.0)
+        self.assertEqual(config.mast_height_m, 5.0)
 
     def test_min_fresnel_clearance_default_is_none(self):
         config = MeshConfig()
@@ -74,7 +74,7 @@ class TestMeshCalculatorConfigFromDict(unittest.TestCase):
         """from_dict without road_buffer_m should not raise and use default."""
         d = {'parameters': {'h3_resolution': 9}}
         cfg = MeshCalculatorConfig.from_dict(d)
-        self.assertEqual(cfg.parameters.road_buffer_m, 0.0)
+        self.assertEqual(cfg.parameters.road_buffer_m, 100.0)
 
     def test_backward_compat_no_max_coverage_radius_m(self):
         """from_dict without max_coverage_radius_m should not raise and use default."""
@@ -85,7 +85,7 @@ class TestMeshCalculatorConfigFromDict(unittest.TestCase):
     def test_backward_compat_empty_parameters(self):
         """from_dict with empty parameters dict uses all defaults."""
         cfg = MeshCalculatorConfig.from_dict({})
-        self.assertEqual(cfg.parameters.road_buffer_m, 0.0)
+        self.assertEqual(cfg.parameters.road_buffer_m, 100.0)
         self.assertEqual(cfg.parameters.max_coverage_radius_m, 15000.0)
 
     def test_from_dict_strips_removed_max_visibility_m(self):
