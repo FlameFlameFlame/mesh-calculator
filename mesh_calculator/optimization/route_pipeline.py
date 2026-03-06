@@ -11,11 +11,13 @@ import os
 from typing import Callable, List, Optional
 
 import h3
+import numpy as np
+from shapely.geometry import shape as shapely_shape
 
 from ..core.config import MeshConfig, RouteSpec
 from ..core.elevation import ElevationProvider
-from ..core.geometry import h3_to_lat_lon
-from ..core.grid import H3Cell
+from ..core.geometry import great_circle_distance, h3_to_lat_lon
+from ..core.grid import H3Cell, generate_full_grid
 from ..core.road_corridor import road_geojson_to_h3_corridor
 from ..data.cache import LOSCache
 from ..data.exporters import (
@@ -35,6 +37,21 @@ from ..optimization.corridor import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _cell_elevation(
+    elevation_provider: ElevationProvider,
+    h3_idx: str,
+    lat: float,
+    lon: float,
+) -> float:
+    """Get H3 cell elevation with provider capability fallback."""
+    if callable(getattr(type(elevation_provider), "get_h3_cell_max_elevation", None)):
+        try:
+            return elevation_provider.get_h3_cell_max_elevation(h3_idx)
+        except Exception:
+            pass
+    return elevation_provider.get_elevation(lat, lon)
 
 
 def _build_corridor_cells(
@@ -58,7 +75,7 @@ def _build_corridor_cells(
         if h3_idx in existing_cells or h3_idx in new_cells:
             continue
         lat, lon = h3.cell_to_latlng(h3_idx)
-        elevation = elevation_provider.get_elevation(lat, lon)
+        elevation = _cell_elevation(elevation_provider, h3_idx, lat, lon)
         new_cells[h3_idx] = H3Cell(
             h3_index=h3_idx,
             lat=lat,
@@ -103,7 +120,7 @@ def _expand_cells_with_buffer(
         if h3_idx in existing_cells:
             continue
         lat, lon = h3_to_lat_lon(h3_idx)
-        elevation = elevation_provider.get_elevation(lat, lon)
+        elevation = _cell_elevation(elevation_provider, h3_idx, lat, lon)
         new_cells[h3_idx] = H3Cell(
             h3_index=h3_idx,
             lat=lat,
@@ -187,11 +204,68 @@ def _mark_city_cells(
         )
 
 
+def _boundary_polygon_from_geojson(boundary_geojson: Optional[dict]):
+    """Extract a polygon geometry from boundary GeoJSON payload."""
+    if not boundary_geojson:
+        return None
+    try:
+        if boundary_geojson.get('type') == 'FeatureCollection':
+            features = boundary_geojson.get('features', [])
+            if not features:
+                return None
+            geoms = [shapely_shape(f['geometry']) for f in features if f.get('geometry')]
+            if not geoms:
+                return None
+            poly = geoms[0]
+            for g in geoms[1:]:
+                poly = poly.union(g)
+            return poly
+        if boundary_geojson.get('type') == 'Feature':
+            geom = boundary_geojson.get('geometry')
+            if not geom:
+                return None
+            return shapely_shape(geom)
+        if boundary_geojson.get('type'):
+            return shapely_shape(boundary_geojson)
+    except Exception:
+        logger.exception("Failed to parse boundary_geojson")
+    return None
+
+
+def _collect_route_gradient_samples(
+    routes: List[RouteSpec],
+    resolution: int,
+    elevation_provider: ElevationProvider,
+) -> list[float]:
+    """Collect per-hop terrain gradient samples (m/km) over all routes."""
+    slopes: list[float] = []
+    for route in routes:
+        corridor = road_geojson_to_h3_corridor(
+            route.features,
+            resolution,
+            site1=route.site1,
+            site2=route.site2,
+        )
+        if len(corridor) < 2:
+            continue
+        for h3_a, h3_b in zip(corridor, corridor[1:]):
+            lat_a, lon_a = h3.cell_to_latlng(h3_a)
+            lat_b, lon_b = h3.cell_to_latlng(h3_b)
+            dist_m = great_circle_distance(lat_a, lon_a, lat_b, lon_b)
+            if dist_m <= 1.0:
+                continue
+            elev_a = _cell_elevation(elevation_provider, h3_a, lat_a, lon_a)
+            elev_b = _cell_elevation(elevation_provider, h3_b, lat_b, lon_b)
+            slopes.append(abs(elev_b - elev_a) / (dist_m / 1000.0))
+    return slopes
+
+
 def run_route_pipeline(
     routes: List[RouteSpec],
     mesh_config: MeshConfig,
     elevation_path: str,
     city_boundaries_geojson: Optional[dict] = None,
+    boundary_geojson: Optional[dict] = None,
     output_dir: str = "output",
     strategy: str = 'dp',
     progress_callback: Optional[Callable[[dict], None]] = None,
@@ -216,6 +290,7 @@ def run_route_pipeline(
         elevation_path: Path to GeoTIFF elevation file.
         city_boundaries_geojson: Optional GeoJSON FeatureCollection with city
                                  boundary polygons for city link tagging.
+        boundary_geojson: Optional boundary geometry used for full-grid export.
         output_dir: Directory to write output files.
         strategy: Tower placement algorithm — 'dp' (MaxMin DP, default) or
                   'greedy' (furthest-clear-LOS, fewer towers, no gap repair).
@@ -273,6 +348,53 @@ def run_route_pipeline(
     _emit_progress('route', 'Starting route pipeline', 0.0)
 
     elevation_provider = ElevationProvider(elevation_path)
+
+    base_h3_resolution = mesh_config.h3_resolution
+    effective_h3_resolution = base_h3_resolution
+    h3_auto_refined = False
+    h3_auto_refine_reason = None
+    if (
+        mesh_config.auto_refine_h3_on_gradient
+        and mesh_config.h3_resolution < mesh_config.auto_refine_h3_max_resolution
+    ):
+        gradients = _collect_route_gradient_samples(
+            routes, mesh_config.h3_resolution, elevation_provider
+        )
+        if gradients:
+            pctl = float(np.percentile(
+                np.asarray(gradients, dtype=np.float64),
+                mesh_config.gradient_refine_percentile,
+            ))
+            threshold = float(mesh_config.gradient_refine_threshold_m_per_km)
+            if pctl >= threshold:
+                effective_h3_resolution = min(
+                    mesh_config.h3_resolution + 1,
+                    mesh_config.auto_refine_h3_max_resolution,
+                )
+                if effective_h3_resolution > mesh_config.h3_resolution:
+                    h3_auto_refined = True
+                    h3_auto_refine_reason = (
+                        f"terrain_gradient_p{mesh_config.gradient_refine_percentile:.0f}"
+                        f"={pctl:.1f}m_per_km>=threshold_{threshold:.1f}"
+                    )
+                    mesh_config.h3_resolution = effective_h3_resolution
+                    logger.info(
+                        "Auto-refined H3 resolution %d -> %d due to terrain gradient "
+                        "(p%.0f=%.1f m/km, threshold=%.1f)",
+                        base_h3_resolution,
+                        effective_h3_resolution,
+                        mesh_config.gradient_refine_percentile,
+                        pctl,
+                        threshold,
+                    )
+            else:
+                logger.info(
+                    "H3 auto-refine not triggered (p%.0f=%.1f m/km, threshold=%.1f)",
+                    mesh_config.gradient_refine_percentile,
+                    pctl,
+                    threshold,
+                )
+
     surface = MeshSurface({}, mesh_config, elevation_provider)
     los_cache = LOSCache()
 
@@ -499,7 +621,7 @@ def run_route_pipeline(
                     continue
                 if site_h3 not in surface.cells:
                     lat, lon = h3.cell_to_latlng(site_h3)
-                    elev = elevation_provider.get_elevation(lat, lon)
+                    elev = _cell_elevation(elevation_provider, site_h3, lat, lon)
                     surface.cells[site_h3] = H3Cell(
                         h3_index=site_h3, lat=lat, lon=lon,
                         elevation=elev, has_road=False, is_in_boundary=False,
@@ -593,12 +715,20 @@ def run_route_pipeline(
     edges_path = os.path.join(output_dir, 'visibility_edges.geojson')
     report_path = os.path.join(output_dir, 'report.json')
     grid_cells_path = os.path.join(output_dir, 'grid_cells.geojson')
+    grid_cells_full_path = os.path.join(output_dir, 'grid_cells_full.geojson')
     gap_repair_hexes_path = os.path.join(output_dir, 'gap_repair_hexes.geojson')
 
     export_towers_geojson(surface, towers_path)
     export_coverage_geojson(surface, coverage_path)
     export_visibility_edges_geojson(surface, edges_path)
     export_grid_cells_geojson(surface.cells, grid_cells_path)
+    if mesh_config.export_full_grid_cells and boundary_geojson:
+        boundary_poly = _boundary_polygon_from_geojson(boundary_geojson)
+        if boundary_poly is not None:
+            full_grid_cells = generate_full_grid(boundary_poly, elevation_provider, mesh_config)
+            export_grid_cells_geojson(full_grid_cells, grid_cells_full_path)
+        else:
+            logger.warning("Skipping full-grid export: boundary polygon not available")
     if surface.gap_repair_debug:
         export_gap_repair_hexes_geojson(surface.gap_repair_debug, gap_repair_hexes_path)
     generate_report(surface, report_path)
@@ -613,6 +743,9 @@ def run_route_pipeline(
         'total_cells': len(surface.cells),
         'visibility_edges': surface.visibility_graph.edge_count(),
         'num_clusters': len(surface.visibility_graph.connected_components()),
+        'effective_h3_resolution': effective_h3_resolution,
+        'h3_auto_refined': h3_auto_refined,
+        'h3_auto_refine_reason': h3_auto_refine_reason,
         'route_summaries': route_summaries,
         'los_cache': cache_stats,
         'elevation_cache': elev_stats,

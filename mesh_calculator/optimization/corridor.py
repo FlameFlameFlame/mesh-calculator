@@ -15,6 +15,18 @@ from ..network.graph import MeshSurface
 logger = structlog.get_logger(__name__)
 
 
+def _cell_elevation(elevation_provider, h3_idx: str, lat: float, lon: float) -> float:
+    """Get elevation with backward-compatible provider fallback."""
+    if elevation_provider is None:
+        return 0.0
+    if callable(getattr(type(elevation_provider), "get_h3_cell_max_elevation", None)):
+        try:
+            return float(elevation_provider.get_h3_cell_max_elevation(h3_idx))
+        except Exception:
+            pass
+    return float(elevation_provider.get_elevation(lat, lon))
+
+
 def _effective_initial_search_radius_m(config: MeshConfig) -> float:
     """Resolve planner search radius, preserving backward compatibility."""
     if config.optimizer_search_radius_m is not None:
@@ -298,7 +310,7 @@ def _expand_segment_buffer(
                 elev = cells[nb].elevation
             elif elevation_provider is not None:
                 lat, lon = h3.cell_to_latlng(nb)
-                elev = elevation_provider.get_elevation(lat, lon)
+                elev = _cell_elevation(elevation_provider, nb, lat, lon)
             else:
                 continue
             closest = min(
@@ -608,7 +620,7 @@ def _greedy_place_towers(
         if elevation_provider is None:
             return None
         lat, lon = h3.cell_to_latlng(h3_idx)
-        elev = elevation_provider.get_elevation(lat, lon)
+        elev = _cell_elevation(elevation_provider, h3_idx, lat, lon)
         cell = H3Cell(h3_index=h3_idx, lat=lat, lon=lon, elevation=elev,
                       has_road=False, is_in_boundary=False)
         cells[h3_idx] = cell
@@ -975,6 +987,60 @@ def place_nodes_along_corridor(
         broken_after = len(_find_broken_gaps(all_nodes, surface, cache))
         return all_nodes, node_meta, working_corridor, corridor_pos, broken_after
 
+    def _prune_unreachable_endpoint_fallback_nodes(
+        nodes: List[str],
+        meta: Dict[str, dict],
+    ) -> tuple[List[str], Dict[str, dict], int]:
+        """
+        Remove unreachable endpoint_fallback artifacts from DP chain.
+
+        Only prunes nodes tagged as endpoint_fallback, excluding any pre-existing
+        placed towers/site anchors. Recomputes broken links until stable.
+        """
+        pruned_total = 0
+        while True:
+            broken = _find_broken_gaps(nodes, surface, cache)
+            if not broken:
+                if pruned_total > 0:
+                    logger.info(
+                        "Pruned unreachable endpoint_fallback nodes",
+                        count=pruned_total,
+                    )
+                return nodes, meta, 0
+
+            removable: List[str] = []
+            for i in broken:
+                start_node = nodes[0]
+                end_node = nodes[-1]
+                for h3_idx in (nodes[i], nodes[i + 1]):
+                    if h3_idx in (start_node, end_node):
+                        continue
+                    node_info = meta.get(h3_idx) or {}
+                    if node_info.get('algorithm') != 'endpoint_fallback':
+                        continue
+                    if h3_idx in surface.tower_by_h3:
+                        continue
+                    if h3_idx not in removable:
+                        removable.append(h3_idx)
+
+            if not removable:
+                if pruned_total > 0:
+                    logger.info(
+                        "Pruned unreachable endpoint_fallback nodes",
+                        count=pruned_total,
+                    )
+                return nodes, meta, len(broken)
+
+            nodes = [n for n in nodes if n not in set(removable)]
+            for h3_idx in removable:
+                meta.pop(h3_idx, None)
+            pruned_total += len(removable)
+            if len(nodes) < 2:
+                logger.warning(
+                    "DP chain reduced below 2 nodes after endpoint fallback pruning"
+                )
+                return nodes, meta, max(len(_find_broken_gaps(nodes, surface, cache)), 0)
+
     initial_search_radius_m = _effective_initial_search_radius_m(config)
     selected_nodes, selected_meta, _, _, broken_count = _run_attempt(
         search_radius_m=initial_search_radius_m,
@@ -1001,6 +1067,11 @@ def place_nodes_along_corridor(
             if broken_count <= 0:
                 break
             attempt_id += 1
+
+        selected_nodes, selected_meta, broken_count = _prune_unreachable_endpoint_fallback_nodes(
+            selected_nodes,
+            selected_meta,
+        )
 
         if broken_count > 0:
             for i in _find_broken_gaps(selected_nodes, surface, cache):

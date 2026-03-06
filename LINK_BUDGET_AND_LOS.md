@@ -22,15 +22,16 @@ In this project, Fresnel clearance affects link quality through diffraction loss
 
 For a pair of H3 cells:
 
-1. Build a coarse straight RF path sample with `h3.grid_path_cells`.
-2. For each sample, compute:
-   - line altitude between endpoints (endpoint elevation + mast height),
+1. Cell elevations are conservative: each H3 cell stores the **maximum DEM elevation** inside the cell polygon (not centroid sample).
+2. For LOS/Fresnel, terrain along the RF line is conservative too:
+   - use the **maximum elevation point on the source→destination line**,
+   - evaluate clearance at that peak position (`d1`, `d2` from source/destination).
+3. At peak location, compute:
+   - line altitude between endpoints (endpoint elevation + antenna height),
    - earth curvature term,
    - first Fresnel radius.
-3. Clearance at sample:
-   - `clearance = line_altitude - (terrain + earth_curvature + fresnel_radius)`
-4. Keep worst (minimum) clearance along the path.
-5. If coarse evaluation passes policy, run dense DEM verification at fixed metric step (`los_dense_sample_step_m`, capped by `los_dense_max_samples`) and recompute final clearance/path loss from the dense profile.
+4. Clearance:
+   - `clearance = line_altitude - (line_peak_terrain + earth_curvature + fresnel_radius)`
 
 Interpretation:
 
@@ -136,14 +137,16 @@ Tower radial coverage is now an explicit runtime calculation, not an automatic r
 - Standalone compute entrypoint: `mesh_calculator/network/tower_coverage.py`
   - `CoverageSource(source_id, h3_index, lat, lon)`
   - `compute_h3_tower_coverage(...)`
-- Runtime tower coverage now uses a strict terrain-shadow model:
+- Runtime tower coverage uses a strict terrain-shadow model:
   - hard geometric LOS (`clearance >= 0`) from tower top to coverage receiver height
   - no diffraction-based pass-through for blocked cells
   - FSPL-only budget check after LOS passes
+- Terrain blocking is evaluated conservatively at line-peak elevation (max terrain on the RF line).
 - Coverage receiver endpoint height is controlled by `coverage_receiver_height_m` (default `1.5 m`), while source endpoint uses `mast_height_m`.
-- Output is covered cells only, including the source H3 cell with:
+- Output includes **all cells in radius** (covered and uncovered), including source H3 cell with:
   - `distance_m = 0.0`
   - `path_loss_db = 0.0`
+- Uncovered cells are returned with `is_covered=false` and serving metrics set to `null`.
 - Source attribution is RF-serving based:
   - `serving_tower_id`: strongest received signal (minimum path loss)
   - `closest_tower_id`: nearest visible source (debug/backward compatibility)

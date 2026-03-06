@@ -82,7 +82,9 @@ class TestTowerCoverageRuntime(unittest.TestCase):
             elevation_provider=None,
         )
         by_h3 = {r["h3_index"]: r for r in results}
-        self.assertNotIn(neighbor_h3, by_h3)
+        self.assertIn(neighbor_h3, by_h3)
+        self.assertFalse(by_h3[neighbor_h3]["is_covered"])
+        self.assertIsNone(by_h3[neighbor_h3]["path_loss_db"])
 
     @patch("mesh_calculator.network.tower_coverage._compute_shadow_link")
     def test_serving_tower_uses_strongest_link(self, mock_shadow_link):
