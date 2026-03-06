@@ -27,6 +27,12 @@ def export_towers_geojson(surface: MeshSurface, output_path: str):
 
     for tower in surface.towers.values():
         meta = tower.placement_meta or {}
+        tower_cell = surface.cells.get(tower.h3_index)
+        antenna_offset_m = (
+            float(getattr(tower_cell, 'antenna_height_offset_m', 0.0) or 0.0)
+            if tower_cell is not None
+            else 0.0
+        )
         feature = {
             'type': 'Feature',
             'geometry': {
@@ -43,6 +49,7 @@ def export_towers_geojson(surface: MeshSurface, output_path: str):
                 'coverage_radius_m': getattr(tower, 'coverage_radius_m', 0.0),
                 'lat': tower.lat,
                 'lon': tower.lon,
+                'antenna_height_m': surface.config.mast_height_m + antenna_offset_m,
                 'algorithm': meta.get(
                     'algorithm',
                     'site' if tower.source == 'site' else None,
@@ -251,6 +258,14 @@ def export_visibility_edges_geojson(surface: MeshSurface, output_path: str):
     for t1_id, t2_id, data in surface.visibility_graph.graph.edges(data=True):
         t1 = surface.towers[t1_id]
         t2 = surface.towers[t2_id]
+        c1 = surface.cells.get(t1.h3_index)
+        c2 = surface.cells.get(t2.h3_index)
+        h1 = surface.config.mast_height_m + float(
+            getattr(c1, 'antenna_height_offset_m', 0.0) or 0.0
+        )
+        h2 = surface.config.mast_height_m + float(
+            getattr(c2, 'antenna_height_offset_m', 0.0) or 0.0
+        )
         clearance_m = data.get('clearance_m')
         is_nlos = (clearance_m is not None and clearance_m < 0)
         los_state = 'nlos' if is_nlos else 'los'
@@ -276,6 +291,8 @@ def export_visibility_edges_geojson(surface: MeshSurface, output_path: str):
                 'clearance_m': clearance_m,
                 'path_loss_db': data.get('path_loss_db'),
                 'mast_height_m': surface.config.mast_height_m,
+                'source_antenna_height_m': h1,
+                'target_antenna_height_m': h2,
                 'link_type': _link_type(t1, t2),
                 'is_nlos': is_nlos,
                 'los_state': los_state,

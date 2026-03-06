@@ -112,8 +112,8 @@ class RouteSpec:
 
     route_id: str
     features: list  # GeoJSON feature dicts for this route
-    site1: dict     # {name, lat, lon}
-    site2: dict     # {name, lat, lon}
+    site1: dict     # {name, lat, lon, site_height_m?}
+    site2: dict     # {name, lat, lon, site_height_m?}
     max_towers_per_route: int = 10  # per-route tower limit
 
 

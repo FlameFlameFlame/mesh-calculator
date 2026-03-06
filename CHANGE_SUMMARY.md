@@ -37,3 +37,4 @@
 - 2026-03-06: Replaced runtime tower-coverage acceptance with strict terrain shadow casting in `network/tower_coverage.py` (hard geometric LOS + FSPL-only budget; blocked cells no longer pass via diffraction policy).
 - 2026-03-06: Added `MeshConfig.coverage_receiver_height_m` (default `1.5`) and applied it to coverage endpoint height, while keeping `mast_height_m` for source towers.
 - 2026-03-06: Updated tower-coverage runtime tests to validate new shadow-casting semantics and strongest-serving source selection under the new link evaluator.
+- 2026-03-06: Added per-site endpoint height support (`site_height_m`) through route anchors and hierarchical site towers via `H3Cell.antenna_height_offset_m`; LOS/Fresnel/cache now use per-endpoint effective heights, and exports now include effective tower/edge endpoint antenna heights.

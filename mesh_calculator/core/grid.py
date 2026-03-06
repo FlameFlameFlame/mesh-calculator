@@ -63,6 +63,7 @@ class H3Cell:
     closest_tower_id: Optional[int] = None
     received_power_dbm: Optional[float] = None   # Computed link budget result
     is_covered: bool = False                      # received_power >= sensitivity AND LOS
+    antenna_height_offset_m: float = 0.0         # Additional endpoint AGL height above global mast
 
 
 def load_boundary(boundary_path: str) -> Polygon:

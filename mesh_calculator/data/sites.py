@@ -21,12 +21,14 @@ class Site:
         lat, lon: Site coordinates
         priority: Priority level (1 = highest priority)
         h3_index: H3 cell index (computed)
+        site_height_m: Additional endpoint antenna height above mast (AGL meters)
     """
     name: str
     lat: float
     lon: float
     priority: int
     h3_index: str = None
+    site_height_m: float = 0.0
 
 
 def load_sites(sites_path: str, h3_resolution: int) -> List[Site]:
@@ -60,6 +62,7 @@ def load_sites(sites_path: str, h3_resolution: int) -> List[Site]:
         # Extract properties
         name = props.get('name', f'Site_{len(sites)+1}')
         priority = int(props.get('priority', 999))
+        site_height_m = float(props.get('site_height_m', 0.0) or 0.0)
 
         # Convert to H3
         h3_index = h3.latlng_to_cell(lat, lon, h3_resolution)
@@ -69,7 +72,8 @@ def load_sites(sites_path: str, h3_resolution: int) -> List[Site]:
             lat=lat,
             lon=lon,
             priority=priority,
-            h3_index=h3_index
+            h3_index=h3_index,
+            site_height_m=site_height_m,
         )
 
         sites.append(site)

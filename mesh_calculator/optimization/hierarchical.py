@@ -51,6 +51,10 @@ def connect_sites_by_priority(
     # Place a tower at every site location (guarantees infrastructure)
     for site in sites:
         if site.h3_index in surface.cells:
+            cell = surface.cells[site.h3_index]
+            prev = float(getattr(cell, 'antenna_height_offset_m', 0.0) or 0.0)
+            site_offset = max(0.0, float(getattr(site, 'site_height_m', 0.0) or 0.0))
+            cell.antenna_height_offset_m = max(prev, site_offset)
             surface.place_tower(site.h3_index, source='site')
             logger.info("Placed site tower", site=site.name, h3=site.h3_index)
         else:

@@ -425,6 +425,26 @@ def run_route_pipeline(
             pt = Point(site['lon'], site['lat'])
             return any(pt.within(p) for p in city_polys)
 
+        def _site_height_m(site: dict) -> float:
+            try:
+                return max(0.0, float(site.get('site_height_m', 0.0) or 0.0))
+            except (TypeError, ValueError):
+                return 0.0
+
+        def _apply_site_offset(cell_h3: str, site_height_m: float, site_name: str) -> None:
+            cell = surface.cells.get(cell_h3)
+            if cell is None:
+                return
+            prev = float(getattr(cell, 'antenna_height_offset_m', 0.0) or 0.0)
+            cell.antenna_height_offset_m = max(prev, site_height_m)
+            if cell.antenna_height_offset_m > prev:
+                logger.info(
+                    "Updated anchor antenna offset",
+                    h3_index=cell_h3,
+                    site=site_name,
+                    antenna_height_offset_m=cell.antenna_height_offset_m,
+                )
+
         # entry1_h3 corresponds to site1 end, entry2_h3 to site2 end
         for site, entry_h3 in [
             (route.site1, entry1_h3),
@@ -433,17 +453,33 @@ def run_route_pipeline(
             if not site or 'lat' not in site:
                 continue
 
+            endpoint_site_height_m = _site_height_m(site)
+
             if _site_is_city(site):
                 # City site: anchor at boundary entry cell (one per road entry)
                 if entry_h3 is None or entry_h3 not in surface.cells:
                     continue
                 neighbors_1ring = h3.grid_disk(entry_h3, 1)
-                if any(nb in surface.tower_by_h3 for nb in neighbors_1ring):
+                existing_anchor_h3 = next(
+                    (nb for nb in neighbors_1ring if nb in surface.tower_by_h3),
+                    None,
+                )
+                if existing_anchor_h3 is not None:
+                    _apply_site_offset(
+                        existing_anchor_h3,
+                        endpoint_site_height_m,
+                        site.get('name', ''),
+                    )
                     logger.info(
                         "Skipping city-boundary anchor at %s — nearby tower exists",
                         entry_h3,
                     )
                     continue
+                _apply_site_offset(
+                    entry_h3,
+                    endpoint_site_height_m,
+                    site.get('name', ''),
+                )
                 surface.place_tower(entry_h3, source='site')
                 logger.info(
                     "Placed city-boundary anchor at %s (%s)",
@@ -455,6 +491,11 @@ def run_route_pipeline(
                     site['lat'], site['lon'], mesh_config.h3_resolution
                 )
                 if site_h3 in surface.tower_by_h3:
+                    _apply_site_offset(
+                        site_h3,
+                        endpoint_site_height_m,
+                        site.get('name', ''),
+                    )
                     continue
                 if site_h3 not in surface.cells:
                     lat, lon = h3.cell_to_latlng(site_h3)
@@ -463,6 +504,11 @@ def run_route_pipeline(
                         h3_index=site_h3, lat=lat, lon=lon,
                         elevation=elev, has_road=False, is_in_boundary=False,
                     )
+                _apply_site_offset(
+                    site_h3,
+                    endpoint_site_height_m,
+                    site.get('name', ''),
+                )
                 surface.place_tower(site_h3, source='site')
                 logger.info(
                     "Placed non-city site anchor at %s (%s)",
