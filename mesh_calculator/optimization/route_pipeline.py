@@ -439,10 +439,10 @@ def run_route_pipeline(
             cell.antenna_height_offset_m = max(prev, site_height_m)
             if cell.antenna_height_offset_m > prev:
                 logger.info(
-                    "Updated anchor antenna offset",
-                    h3_index=cell_h3,
-                    site=site_name,
-                    antenna_height_offset_m=cell.antenna_height_offset_m,
+                    "Updated anchor antenna offset at %s for %s: %.2f m",
+                    cell_h3,
+                    site_name,
+                    cell.antenna_height_offset_m,
                 )
 
         # entry1_h3 corresponds to site1 end, entry2_h3 to site2 end

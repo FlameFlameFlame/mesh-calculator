@@ -38,3 +38,4 @@
 - 2026-03-06: Added `MeshConfig.coverage_receiver_height_m` (default `1.5`) and applied it to coverage endpoint height, while keeping `mast_height_m` for source towers.
 - 2026-03-06: Updated tower-coverage runtime tests to validate new shadow-casting semantics and strongest-serving source selection under the new link evaluator.
 - 2026-03-06: Added per-site endpoint height support (`site_height_m`) through route anchors and hierarchical site towers via `H3Cell.antenna_height_offset_m`; LOS/Fresnel/cache now use per-endpoint effective heights, and exports now include effective tower/edge endpoint antenna heights.
+- 2026-03-06: Fixed route optimization crash caused by structured-style kwargs in standard logging (`logger.info(..., h3_index=...)`) during anchor offset updates; logging now uses positional formatting and no longer throws `Logger._log() got an unexpected keyword argument 'h3_index'`.
