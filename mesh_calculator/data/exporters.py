@@ -164,7 +164,11 @@ def export_tower_coverage_geojson(hex_results: list, output_path: str):
     )
 
 
-def export_grid_cells_geojson(cells: Dict, output_path: str):
+def export_grid_cells_geojson(
+    cells: Dict,
+    output_path: str,
+    effective_h3_resolution: int | None = None,
+):
     """
     Export H3 grid cells as GeoJSON polygons.
 
@@ -177,6 +181,10 @@ def export_grid_cells_geojson(cells: Dict, output_path: str):
         boundary = h3.cell_to_boundary(h3_idx)
         coords = [[lon, lat] for lat, lon in boundary]
         coords.append(coords[0])
+        try:
+            h3_resolution = int(h3.get_resolution(h3_idx))
+        except Exception:
+            h3_resolution = None
         features.append({
             'type': 'Feature',
             'geometry': {'type': 'Polygon', 'coordinates': [coords]},
@@ -185,6 +193,12 @@ def export_grid_cells_geojson(cells: Dict, output_path: str):
                 'elevation': cell.elevation,
                 'has_road': cell.has_road,
                 'is_in_unfit_area': cell.is_in_unfit_area,
+                'h3_resolution': h3_resolution,
+                'effective_h3_resolution': (
+                    int(effective_h3_resolution)
+                    if effective_h3_resolution is not None
+                    else h3_resolution
+                ),
             },
         })
 
@@ -224,6 +238,8 @@ def export_gap_repair_hexes_geojson(debug_hexes: list, output_path: str):
                 'repair_round': rec.get('repair_round'),
                 'search_radius_m': rec.get('search_radius_m'),
                 'search_ring': rec.get('search_ring'),
+                'search_scope': rec.get('search_scope'),
+                'step_idx': rec.get('step_idx'),
                 # Legacy compatibility
                 'gap_idx': rec.get('gap_idx', rec.get('segment_idx')),
                 'buffer_ring': rec.get('buffer_ring', rec.get('search_ring')),

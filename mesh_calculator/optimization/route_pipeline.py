@@ -721,12 +721,20 @@ def run_route_pipeline(
     export_towers_geojson(surface, towers_path)
     export_coverage_geojson(surface, coverage_path)
     export_visibility_edges_geojson(surface, edges_path)
-    export_grid_cells_geojson(surface.cells, grid_cells_path)
+    export_grid_cells_geojson(
+        surface.cells,
+        grid_cells_path,
+        effective_h3_resolution=effective_h3_resolution,
+    )
     if mesh_config.export_full_grid_cells and boundary_geojson:
         boundary_poly = _boundary_polygon_from_geojson(boundary_geojson)
         if boundary_poly is not None:
             full_grid_cells = generate_full_grid(boundary_poly, elevation_provider, mesh_config)
-            export_grid_cells_geojson(full_grid_cells, grid_cells_full_path)
+            export_grid_cells_geojson(
+                full_grid_cells,
+                grid_cells_full_path,
+                effective_h3_resolution=effective_h3_resolution,
+            )
         else:
             logger.warning("Skipping full-grid export: boundary polygon not available")
     if surface.gap_repair_debug:
