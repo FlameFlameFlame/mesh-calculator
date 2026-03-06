@@ -856,7 +856,9 @@ def place_nodes_along_corridor(
         search_radius_m: float,
         attempt_id: int,
         phase_label: str,
-    ) -> tuple[List[str], Dict[str, dict], List[str], Dict[str, int], int]:
+        run_gap_repair: bool = False,
+        gap_repair_base_radius_m: Optional[float] = None,
+    ) -> tuple[List[str], Dict[str, dict], List[str], Dict[str, int], int, int]:
         working_corridor = list(corridor)
         injected_buffer, all_candidate_cells, selected_buffer_cells = (
             _inject_buffer_candidates(working_corridor, search_radius_m)
@@ -996,38 +998,46 @@ def place_nodes_along_corridor(
                     all_nodes.append(n)
 
         if strategy != 'greedy':
-            repair_ladder = _normalize_radii(
-                config.gap_repair_search_radius_ladder_m,
-                default_value=search_radius_m,
-            )
-            for repair_round in range(1, config.gap_repair_rounds + 1):
-                broken = _find_broken_gaps(all_nodes, surface, cache)
-                if not broken:
-                    break
-                repair_radius = repair_ladder[min(repair_round - 1, len(repair_ladder) - 1)]
-                repair_ring = _radius_to_ring_m(config, repair_radius, minimum=1)
-                logger.info(
-                    "Gap repair round %d/%d: %d broken pair(s), ring=%d, radius_m=%.0f",
-                    repair_round, config.gap_repair_rounds, len(broken),
-                    repair_ring, repair_radius,
+            if run_gap_repair and config.gap_repair_rounds > 0:
+                repair_ladder = _normalize_radii(
+                    config.gap_repair_search_radius_ladder_m,
+                    default_value=0.0,
                 )
-                all_nodes = _repair_broken_gaps(
-                    all_nodes, working_corridor, corridor_pos,
-                    search_radius_m=repair_radius,
-                    repair_round=repair_round,
-                    attempt_id=attempt_id,
-                    surface=surface,
-                    cache=cache,
-                    user_budget=effective_budget - 2,
-                    node_meta=node_meta,
+                repair_base_radius = (
+                    float(gap_repair_base_radius_m)
+                    if gap_repair_base_radius_m is not None
+                    else float(search_radius_m)
                 )
+                repair_base_radius = max(0.0, repair_base_radius)
+                for repair_round in range(1, config.gap_repair_rounds + 1):
+                    broken = _find_broken_gaps(all_nodes, surface, cache)
+                    if not broken:
+                        break
+                    repair_delta = repair_ladder[min(repair_round - 1, len(repair_ladder) - 1)]
+                    repair_radius = repair_base_radius + repair_delta
+                    repair_ring = _radius_to_ring_m(config, repair_radius, minimum=1)
+                    logger.info(
+                        "Gap repair round %d/%d: %d broken pair(s), ring=%d, radius_m=%.0f",
+                        repair_round, config.gap_repair_rounds, len(broken),
+                        repair_ring, repair_radius,
+                    )
+                    all_nodes = _repair_broken_gaps(
+                        all_nodes, working_corridor, corridor_pos,
+                        search_radius_m=repair_radius,
+                        repair_round=repair_round,
+                        attempt_id=attempt_id,
+                        surface=surface,
+                        cache=cache,
+                        user_budget=effective_budget - 2,
+                        node_meta=node_meta,
+                    )
             pre_fill_count = len(all_nodes)
             all_nodes = _fill_visibility_gaps(all_nodes, working_corridor, config.max_visibility_m)
             if len(all_nodes) > pre_fill_count:
                 logger.debug("After gap-fill", count=len(all_nodes))
 
         broken_after = len(_find_broken_gaps(all_nodes, surface, cache))
-        return all_nodes, node_meta, working_corridor, corridor_pos, broken_after
+        return all_nodes, node_meta, working_corridor, corridor_pos, broken_after, effective_budget
 
     def _prune_unreachable_endpoint_fallback_nodes(
         nodes: List[str],
@@ -1084,11 +1094,14 @@ def place_nodes_along_corridor(
                 return nodes, meta, max(len(_find_broken_gaps(nodes, surface, cache)), 0)
 
     initial_search_radius_m = _effective_initial_search_radius_m(config)
-    selected_nodes, selected_meta, _, _, broken_count = _run_attempt(
+    selected_nodes, selected_meta, selected_working_corridor, selected_corridor_pos, broken_count, selected_budget = _run_attempt(
         search_radius_m=initial_search_radius_m,
         attempt_id=0,
         phase_label='initial',
+        run_gap_repair=False,
     )
+    selected_search_radius_m = initial_search_radius_m
+    selected_attempt_id = 0
 
     if strategy != 'greedy' and broken_count > 0:
         fallback_ladder = _normalize_radii(
@@ -1099,16 +1112,42 @@ def place_nodes_along_corridor(
         for fallback_radius_m in fallback_ladder:
             if fallback_radius_m <= initial_search_radius_m:
                 continue
-            nodes, meta, _, _, broken = _run_attempt(
+            (
+                nodes,
+                meta,
+                selected_working_corridor,
+                selected_corridor_pos,
+                broken,
+                selected_budget,
+            ) = _run_attempt(
                 search_radius_m=fallback_radius_m,
                 attempt_id=attempt_id,
                 phase_label='fallback_initial',
+                run_gap_repair=False,
             )
             selected_nodes, selected_meta = nodes, meta
+            selected_search_radius_m = fallback_radius_m
+            selected_attempt_id = attempt_id
             broken_count = broken
             if broken_count <= 0:
                 break
             attempt_id += 1
+
+        if broken_count > 0:
+            (
+                selected_nodes,
+                selected_meta,
+                selected_working_corridor,
+                selected_corridor_pos,
+                broken_count,
+                selected_budget,
+            ) = _run_attempt(
+                search_radius_m=selected_search_radius_m,
+                attempt_id=selected_attempt_id,
+                phase_label='fallback_initial' if selected_attempt_id > 0 else 'initial',
+                run_gap_repair=True,
+                gap_repair_base_radius_m=selected_search_radius_m,
+            )
 
         selected_nodes, selected_meta, broken_count = _prune_unreachable_endpoint_fallback_nodes(
             selected_nodes,
