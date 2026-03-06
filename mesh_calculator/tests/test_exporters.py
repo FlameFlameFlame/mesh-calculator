@@ -11,6 +11,7 @@ from ..core.grid import H3Cell
 from ..core.config import MeshConfig
 from ..data.exporters import (
     export_gap_repair_hexes_geojson,
+    export_grid_cells_geojson,
     export_visibility_edges_geojson,
 )
 
@@ -215,6 +216,8 @@ class TestExportGapRepairHexes(unittest.TestCase):
             "repair_round": 2,
             "search_radius_m": 600.0,
             "search_ring": 2,
+            "search_scope": "gap_repair_subcorridor",
+            "step_idx": None,
         }]
         with tempfile.NamedTemporaryFile(suffix=".geojson", delete=False) as f:
             path = f.name
@@ -229,5 +232,25 @@ class TestExportGapRepairHexes(unittest.TestCase):
             self.assertEqual(props["segment_idx"], 3)
             self.assertEqual(props["search_radius_m"], 600.0)
             self.assertEqual(props["search_ring"], 2)
+            self.assertEqual(props["search_scope"], "gap_repair_subcorridor")
+            self.assertIsNone(props["step_idx"])
+        finally:
+            os.unlink(path)
+
+
+class TestExportGridCells(unittest.TestCase):
+    def test_grid_resolution_metadata_export(self):
+        cells = {
+            "8828c00001fffff": H3Cell("8828c00001fffff", 40.0, 44.0, 500.0, has_road=True),
+        }
+        with tempfile.NamedTemporaryFile(suffix=".geojson", delete=False) as f:
+            path = f.name
+        try:
+            export_grid_cells_geojson(cells, path, effective_h3_resolution=9)
+            with open(path) as f:
+                data = json.load(f)
+            props = data["features"][0]["properties"]
+            self.assertEqual(props["h3_resolution"], 8)
+            self.assertEqual(props["effective_h3_resolution"], 9)
         finally:
             os.unlink(path)

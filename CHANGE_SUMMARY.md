@@ -53,3 +53,6 @@
 - 2026-03-07: Added edge endpoint terrain fields to `visibility_edges.geojson` (`source_elevation_m`, `target_elevation_m`) so downstream profile rendering can use the same cell-max endpoint elevations as LOS optimization.
 - 2026-03-07: Added explicit edge-decision debug metadata at visibility-edge creation time (`edge_origin`, policy mode, budget/path-loss margin, clearance threshold/margin, acceptance booleans) for both global visibility checks and corridor-chain wiring.
 - 2026-03-07: Exported source/target placement algorithms on edges (`source_algorithm`, `target_algorithm`) to explain why links appear in final graph.
+- 2026-03-07: Expanded search-debug capture in corridor placement with `search_scope` and `step_idx`, including full DP initial/fallback buffer candidate sets, selected injected cells, gap-repair subcorridor scope, and greedy per-step candidate scopes.
+- 2026-03-07: Extended `gap_repair_hexes.geojson` export schema additively with `search_scope` and `step_idx` while preserving legacy fields.
+- 2026-03-07: Added `h3_resolution` and `effective_h3_resolution` metadata to `grid_cells.geojson` and `grid_cells_full.geojson` exports, and passed run effective resolution from route pipeline exports.

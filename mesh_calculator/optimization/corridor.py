@@ -53,6 +53,8 @@ def _append_search_debug_records(
     repair_round: Optional[int],
     search_radius_m: float,
     search_ring: int,
+    search_scope: Optional[str] = None,
+    step_idx: Optional[int] = None,
 ) -> None:
     for h3_idx in h3_indices:
         surface.gap_repair_debug.append({
@@ -64,6 +66,8 @@ def _append_search_debug_records(
             'repair_round': repair_round,
             'search_radius_m': search_radius_m,
             'search_ring': search_ring,
+            'search_scope': search_scope,
+            'step_idx': step_idx,
             # Legacy keys kept for compatibility with existing layer tooltips.
             'gap_idx': segment_idx,
             'buffer_ring': search_ring,
@@ -495,6 +499,7 @@ def _repair_broken_gaps(
             repair_round=repair_round,
             search_radius_m=search_radius_m,
             search_ring=new_ring,
+            search_scope='gap_repair_subcorridor',
         )
         # Budget for this gap: remaining interior slots after already-placed towers.
         # chain includes both endpoints, so interior count = len(chain) - 2.
@@ -637,6 +642,7 @@ def _greedy_place_towers(
     chain = [corridor[0]]
     current = corridor[0]
     current_road_j = 0
+    step_idx = 0
 
     def _try_append_endpoint_if_reachable() -> None:
         """Append corridor endpoint only if directly reachable from current tail."""
@@ -702,6 +708,8 @@ def _greedy_place_towers(
             repair_round=None,
             search_radius_m=effective_radius_m,
             search_ring=buffer_ring,
+            search_scope='greedy_step_candidates',
+            step_idx=step_idx,
         )
 
         # Build (src, dst) pairs within visibility range
@@ -746,6 +754,7 @@ def _greedy_place_towers(
             out_meta[best_dst] = {'algorithm': 'greedy', 'dp_steps': None, 'repair_round': None}
         current = best_dst
         current_road_j = best_j
+        step_idx += 1
 
     return chain
 
@@ -807,11 +816,11 @@ def place_nodes_along_corridor(
     def _inject_buffer_candidates(
         working_corridor: List[str],
         search_radius_m: float,
-    ) -> int:
+    ) -> tuple[int, List[str], List[str]]:
         corridor_set = set(working_corridor)
         search_ring = _radius_to_ring_m(config, search_radius_m, minimum=0)
         if search_ring <= 0:
-            return 0
+            return 0, [], []
         candidate_buffer_cells = []
         for road_h3 in list(corridor_set):
             try:
@@ -821,6 +830,7 @@ def place_nodes_along_corridor(
             for nb in neighbors:
                 if nb not in corridor_set and nb in cells and not cells[nb].has_road:
                     candidate_buffer_cells.append(nb)
+        all_candidate_cells = sorted(set(candidate_buffer_cells))
         best_by_road: dict = {}
         for nb in candidate_buffer_cells:
             closest = min(corridor_set, key=lambda r: h3_distance(nb, r))
@@ -828,6 +838,7 @@ def place_nodes_along_corridor(
             if closest not in best_by_road or elev > best_by_road[closest][1]:
                 best_by_road[closest] = (nb, elev)
         injected = 0
+        selected_buffer_cells: List[str] = []
         for road_h3, (nb, _elev) in best_by_road.items():
             if nb in corridor_set:
                 continue
@@ -837,8 +848,9 @@ def place_nodes_along_corridor(
                 continue
             working_corridor.insert(pos + 1, nb)
             corridor_set.add(nb)
+            selected_buffer_cells.append(nb)
             injected += 1
-        return injected
+        return injected, all_candidate_cells, sorted(set(selected_buffer_cells))
 
     def _run_attempt(
         search_radius_m: float,
@@ -846,10 +858,40 @@ def place_nodes_along_corridor(
         phase_label: str,
     ) -> tuple[List[str], Dict[str, dict], List[str], Dict[str, int], int]:
         working_corridor = list(corridor)
-        injected_buffer = _inject_buffer_candidates(working_corridor, search_radius_m)
+        injected_buffer, all_candidate_cells, selected_buffer_cells = (
+            _inject_buffer_candidates(working_corridor, search_radius_m)
+        )
         if injected_buffer:
             logger.info(
                 "Injected %d buffer cells as corridor candidates", injected_buffer
+            )
+        scope_prefix = 'fallback' if phase_label == 'fallback_initial' else 'initial'
+        initial_ring = _radius_to_ring_m(config, search_radius_m, minimum=0)
+        if all_candidate_cells:
+            _append_search_debug_records(
+                surface=surface,
+                h3_indices=all_candidate_cells,
+                algorithm='greedy' if strategy == 'greedy' else 'dp',
+                phase=phase_label,
+                attempt_id=attempt_id,
+                segment_idx=-1,
+                repair_round=None,
+                search_radius_m=search_radius_m,
+                search_ring=initial_ring,
+                search_scope=f'{scope_prefix}_buffer_candidate',
+            )
+        if selected_buffer_cells:
+            _append_search_debug_records(
+                surface=surface,
+                h3_indices=selected_buffer_cells,
+                algorithm='greedy' if strategy == 'greedy' else 'dp',
+                phase=phase_label,
+                attempt_id=attempt_id,
+                segment_idx=-1,
+                repair_round=None,
+                search_radius_m=search_radius_m,
+                search_ring=initial_ring,
+                search_scope=f'{scope_prefix}_buffer_selected',
             )
 
         corridor_pos: Dict[str, int] = {}
@@ -881,7 +923,6 @@ def place_nodes_along_corridor(
         seen: set = set()
         node_meta: Dict[str, dict] = {}
 
-        initial_ring = _radius_to_ring_m(config, search_radius_m, minimum=0)
         for bi in range(len(boundaries) - 1):
             seg_start = boundaries[bi]
             seg_end = boundaries[bi + 1]
@@ -897,6 +938,7 @@ def place_nodes_along_corridor(
                 repair_round=None,
                 search_radius_m=search_radius_m,
                 search_ring=initial_ring,
+                search_scope=f'{scope_prefix}_corridor',
             )
 
             seg_len = seg_end - seg_start
