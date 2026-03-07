@@ -279,6 +279,7 @@ class MeshSurface:
         self,
         cache: LOSCache = None,
         progress_callback: Optional[Callable[[int, int], None]] = None,
+        chunk_progress_callback: Optional[Callable[[int, int], None]] = None,
     ):
         """
         Update visibility edges between all towers.
@@ -289,6 +290,7 @@ class MeshSurface:
         Args:
             cache: Optional LOS cache
             progress_callback: Optional callback(completed_pairs, total_pairs)
+            chunk_progress_callback: Optional callback(completed_chunks, total_chunks)
         """
         tower_list = list(self.towers.values())
         n = len(tower_list)
@@ -329,6 +331,11 @@ class MeshSurface:
                 progress_callback(0, total_pairs)
             except Exception:
                 logger.debug("Visibility progress callback failed", exc_info=True)
+        if chunk_progress_callback is not None:
+            try:
+                chunk_progress_callback(0, 0)
+            except Exception:
+                logger.debug("Visibility chunk progress callback failed", exc_info=True)
         los_diag: dict = {}
         if progress_callback is None:
             los_results = compute_los_batch(
@@ -352,6 +359,7 @@ class MeshSurface:
                 compute_fn=compute_los,
                 diagnostics=los_diag,
                 progress_callback=progress_callback,
+                chunk_progress_callback=chunk_progress_callback,
             )
         self.record_los_batch_diagnostics(los_diag)
         for i, j in candidate_pairs:

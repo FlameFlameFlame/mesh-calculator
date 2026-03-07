@@ -242,6 +242,7 @@ def compute_los_batch_progress(
     diagnostics: Dict[str, Any] | None = None,
     strict_failures: bool = False,
     progress_callback=None,
+    chunk_progress_callback=None,
 ) -> Dict[Tuple[str, str], LOSResult]:
     """
     Compute LOS for multiple cell pairs with progress reporting.
@@ -255,6 +256,7 @@ def compute_los_batch_progress(
         progress_interval: Report progress every N completions
         elevation_provider: Optional elevation provider for off-grid cells
         progress_callback: Optional callback(completed, total) for live progress
+        chunk_progress_callback: Optional callback(completed_chunks, total_chunks)
 
     Returns:
         Dictionary mapping (h3_src, h3_dst) to LOSResult
@@ -281,6 +283,7 @@ def compute_los_batch_progress(
     chunk_failures = 0
     chunk_count = 1
     batch_size = len(unique_pairs)
+    completed_chunks = 0
 
     def _emit_batch_progress() -> None:
         if progress_callback is None:
@@ -290,9 +293,19 @@ def compute_los_batch_progress(
         except Exception:
             logger.debug("LOS progress callback failed", exc_info=True)
 
+    def _emit_chunk_progress() -> None:
+        if chunk_progress_callback is None:
+            return
+        try:
+            chunk_progress_callback(int(completed_chunks), int(chunk_count))
+        except Exception:
+            logger.debug("LOS chunk progress callback failed", exc_info=True)
+
     _emit_batch_progress()
+    _emit_chunk_progress()
 
     if len(unique_pairs) < max(1, int(min_pairs_for_parallel)) or max_workers <= 1:
+        completed_chunks = 1
         for h3_src, h3_dst in unique_pairs:
             completed += 1
             try:
@@ -310,6 +323,7 @@ def compute_los_batch_progress(
                     round(100 * completed / len(unique_pairs), 1),
                 )
                 _emit_batch_progress()
+        _emit_chunk_progress()
     else:
         batch_size = max(32, len(unique_pairs) // max(max_workers * 8, 1))
         pair_batches = [
@@ -317,6 +331,8 @@ def compute_los_batch_progress(
             for i in range(0, len(unique_pairs), batch_size)
         ]
         chunk_count = len(pair_batches)
+        completed_chunks = 0
+        _emit_chunk_progress()
         ordered_batches: list[Dict[Tuple[str, str], LOSResult] | None] = [None] * len(pair_batches)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
@@ -356,6 +372,8 @@ def compute_los_batch_progress(
                 except Exception as e:
                     chunk_failures += 1
                     logger.warning("LOS chunk failed: chunk=%d error=%s", idx, str(e))
+                completed_chunks += 1
+                _emit_chunk_progress()
                 if completed % progress_interval == 0:
                     logger.debug(
                         "LOS progress: completed=%d total=%d pct=%.1f",
@@ -370,6 +388,7 @@ def compute_los_batch_progress(
 
     completed = len(unique_pairs)
     _emit_batch_progress()
+    _emit_chunk_progress()
 
     if strict_failures and failure_details:
         sample_pair, sample_error = failure_details[0]

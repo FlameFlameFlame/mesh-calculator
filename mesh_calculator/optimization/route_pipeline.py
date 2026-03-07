@@ -236,6 +236,7 @@ def run_route_pipeline(
         route_index: Optional[int] = None,
         route_id: Optional[str] = None,
         route_label: Optional[str] = None,
+        **extra_fields,
     ) -> None:
         if progress_callback is None:
             return
@@ -248,6 +249,8 @@ def run_route_pipeline(
             'route_id': route_id,
             'route_label': route_label,
         }
+        if extra_fields:
+            payload.update(extra_fields)
         try:
             progress_callback(payload)
         except Exception:
@@ -727,19 +730,44 @@ def run_route_pipeline(
         )
 
     # Compute visibility edges between all towers
+    visibility_chunk_state = {'completed': 0, 'total': 0}
+
     def _emit_visibility_progress(completed: int, total: int) -> None:
         denom = total if total > 0 else 1
         frac = max(0.0, min(1.0, float(completed) / float(denom)))
         pct = visibility_start_percent + (visibility_end_percent - visibility_start_percent) * frac
+        chunk_completed = int(visibility_chunk_state.get('completed', 0))
+        chunk_total = int(visibility_chunk_state.get('total', 0))
+        chunk_suffix = f", chunks {chunk_completed}/{chunk_total}" if chunk_total > 0 else ""
         _emit_progress(
             'visibility',
-            f'Computing visibility links ({completed}/{total})',
+            f'Computing visibility links ({completed}/{total}{chunk_suffix})',
             pct,
+            los_pairs_completed=int(completed),
+            los_pairs_total=int(total),
+            chunks_completed=chunk_completed,
+            chunks_total=chunk_total,
         )
+
+    def _emit_visibility_chunk_progress(completed_chunks: int, total_chunks: int) -> None:
+        visibility_chunk_state['completed'] = max(0, int(completed_chunks))
+        visibility_chunk_state['total'] = max(0, int(total_chunks))
 
     _emit_progress('visibility', 'Computing visibility links (0/0)', visibility_start_percent)
     logger.info("Computing visibility edges for %d tower(s)...", len(surface.towers))
-    surface.update_visibility_edges(los_cache, progress_callback=_emit_visibility_progress)
+    try:
+        surface.update_visibility_edges(
+            los_cache,
+            progress_callback=_emit_visibility_progress,
+            chunk_progress_callback=_emit_visibility_chunk_progress,
+        )
+    except TypeError:
+        # Backward-compatible path for tests/patches that still monkeypatch the
+        # old two-argument signature.
+        surface.update_visibility_edges(
+            los_cache,
+            progress_callback=_emit_visibility_progress,
+        )
     _emit_progress('visibility', 'Visibility links computed', visibility_end_percent)
 
     # Tag city links
