@@ -3,7 +3,7 @@ Route-based tower placement pipeline.
 
 Processes user-chosen routes sequentially, placing towers on each corridor
 while reusing towers from previously processed routes. Computes visibility
-edges, road-cell coverage, and optionally tags city links.
+edges and optionally tags city links.
 """
 import json
 import logging
@@ -17,7 +17,6 @@ from ..core.config import MeshConfig, RouteSpec
 from ..core.grid_provider import GridProvider
 from ..data.cache import LOSCache
 from ..data.exporters import (
-    export_coverage_geojson,
     export_gap_repair_hexes_geojson,
     export_grid_cells_geojson,
     export_towers_geojson,
@@ -194,8 +193,7 @@ def run_route_pipeline(
 
     After all routes are processed:
     - Visibility edges are computed between all towers (with path loss).
-    - Per-cell coverage metrics are computed (path loss per hex).
-    - Optionally, towers are tagged with city_link if ≥20% coverage in a city.
+    - Optionally, towers are tagged with city_link based on boundary heuristics.
     - Results are exported to output_dir.
 
     Args:
@@ -215,6 +213,8 @@ def run_route_pipeline(
     """
     total_routes = len(routes)
     route_weight = (80.0 / total_routes) if total_routes > 0 else 0.0
+    visibility_start_percent = 80.0
+    visibility_end_percent = 96.0
     has_city_phase = bool(
         city_boundaries_geojson
         and city_boundaries_geojson.get('features')
@@ -705,16 +705,20 @@ def run_route_pipeline(
         )
 
     # Compute visibility edges between all towers
-    _emit_progress('visibility', 'Computing visibility edges', 80.0)
-    logger.info("Computing visibility edges for %d tower(s)...", len(surface.towers))
-    surface.update_visibility_edges(los_cache)
-    _emit_progress('visibility', 'Visibility edges computed', 88.0)
+    def _emit_visibility_progress(completed: int, total: int) -> None:
+        denom = total if total > 0 else 1
+        frac = max(0.0, min(1.0, float(completed) / float(denom)))
+        pct = visibility_start_percent + (visibility_end_percent - visibility_start_percent) * frac
+        _emit_progress(
+            'visibility',
+            f'Computing visibility links ({completed}/{total})',
+            pct,
+        )
 
-    # Compute per-cell coverage (path loss per hex)
-    _emit_progress('coverage', 'Computing road-cell coverage', 88.0)
-    logger.info("Computing cell coverage...")
-    surface.compute_cell_coverage(los_cache)
-    _emit_progress('coverage', 'Coverage computed', 96.0)
+    _emit_progress('visibility', 'Computing visibility links (0/0)', visibility_start_percent)
+    logger.info("Computing visibility edges for %d tower(s)...", len(surface.towers))
+    surface.update_visibility_edges(los_cache, progress_callback=_emit_visibility_progress)
+    _emit_progress('visibility', 'Visibility links computed', visibility_end_percent)
 
     # Tag city links
     if city_boundaries_geojson:
@@ -725,7 +729,6 @@ def run_route_pipeline(
     # Export results
     _emit_progress('export', 'Exporting outputs and report', export_start_percent)
     towers_path = os.path.join(output_dir, 'towers.geojson')
-    coverage_path = os.path.join(output_dir, 'coverage.geojson')
     edges_path = os.path.join(output_dir, 'visibility_edges.geojson')
     report_path = os.path.join(output_dir, 'report.json')
     grid_cells_path = os.path.join(output_dir, 'grid_cells.geojson')
@@ -733,7 +736,6 @@ def run_route_pipeline(
     gap_repair_hexes_path = os.path.join(output_dir, 'gap_repair_hexes.geojson')
 
     export_towers_geojson(surface, towers_path)
-    export_coverage_geojson(surface, coverage_path)
     export_visibility_edges_geojson(surface, edges_path)
     export_grid_cells_geojson(
         surface.cells,

@@ -2,7 +2,7 @@
 Network graph representation for towers and visibility.
 """
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Set
+from typing import Callable, Dict, Optional, Set
 
 import networkx as nx
 import numpy as np
@@ -14,7 +14,7 @@ from ..core.grid import H3Cell
 from ..core.config import MeshConfig
 from ..data.cache import LOSCache
 from ..physics.los import compute_los
-from ..parallel.los_compute import compute_los_batch
+from ..parallel.los_compute import compute_los_batch, compute_los_batch_progress
 from .tower_coverage import CoverageSource, compute_h3_tower_coverage
 
 logger = structlog.get_logger(__name__)
@@ -275,7 +275,11 @@ class MeshSurface:
 
         return tower
 
-    def update_visibility_edges(self, cache: LOSCache = None):
+    def update_visibility_edges(
+        self,
+        cache: LOSCache = None,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+    ):
         """
         Update visibility edges between all towers.
 
@@ -284,6 +288,7 @@ class MeshSurface:
 
         Args:
             cache: Optional LOS cache
+            progress_callback: Optional callback(completed_pairs, total_pairs)
         """
         tower_list = list(self.towers.values())
         n = len(tower_list)
@@ -318,16 +323,36 @@ class MeshSurface:
             (tower_list[i].h3_index, tower_list[j].h3_index)
             for i, j in candidate_pairs
         ]
+        total_pairs = len(h3_pairs)
+        if progress_callback is not None:
+            try:
+                progress_callback(0, total_pairs)
+            except Exception:
+                logger.debug("Visibility progress callback failed", exc_info=True)
         los_diag: dict = {}
-        los_results = compute_los_batch(
-            h3_pairs,
-            self.cells,
-            self.config,
-            cache,
-            elevation_provider=self.elevation_provider,
-            compute_fn=compute_los,
-            diagnostics=los_diag,
-        )
+        if progress_callback is None:
+            los_results = compute_los_batch(
+                h3_pairs,
+                self.cells,
+                self.config,
+                cache,
+                elevation_provider=self.elevation_provider,
+                compute_fn=compute_los,
+                diagnostics=los_diag,
+            )
+        else:
+            progress_interval = max(1, total_pairs // 40) if total_pairs > 0 else 1
+            los_results = compute_los_batch_progress(
+                h3_pairs,
+                self.cells,
+                self.config,
+                cache,
+                progress_interval=progress_interval,
+                elevation_provider=self.elevation_provider,
+                compute_fn=compute_los,
+                diagnostics=los_diag,
+                progress_callback=progress_callback,
+            )
         self.record_los_batch_diagnostics(los_diag)
         for i, j in candidate_pairs:
             t1, t2 = tower_list[i], tower_list[j]

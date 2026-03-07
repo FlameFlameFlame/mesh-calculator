@@ -241,6 +241,7 @@ def compute_los_batch_progress(
     compute_fn=None,
     diagnostics: Dict[str, Any] | None = None,
     strict_failures: bool = False,
+    progress_callback=None,
 ) -> Dict[Tuple[str, str], LOSResult]:
     """
     Compute LOS for multiple cell pairs with progress reporting.
@@ -253,6 +254,7 @@ def compute_los_batch_progress(
         max_workers: Number of worker threads (default: CPU count)
         progress_interval: Report progress every N completions
         elevation_provider: Optional elevation provider for off-grid cells
+        progress_callback: Optional callback(completed, total) for live progress
 
     Returns:
         Dictionary mapping (h3_src, h3_dst) to LOSResult
@@ -280,14 +282,24 @@ def compute_los_batch_progress(
     chunk_count = 1
     batch_size = len(unique_pairs)
 
+    def _emit_batch_progress() -> None:
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(int(completed), int(len(unique_pairs)))
+        except Exception:
+            logger.debug("LOS progress callback failed", exc_info=True)
+
+    _emit_batch_progress()
+
     if len(unique_pairs) < max(1, int(min_pairs_for_parallel)) or max_workers <= 1:
         for h3_src, h3_dst in unique_pairs:
+            completed += 1
             try:
                 canonical_results[(h3_src, h3_dst)] = compute_fn(
                     h3_src, h3_dst, cells, config, cache,
                     elevation_provider=elevation_provider,
                 )
-                completed += 1
             except Exception as exc:
                 failure_details.append(((h3_src, h3_dst), str(exc)))
             if completed % progress_interval == 0:
@@ -297,6 +309,7 @@ def compute_los_batch_progress(
                     len(unique_pairs),
                     round(100 * completed / len(unique_pairs), 1),
                 )
+                _emit_batch_progress()
     else:
         batch_size = max(32, len(unique_pairs) // max(max_workers * 8, 1))
         pair_batches = [
@@ -323,7 +336,7 @@ def compute_los_batch_progress(
                 try:
                     batch_result, batch_failures = future.result()
                     ordered_batches[idx] = batch_result
-                    completed += len(batch_result)
+                    completed += len(batch_result) + len(batch_failures)
                     if batch_failures:
                         chunk_failures += 1
                         failure_details.extend(batch_failures)
@@ -350,9 +363,13 @@ def compute_los_batch_progress(
                         len(unique_pairs),
                         round(100 * completed / len(unique_pairs), 1),
                     )
+                    _emit_batch_progress()
         for batch_result in ordered_batches:
             if batch_result:
                 canonical_results.update(batch_result)
+
+    completed = len(unique_pairs)
+    _emit_batch_progress()
 
     if strict_failures and failure_details:
         sample_pair, sample_error = failure_details[0]

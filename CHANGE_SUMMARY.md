@@ -1,5 +1,7 @@
 # Change Summary
 
+- 2026-03-07: Added live LOS-link progress plumbing for visibility calculation: `compute_los_batch_progress(...)` now supports a callback, and `MeshSurface.update_visibility_edges(...)` reports completed/total link checks so route-pipeline progress can show real link-calculation advancement.
+- 2026-03-07: Removed road-cell coverage computation/export from route pipeline (`compute_cell_coverage` + `coverage.geojson`) so optimization now focuses on tower placement + visibility edges; runtime coverage remains in mesh-generator APIs.
 - 2026-03-07: Fixed adaptive buffer under-expansion in `GridProvider` radius queries by switching from pure center-distance checks to cell-footprint-aware distance (`center_distance <= radius + center_cell_radius + candidate_cell_radius`), so small positive buffers (e.g. 100m) include adjacent/touching cells.
 - 2026-03-07: Added regression test `test_adaptive_small_buffer_includes_touching_neighbors` in `tests/test_grid_provider.py` and verified full suite (`162 passed`).
 - 2026-03-07: Restored and completed parallelization diagnostics hardening: `compute_los_batch(...)` / `compute_los_batch_progress(...)` now collect per-pair failures, support optional strict-failure mode, and emit deterministic diagnostics payloads (`pairs_failed`, `chunk_failures`, timing/chunk stats) for reproducibility debugging.

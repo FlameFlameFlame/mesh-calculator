@@ -110,14 +110,16 @@ def _prepare_pipeline_monkeypatch(monkeypatch, captured: dict) -> None:
     monkeypatch.setattr(rp, "place_nodes_along_corridor", lambda *_a, **_k: [])
     monkeypatch.setattr(rp, "install_nodes", lambda *_a, **_k: None)
     monkeypatch.setattr(rp, "wire_corridor_edges", lambda *_a, **_k: None)
-    monkeypatch.setattr(rp.MeshSurface, "update_visibility_edges", lambda self, _cache: None)
-    monkeypatch.setattr(rp.MeshSurface, "compute_cell_coverage", lambda self, _cache: None)
+    monkeypatch.setattr(
+        rp.MeshSurface,
+        "update_visibility_edges",
+        lambda self, _cache, progress_callback=None: None,
+    )
 
     def _capture_surface(surface, _path):
         captured["surface"] = surface
 
     monkeypatch.setattr(rp, "export_towers_geojson", _capture_surface)
-    monkeypatch.setattr(rp, "export_coverage_geojson", lambda *_a, **_k: None)
     monkeypatch.setattr(rp, "export_visibility_edges_geojson", lambda *_a, **_k: None)
     monkeypatch.setattr(rp, "export_grid_cells_geojson", lambda *_a, **_k: None)
     monkeypatch.setattr(rp, "export_gap_repair_hexes_geojson", lambda *_a, **_k: None)
