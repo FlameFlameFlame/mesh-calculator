@@ -86,7 +86,7 @@ Dense verification behavior:
 
 Tower placement consumes `compute_los()` everywhere:
 
-- Corridor DP and greedy placement (`optimization/corridor.py`)
+- Corridor DP placement (`optimization/corridor.py`)
 - Gap repair rounds (`optimization/corridor.py`)
 - Edge wiring between placed towers (`wire_corridor_edges`)
 - Global visibility graph updates (`network/graph.py`)
