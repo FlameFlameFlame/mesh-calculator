@@ -116,11 +116,22 @@ def _dedupe_sources(sources: Iterable[CoverageSource]) -> list[CoverageSource]:
 def _normalize_sources_to_resolution(
     sources: Iterable[CoverageSource],
     resolution: int,
+    config: MeshConfig,
+    grid_provider=None,
 ) -> list[CoverageSource]:
-    """Snap all sources to the requested coverage H3 resolution."""
+    """Snap all sources to coverage grid (adaptive when provider supports it)."""
     normalized: list[CoverageSource] = []
+    use_adaptive = _provider_supports(grid_provider, "locate_adaptive_cell")
     for src in sources:
-        snapped_h3 = h3.latlng_to_cell(src.lat, src.lon, resolution)
+        if use_adaptive:
+            snapped_h3 = grid_provider.locate_adaptive_cell(
+                src.lat,
+                src.lon,
+                resolution,
+                config,
+            )
+        else:
+            snapped_h3 = h3.latlng_to_cell(src.lat, src.lon, resolution)
         snapped_lat, snapped_lon = h3.cell_to_latlng(snapped_h3)
         normalized.append(CoverageSource(
             source_id=src.source_id,
@@ -200,7 +211,12 @@ def compute_h3_tower_coverage(
     itself is always included with distance/path-loss set to 0.
     """
     src_list = _dedupe_sources(
-        _normalize_sources_to_resolution(sources, config.h3_resolution)
+        _normalize_sources_to_resolution(
+            sources,
+            config.h3_resolution,
+            config,
+            grid_provider=grid_provider,
+        )
     )
     if not src_list:
         return []
@@ -221,8 +237,19 @@ def compute_h3_tower_coverage(
     )
 
     candidate_h3s: set[str] = set()
-    for src in src_list:
-        candidate_h3s.update(h3.grid_disk(src.h3_index, max_rings))
+    if _provider_supports(grid_provider, "adaptive_cells_within_radius"):
+        full_pool = set(grid_provider.get_adaptive_full_cells(config.h3_resolution, config))
+        for src in src_list:
+            candidate_h3s.update(grid_provider.adaptive_cells_within_radius(
+                src.h3_index,
+                coverage_radius_m,
+                config.h3_resolution,
+                config,
+                candidate_cells=full_pool,
+            ))
+    else:
+        for src in src_list:
+            candidate_h3s.update(h3.grid_disk(src.h3_index, max_rings))
 
     augmented_cells = dict(base_cells)
     for src in src_list:
@@ -244,6 +271,16 @@ def compute_h3_tower_coverage(
                 los_lat=los_lat,
                 los_lon=los_lon,
             )
+            if _provider_supports(grid_provider, "get_adaptive_cell_metadata"):
+                meta = grid_provider.get_adaptive_cell_metadata(
+                    src.h3_index,
+                    config.h3_resolution,
+                    config,
+                )
+                setattr(augmented_cells[src.h3_index], "base_h3_resolution", meta["base_h3_resolution"])
+                setattr(augmented_cells[src.h3_index], "target_h3_resolution", meta["target_h3_resolution"])
+                setattr(augmented_cells[src.h3_index], "gradient_m_per_km", meta["gradient_m_per_km"])
+                setattr(augmented_cells[src.h3_index], "adaptive_refined", meta["adaptive_refined"])
 
     for h3_idx in candidate_h3s:
         if h3_idx not in augmented_cells:
@@ -265,6 +302,16 @@ def compute_h3_tower_coverage(
                 los_lat=los_lat,
                 los_lon=los_lon,
             )
+            if _provider_supports(grid_provider, "get_adaptive_cell_metadata"):
+                meta = grid_provider.get_adaptive_cell_metadata(
+                    h3_idx,
+                    config.h3_resolution,
+                    config,
+                )
+                setattr(augmented_cells[h3_idx], "base_h3_resolution", meta["base_h3_resolution"])
+                setattr(augmented_cells[h3_idx], "target_h3_resolution", meta["target_h3_resolution"])
+                setattr(augmented_cells[h3_idx], "gradient_m_per_km", meta["gradient_m_per_km"])
+                setattr(augmented_cells[h3_idx], "adaptive_refined", meta["adaptive_refined"])
 
     cand_list = [augmented_cells[h] for h in candidate_h3s]
     src_cells = [augmented_cells[s.h3_index] for s in src_list]
@@ -393,6 +440,11 @@ def compute_h3_tower_coverage(
             'lat': cell.lat,
             'lon': cell.lon,
             'elevation': cell.elevation,
+            'h3_resolution': int(h3.get_resolution(cell.h3_index)),
+            'base_h3_resolution': getattr(cell, 'base_h3_resolution', config.h3_resolution),
+            'target_h3_resolution': getattr(cell, 'target_h3_resolution', int(h3.get_resolution(cell.h3_index))),
+            'gradient_m_per_km': float(getattr(cell, 'gradient_m_per_km', 0.0) or 0.0),
+            'adaptive_refined': bool(getattr(cell, 'adaptive_refined', False)),
             'has_road': cell.has_road,
             'visible_tower_count': count,
             'distance_m': (

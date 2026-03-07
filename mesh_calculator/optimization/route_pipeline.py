@@ -13,7 +13,6 @@ from typing import Callable, List, Optional
 import h3
 
 from ..core.config import MeshConfig, RouteSpec
-from ..core.grid import H3Cell, resolve_cell_profile
 from ..core.grid_provider import GridProvider
 from ..data.cache import LOSCache
 from ..data.exporters import (
@@ -35,21 +34,27 @@ from ..optimization.corridor import (
 logger = logging.getLogger(__name__)
 
 
-def _cell_profile(
-    mesh_config: MeshConfig,
+def _provider_supports(provider, method_name: str) -> bool:
+    return provider is not None and callable(getattr(type(provider), method_name, None))
+
+
+def _locate_site_cell(
     grid_provider: GridProvider,
-    h3_idx: str,
     lat: float,
     lon: float,
-) -> tuple[float, float, float]:
-    """Resolve (elevation, los_lat, los_lon) for a cell."""
-    return resolve_cell_profile(
-        grid_provider,
-        h3_idx,
-        lat,
-        lon,
-        anchor_margin_m=mesh_config.cell_anchor_margin_m,
-    )
+    mesh_config: MeshConfig,
+    *,
+    prefer_road: bool = False,
+) -> str:
+    if _provider_supports(grid_provider, "locate_adaptive_cell"):
+        return grid_provider.locate_adaptive_cell(
+            float(lat),
+            float(lon),
+            mesh_config.h3_resolution,
+            mesh_config,
+            prefer_road=prefer_road,
+        )
+    return h3.latlng_to_cell(float(lat), float(lon), mesh_config.h3_resolution)
 
 
 def _build_corridor_cells(
@@ -108,10 +113,36 @@ def _expand_cells_with_buffer(
         minimum_one=True,
     )
 
+    if (
+        bool(getattr(mesh_config, "auto_refine_h3_on_gradient", False))
+        and _provider_supports(grid_provider, "get_adaptive_full_cells")
+    ):
+        candidate_pool = grid_provider.get_adaptive_full_cells(
+            mesh_config.h3_resolution,
+            mesh_config,
+        )
+    elif _provider_supports(grid_provider, "get_full_cells"):
+        candidate_pool = grid_provider.get_full_cells(mesh_config.h3_resolution)
+    else:
+        candidate_pool = set(existing_cells.keys()) | set(road_cells)
+
     road_cell_set = set(road_cells)
     new_main_cells: set = set()
     for road_cell in road_cells:
-        for neighbor in grid_provider.expand_disk(road_cell, buffer_rings):
+        if _provider_supports(grid_provider, "adaptive_cells_within_radius"):
+            neighbors = grid_provider.adaptive_cells_within_radius(
+                road_cell,
+                mesh_config.road_buffer_m,
+                mesh_config.h3_resolution,
+                mesh_config,
+                candidate_cells=candidate_pool,
+            )
+        else:
+            if _provider_supports(grid_provider, "expand_disk"):
+                neighbors = grid_provider.expand_disk(road_cell, buffer_rings)
+            else:
+                neighbors = h3.grid_disk(road_cell, buffer_rings)
+        for neighbor in neighbors:
             if neighbor not in road_cell_set and neighbor not in existing_cells:
                 new_main_cells.add(neighbor)
 
@@ -292,35 +323,37 @@ def run_route_pipeline(
         raise ValueError("run_route_pipeline requires grid_provider")
 
     base_h3_resolution = mesh_config.h3_resolution
-    effective_h3_resolution = base_h3_resolution
-    h3_auto_refined = False
-    h3_auto_refine_reason = None
-    if mesh_config.auto_refine_h3_on_gradient:
-        resolved_res, refined, reason, pctl = grid_provider.resolve_effective_resolution(
-            routes, mesh_config.h3_resolution, mesh_config
+    if _provider_supports(grid_provider, "adaptive_resolution_summary"):
+        adaptive_summary = grid_provider.adaptive_resolution_summary(
+            base_h3_resolution,
+            mesh_config,
         )
-        effective_h3_resolution = resolved_res
-        h3_auto_refined = refined
-        h3_auto_refine_reason = reason
-        mesh_config.h3_resolution = effective_h3_resolution
-        if pctl is not None:
-            if refined:
-                logger.info(
-                    "Auto-refined H3 resolution %d -> %d via provider ladder "
-                    "(p%.0f=%.1f m/km)",
-                    base_h3_resolution,
-                    effective_h3_resolution,
-                    mesh_config.gradient_refine_percentile,
-                    pctl,
-                )
-            else:
-                logger.info(
-                    "H3 auto-refine not triggered by provider ladder "
-                    "(p%.0f=%.1f m/km, base_res=%d)",
-                    mesh_config.gradient_refine_percentile,
-                    pctl,
-                    base_h3_resolution,
-                )
+    else:
+        adaptive_summary = {
+            "h3_resolution_mode": "fixed",
+            "base_h3_resolution": base_h3_resolution,
+            "effective_h3_resolution_min": base_h3_resolution,
+            "effective_h3_resolution_max": base_h3_resolution,
+            "cells_by_resolution": {base_h3_resolution: 0},
+        }
+    effective_h3_resolution = adaptive_summary.get(
+        "effective_h3_resolution_max",
+        base_h3_resolution,
+    )
+    h3_auto_refined = effective_h3_resolution > base_h3_resolution
+    h3_auto_refine_reason = None
+    if h3_auto_refined:
+        h3_auto_refine_reason = (
+            f"adaptive_mixed_{adaptive_summary.get('effective_h3_resolution_min')}"
+            f"-{adaptive_summary.get('effective_h3_resolution_max')}"
+        )
+        logger.info(
+            "Adaptive mixed H3 mesh active: base=%d range=%d-%d cells_by_resolution=%s",
+            base_h3_resolution,
+            adaptive_summary.get("effective_h3_resolution_min", base_h3_resolution),
+            adaptive_summary.get("effective_h3_resolution_max", base_h3_resolution),
+            adaptive_summary.get("cells_by_resolution", {}),
+        )
 
     surface = MeshSurface({}, mesh_config, grid_provider)
     los_cache = LOSCache()
@@ -345,12 +378,21 @@ def run_route_pipeline(
         )
 
         # Convert GeoJSON features to ordered H3 corridor (site1→site2)
-        corridor = grid_provider.corridor_from_features(
-            route.features,
-            mesh_config.h3_resolution,
-            site1=route.site1,
-            site2=route.site2,
-        )
+        try:
+            corridor = grid_provider.corridor_from_features(
+                route.features,
+                mesh_config.h3_resolution,
+                site1=route.site1,
+                site2=route.site2,
+                config=mesh_config,
+            )
+        except TypeError:
+            corridor = grid_provider.corridor_from_features(
+                route.features,
+                mesh_config.h3_resolution,
+                site1=route.site1,
+                site2=route.site2,
+            )
         _emit_progress(
             stage='route',
             step='Preparing corridor',
@@ -385,10 +427,20 @@ def run_route_pipeline(
         # Determine site H3 indices (for logging only — no corridor extension)
         if (route.site1 and 'lat' in route.site1
                 and route.site2 and 'lat' in route.site2):
-            site1_h3 = h3.latlng_to_cell(
-                route.site1['lat'], route.site1['lon'], mesh_config.h3_resolution)
-            site2_h3 = h3.latlng_to_cell(
-                route.site2['lat'], route.site2['lon'], mesh_config.h3_resolution)
+            site1_h3 = _locate_site_cell(
+                grid_provider,
+                float(route.site1['lat']),
+                float(route.site1['lon']),
+                mesh_config,
+                prefer_road=True,
+            )
+            site2_h3 = _locate_site_cell(
+                grid_provider,
+                float(route.site2['lat']),
+                float(route.site2['lon']),
+                mesh_config,
+                prefer_road=True,
+            )
             logger.info(
                 "Site cells for route '%s': %s → %s",
                 route.route_id, site1_h3, site2_h3,
@@ -510,7 +562,20 @@ def run_route_pipeline(
                 # City site: anchor at boundary entry cell (one per road entry)
                 if entry_h3 is None or entry_h3 not in surface.cells:
                     continue
-                neighbors_1ring = h3.grid_disk(entry_h3, 1)
+                edge_m = h3.average_hexagon_edge_length(
+                    int(h3.get_resolution(entry_h3)),
+                    unit='m',
+                )
+                if _provider_supports(grid_provider, "adaptive_cells_within_radius"):
+                    neighbors_1ring = grid_provider.adaptive_cells_within_radius(
+                        entry_h3,
+                        max(edge_m * 1.2, 1.0),
+                        mesh_config.h3_resolution,
+                        mesh_config,
+                        candidate_cells=set(surface.tower_by_h3.keys()),
+                    )
+                else:
+                    neighbors_1ring = h3.grid_disk(entry_h3, 1)
                 existing_anchor_h3 = next(
                     (nb for nb in neighbors_1ring if nb in surface.tower_by_h3),
                     None,
@@ -538,8 +603,11 @@ def run_route_pipeline(
                 )
             else:
                 # Non-city site: single anchor at the exact site H3 cell
-                site_h3 = h3.latlng_to_cell(
-                    site['lat'], site['lon'], mesh_config.h3_resolution
+                site_h3 = _locate_site_cell(
+                    grid_provider,
+                    float(site['lat']),
+                    float(site['lon']),
+                    mesh_config,
                 )
                 if site_h3 in surface.tower_by_h3:
                     _apply_site_offset(
@@ -549,18 +617,11 @@ def run_route_pipeline(
                     )
                     continue
                 if site_h3 not in surface.cells:
-                    lat, lon = h3.cell_to_latlng(site_h3)
-                    elev, los_lat, los_lon = _cell_profile(
-                        mesh_config,
-                        grid_provider,
+                    surface.cells[site_h3] = grid_provider.get_or_create_cell(
                         site_h3,
-                        lat,
-                        lon,
-                    )
-                    surface.cells[site_h3] = H3Cell(
-                        h3_index=site_h3, lat=lat, lon=lon,
-                        elevation=elev, has_road=False, is_in_boundary=False,
-                        los_lat=los_lat, los_lon=los_lon,
+                        mesh_config,
+                        has_road=False,
+                        is_in_boundary=False,
                     )
                 _apply_site_offset(
                     site_h3,
@@ -660,6 +721,7 @@ def run_route_pipeline(
     export_grid_cells_geojson(
         surface.cells,
         grid_cells_path,
+        base_h3_resolution=base_h3_resolution,
         effective_h3_resolution=effective_h3_resolution,
     )
     if mesh_config.export_full_grid_cells and boundary_geojson:
@@ -668,6 +730,7 @@ def run_route_pipeline(
             export_grid_cells_geojson(
                 full_grid_cells,
                 grid_cells_full_path,
+                base_h3_resolution=base_h3_resolution,
                 effective_h3_resolution=effective_h3_resolution,
             )
         except Exception:
@@ -686,6 +749,17 @@ def run_route_pipeline(
         'total_cells': len(surface.cells),
         'visibility_edges': surface.visibility_graph.edge_count(),
         'num_clusters': len(surface.visibility_graph.connected_components()),
+        'h3_resolution_mode': adaptive_summary.get('h3_resolution_mode', 'fixed'),
+        'base_h3_resolution': base_h3_resolution,
+        'effective_h3_resolution_min': adaptive_summary.get(
+            'effective_h3_resolution_min',
+            base_h3_resolution,
+        ),
+        'effective_h3_resolution_max': adaptive_summary.get(
+            'effective_h3_resolution_max',
+            base_h3_resolution,
+        ),
+        'cells_by_resolution': adaptive_summary.get('cells_by_resolution', {}),
         'effective_h3_resolution': effective_h3_resolution,
         'h3_auto_refined': h3_auto_refined,
         'h3_auto_refine_reason': h3_auto_refine_reason,

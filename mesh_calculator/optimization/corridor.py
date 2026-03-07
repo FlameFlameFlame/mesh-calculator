@@ -60,6 +60,38 @@ def _radius_to_ring_m(config: MeshConfig, radius_m: float, minimum: int = 0) -> 
     return max(minimum, math.ceil(radius_m / edge_m))
 
 
+def _adaptive_cells_within_radius(
+    surface: MeshSurface,
+    center_h3: str,
+    radius_m: float,
+    *,
+    candidate_cells: Optional[set[str]] = None,
+) -> set[str]:
+    """Query nearby cells in meters, using GridProvider adaptive mesh when available."""
+    provider = surface.elevation_provider
+    if provider is not None and callable(
+        getattr(type(provider), "adaptive_cells_within_radius", None)
+    ):
+        try:
+            return set(provider.adaptive_cells_within_radius(
+                center_h3,
+                float(radius_m),
+                surface.config.h3_resolution,
+                surface.config,
+                candidate_cells=candidate_cells,
+            ))
+        except Exception:
+            logger.debug("adaptive_cells_within_radius failed; falling back to grid_disk", exc_info=True)
+    ring = _radius_to_ring_m(surface.config, radius_m, minimum=1 if radius_m > 0 else 0)
+    try:
+        return set(h3.grid_disk(center_h3, ring))
+    except Exception:
+        # Unit tests sometimes use synthetic non-H3 ids ("cell_1", ...).
+        if candidate_cells is not None:
+            return set(candidate_cells)
+        return {center_h3}
+
+
 def _append_search_debug_records(
     surface: MeshSurface,
     h3_indices: List[str],
@@ -323,8 +355,16 @@ def _expand_segment_buffer(
     elevation_provider = surface.elevation_provider
     injected = 0
     best_by_road: dict = {}
+    edge_m = h3.average_hexagon_edge_length(surface.config.h3_resolution, unit='m')
+    radius_m = max(float(ring) * edge_m, 0.0)
     for road_h3 in list(segment_set):
-        for nb in h3.grid_disk(road_h3, ring):
+        neighbors = _adaptive_cells_within_radius(
+            surface,
+            road_h3,
+            radius_m,
+            candidate_cells=set(cells.keys()),
+        )
+        for nb in neighbors:
             if nb in segment_set:
                 continue
             if nb in cells:
@@ -664,7 +704,9 @@ def _greedy_place_towers(
 
     def _get_buffer(cell: str) -> set:
         buf = set()
-        for nb in h3.grid_disk(cell, buffer_ring):
+        edge_m = h3.average_hexagon_edge_length(config.h3_resolution, unit='m')
+        radius_m = max(float(buffer_ring) * edge_m, 0.0)
+        for nb in _adaptive_cells_within_radius(surface, cell, radius_m):
             if _get_or_create_cell(nb) is not None:
                 buf.add(nb)
         buf.add(cell)
@@ -854,10 +896,12 @@ def place_nodes_along_corridor(
             return 0, [], []
         candidate_buffer_cells = []
         for road_h3 in list(corridor_set):
-            try:
-                neighbors = h3.grid_disk(road_h3, search_ring)
-            except Exception:
-                continue
+            neighbors = _adaptive_cells_within_radius(
+                surface,
+                road_h3,
+                search_radius_m,
+                candidate_cells=set(cells.keys()),
+            )
             for nb in neighbors:
                 if nb not in corridor_set and nb in cells and not cells[nb].has_road:
                     candidate_buffer_cells.append(nb)
