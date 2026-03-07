@@ -10,11 +10,13 @@ import json
 import os
 import hashlib
 import threading
+import math
 from typing import Dict, Iterable, Optional
 
 import geopandas as gpd
 import h3
 import numpy as np
+from scipy.spatial import cKDTree
 from shapely.geometry import Polygon, shape as shapely_shape
 
 import structlog
@@ -35,6 +37,7 @@ logger = structlog.get_logger(__name__)
 _DEFAULT_BUNDLE_RESOLUTIONS = (8, 9, 10, 11)
 _GRID_BUNDLE_VERSION = 2
 _SUPPORTED_BUNDLE_VERSIONS = {1, 2}
+_EARTH_R = 6_371_000.0
 
 
 def _boundary_polygon_from_geojson(boundary_geojson: Optional[dict]) -> Optional[Polygon]:
@@ -93,6 +96,18 @@ def _file_metadata(path: str) -> dict:
         }
 
 
+def _to_xyz(lats: np.ndarray, lons: np.ndarray) -> np.ndarray:
+    """Project lat/lon arrays to approximate ECEF xyz for KD-tree range search."""
+    lats_rad = np.radians(lats)
+    lons_rad = np.radians(lons)
+    cos_lat = np.cos(lats_rad)
+    return np.column_stack([
+        cos_lat * np.cos(lons_rad),
+        cos_lat * np.sin(lons_rad),
+        np.sin(lats_rad),
+    ]) * _EARTH_R
+
+
 class GridProvider:
     """
     Multi-resolution grid/elevation provider.
@@ -130,6 +145,7 @@ class GridProvider:
         self._full_cells_by_res: Dict[int, set[str]] = full_cells_by_res or {}
         self._road_cells_by_res: Dict[int, set[str]] = road_cells_by_res or {}
         self._cell_cache_by_res: Dict[int, Dict[str, H3Cell]] = {}
+        self._adaptive_mesh_cache: Dict[tuple, dict] = {}
         self._lock = threading.Lock()
         self._roads_gdf_cache = None
 
@@ -345,7 +361,10 @@ class GridProvider:
         if res not in self._road_cells_by_res:
             roads_gdf = self._get_roads_gdf()
             if len(roads_gdf):
-                self._road_cells_by_res[res] = set(find_h3_cells_on_roads(roads_gdf, res))
+                self._road_cells_by_res[res] = (
+                    set(find_h3_cells_on_roads(roads_gdf, res))
+                    & set(self.get_full_cells(res))
+                )
             else:
                 self._road_cells_by_res[res] = set()
         return self._road_cells_by_res[res]
@@ -356,7 +375,16 @@ class GridProvider:
         resolution: int,
         site1: Optional[dict] = None,
         site2: Optional[dict] = None,
+        config: Optional[MeshConfig] = None,
     ) -> list[str]:
+        if config is not None and bool(getattr(config, "auto_refine_h3_on_gradient", False)):
+            return self.adaptive_corridor_from_features(
+                features,
+                int(resolution),
+                config,
+                site1=site1,
+                site2=site2,
+            )
         return road_geojson_to_h3_corridor(features, int(resolution), site1=site1, site2=site2)
 
     def radius_m_to_ring(self, radius_m: float, resolution: int, minimum_one: bool = False) -> int:
@@ -369,6 +397,311 @@ class GridProvider:
     def expand_disk(self, h3_index: str, rings: int) -> set[str]:
         return set(h3.grid_disk(h3_index, int(rings)))
 
+    def _adaptive_cache_key(self, base_resolution: int, config: MeshConfig) -> tuple:
+        return (
+            int(base_resolution),
+            bool(getattr(config, "auto_refine_h3_on_gradient", False)),
+            int(getattr(config, "auto_refine_h3_max_resolution", 11)),
+        )
+
+    def _ladder_target_resolution(self, gradient_m_per_km: float, base_resolution: int, config: MeshConfig) -> int:
+        target = int(base_resolution)
+        if gradient_m_per_km > 100.0:
+            target = 11
+        elif gradient_m_per_km > 75.0:
+            target = 10
+        elif gradient_m_per_km > 50.0:
+            target = 9
+        target = max(int(base_resolution), target)
+        target = min(target, int(getattr(config, "auto_refine_h3_max_resolution", 11)))
+        return target
+
+    def _base_cell_local_gradient(self, base_h3: str, base_full: set[str]) -> float:
+        """Max ring-1 slope (m/km) around a base-resolution H3 cell."""
+        lat_a, lon_a = h3.cell_to_latlng(base_h3)
+        elev_a = self.get_h3_cell_max_elevation(base_h3)
+        max_grad = 0.0
+        for nb in h3.grid_disk(base_h3, 1):
+            if nb == base_h3 or nb not in base_full:
+                continue
+            lat_b, lon_b = h3.cell_to_latlng(nb)
+            dist_m = great_circle_distance(lat_a, lon_a, lat_b, lon_b)
+            if dist_m <= 1.0:
+                continue
+            elev_b = self.get_h3_cell_max_elevation(nb)
+            grad = abs(elev_b - elev_a) / (dist_m / 1000.0)
+            if grad > max_grad:
+                max_grad = grad
+        return float(max_grad)
+
+    def _build_adaptive_mesh(self, base_resolution: int, config: MeshConfig) -> dict:
+        """Build a non-overlapping mixed-resolution partition for the whole boundary."""
+        key = self._adaptive_cache_key(base_resolution, config)
+        cached = self._adaptive_mesh_cache.get(key)
+        if cached is not None:
+            return cached
+
+        base_res = int(base_resolution)
+        base_full = set(self.get_full_cells(base_res))
+        base_road = set(self.get_road_cells(base_res)) & base_full
+
+        full_cells_out: set[str] = set()
+        road_cells_out: set[str] = set()
+        cell_meta: dict[str, dict] = {}
+        by_res_full: dict[int, set[str]] = {}
+        by_res_road: dict[int, set[str]] = {}
+        cell_lats: list[float] = []
+        cell_lons: list[float] = []
+        cell_ids: list[str] = []
+
+        if not bool(getattr(config, "auto_refine_h3_on_gradient", False)):
+            for h3_idx in base_full:
+                full_cells_out.add(h3_idx)
+                if h3_idx in base_road:
+                    road_cells_out.add(h3_idx)
+                cell_meta[h3_idx] = {
+                    "base_h3_resolution": base_res,
+                    "target_h3_resolution": base_res,
+                    "gradient_m_per_km": 0.0,
+                    "adaptive_refined": False,
+                }
+        else:
+            full_by_res_cache: dict[int, set[str]] = {base_res: base_full}
+            road_by_res_cache: dict[int, set[str]] = {base_res: base_road}
+            for parent in base_full:
+                gradient = self._base_cell_local_gradient(parent, base_full)
+                target_res = self._ladder_target_resolution(gradient, base_res, config)
+                if target_res == base_res:
+                    full_cells_out.add(parent)
+                    if parent in base_road:
+                        road_cells_out.add(parent)
+                    cell_meta[parent] = {
+                        "base_h3_resolution": base_res,
+                        "target_h3_resolution": target_res,
+                        "gradient_m_per_km": gradient,
+                        "adaptive_refined": False,
+                    }
+                    continue
+
+                target_full = full_by_res_cache.get(target_res)
+                if target_full is None:
+                    target_full = set(self.get_full_cells(target_res))
+                    full_by_res_cache[target_res] = target_full
+                target_road = road_by_res_cache.get(target_res)
+                if target_road is None:
+                    target_road = set(self.get_road_cells(target_res))
+                    road_by_res_cache[target_res] = target_road
+
+                for child in h3.cell_to_children(parent, target_res):
+                    if child not in target_full:
+                        continue
+                    full_cells_out.add(child)
+                    if child in target_road:
+                        road_cells_out.add(child)
+                    cell_meta[child] = {
+                        "base_h3_resolution": base_res,
+                        "target_h3_resolution": target_res,
+                        "gradient_m_per_km": gradient,
+                        "adaptive_refined": True,
+                    }
+
+        for h3_idx in full_cells_out:
+            res = int(h3.get_resolution(h3_idx))
+            by_res_full.setdefault(res, set()).add(h3_idx)
+            if h3_idx in road_cells_out:
+                by_res_road.setdefault(res, set()).add(h3_idx)
+            lat, lon = h3.cell_to_latlng(h3_idx)
+            cell_lats.append(lat)
+            cell_lons.append(lon)
+            cell_ids.append(h3_idx)
+
+        kdtree = None
+        xyz = None
+        if cell_ids:
+            xyz = _to_xyz(np.asarray(cell_lats), np.asarray(cell_lons))
+            kdtree = cKDTree(xyz)
+
+        counts: dict[int, int] = {}
+        for h3_idx in full_cells_out:
+            res = int(h3.get_resolution(h3_idx))
+            counts[res] = counts.get(res, 0) + 1
+
+        mesh = {
+            "base_resolution": base_res,
+            "full_cells": full_cells_out,
+            "road_cells": road_cells_out,
+            "full_by_res": by_res_full,
+            "road_by_res": by_res_road,
+            "cell_meta": cell_meta,
+            "cells_by_resolution": counts,
+            "effective_h3_resolution_min": min(counts.keys()) if counts else base_res,
+            "effective_h3_resolution_max": max(counts.keys()) if counts else base_res,
+            "cell_ids": cell_ids,
+            "xyz": xyz,
+            "kdtree": kdtree,
+        }
+        self._adaptive_mesh_cache[key] = mesh
+        return mesh
+
+    def get_adaptive_full_cells(self, base_resolution: int, config: MeshConfig) -> set[str]:
+        return set(self._build_adaptive_mesh(base_resolution, config)["full_cells"])
+
+    def get_adaptive_road_cells(self, base_resolution: int, config: MeshConfig) -> set[str]:
+        return set(self._build_adaptive_mesh(base_resolution, config)["road_cells"])
+
+    def get_adaptive_cell_metadata(
+        self,
+        h3_index: str,
+        base_resolution: int,
+        config: MeshConfig,
+    ) -> dict:
+        mesh = self._build_adaptive_mesh(base_resolution, config)
+        meta = mesh["cell_meta"].get(h3_index)
+        if meta is not None:
+            return dict(meta)
+        res = int(h3.get_resolution(h3_index))
+        return {
+            "base_h3_resolution": int(base_resolution),
+            "target_h3_resolution": res,
+            "gradient_m_per_km": 0.0,
+            "adaptive_refined": False,
+        }
+
+    def adaptive_resolution_summary(self, base_resolution: int, config: MeshConfig) -> dict:
+        mesh = self._build_adaptive_mesh(base_resolution, config)
+        return {
+            "h3_resolution_mode": "adaptive_mixed",
+            "base_h3_resolution": int(base_resolution),
+            "effective_h3_resolution_min": mesh["effective_h3_resolution_min"],
+            "effective_h3_resolution_max": mesh["effective_h3_resolution_max"],
+            "cells_by_resolution": dict(sorted(mesh["cells_by_resolution"].items())),
+        }
+
+    def locate_adaptive_cell(
+        self,
+        lat: float,
+        lon: float,
+        base_resolution: int,
+        config: MeshConfig,
+        *,
+        prefer_road: bool = False,
+    ) -> str:
+        mesh = self._build_adaptive_mesh(base_resolution, config)
+        by_res = mesh["road_by_res"] if prefer_road else mesh["full_by_res"]
+        if not by_res:
+            return h3.latlng_to_cell(lat, lon, int(base_resolution))
+        for res in sorted(by_res.keys(), reverse=True):
+            idx = h3.latlng_to_cell(lat, lon, int(res))
+            if idx in by_res.get(int(res), set()):
+                return idx
+        return h3.latlng_to_cell(lat, lon, int(base_resolution))
+
+    def adaptive_cells_within_radius(
+        self,
+        center_h3: str,
+        radius_m: float,
+        base_resolution: int,
+        config: MeshConfig,
+        *,
+        candidate_cells: Optional[set[str]] = None,
+    ) -> set[str]:
+        if radius_m <= 0:
+            return {center_h3}
+        mesh = self._build_adaptive_mesh(base_resolution, config)
+        lat, lon = h3.cell_to_latlng(center_h3)
+
+        if candidate_cells is None:
+            kdtree = mesh.get("kdtree")
+            if kdtree is None:
+                return set()
+            q = _to_xyz(np.asarray([lat]), np.asarray([lon]))[0]
+            idxs = kdtree.query_ball_point(q, r=float(radius_m))
+            return {mesh["cell_ids"][i] for i in idxs}
+
+        candidate_count = len(candidate_cells)
+        full_count = len(mesh.get("full_cells", []))
+        kdtree = mesh.get("kdtree")
+        if (
+            kdtree is not None
+            and full_count > 0
+            and candidate_count >= int(full_count * 0.5)
+        ):
+            q = _to_xyz(np.asarray([lat]), np.asarray([lon]))[0]
+            idxs = kdtree.query_ball_point(q, r=float(radius_m))
+            return {
+                mesh["cell_ids"][i]
+                for i in idxs
+                if mesh["cell_ids"][i] in candidate_cells
+            }
+
+        out: set[str] = set()
+        for h3_idx in candidate_cells:
+            lat_b, lon_b = h3.cell_to_latlng(h3_idx)
+            if great_circle_distance(lat, lon, lat_b, lon_b) <= float(radius_m):
+                out.add(h3_idx)
+        return out
+
+    def adaptive_corridor_from_features(
+        self,
+        features: list,
+        base_resolution: int,
+        config: MeshConfig,
+        site1: Optional[dict] = None,
+        site2: Optional[dict] = None,
+    ) -> list[str]:
+        """
+        Build an ordered mixed-resolution corridor by projecting high-res road samples
+        onto the adaptive road mesh and deduplicating in path order.
+        """
+        high_res = max(self.available_resolutions() or [int(base_resolution)])
+        ordered_high = road_geojson_to_h3_corridor(features, high_res, site1=site1, site2=site2)
+        if not ordered_high:
+            ordered_high = road_geojson_to_h3_corridor(
+                features, int(base_resolution), site1=site1, site2=site2
+            )
+        mapped: list[str] = []
+        seen: set[str] = set()
+        for h3_idx in ordered_high:
+            lat, lon = h3.cell_to_latlng(h3_idx)
+            adaptive = self.locate_adaptive_cell(
+                lat,
+                lon,
+                int(base_resolution),
+                config,
+                prefer_road=True,
+            )
+            if adaptive not in seen:
+                mapped.append(adaptive)
+                seen.add(adaptive)
+
+        if site1 and "lat" in site1 and "lon" in site1:
+            start = self.locate_adaptive_cell(
+                float(site1["lat"]),
+                float(site1["lon"]),
+                int(base_resolution),
+                config,
+                prefer_road=True,
+            )
+            if mapped and mapped[0] != start:
+                mapped.insert(0, start)
+            elif not mapped:
+                mapped.append(start)
+
+        if site2 and "lat" in site2 and "lon" in site2:
+            end = self.locate_adaptive_cell(
+                float(site2["lat"]),
+                float(site2["lon"]),
+                int(base_resolution),
+                config,
+                prefer_road=True,
+            )
+            if mapped and mapped[-1] != end:
+                mapped.append(end)
+            elif not mapped:
+                mapped.append(end)
+
+        return mapped
+
     def get_or_create_cell(
         self,
         h3_index: str,
@@ -377,13 +710,21 @@ class GridProvider:
         has_road: bool = False,
         is_in_boundary: bool = True,
     ) -> H3Cell:
-        res = int(config.h3_resolution)
+        try:
+            res = int(h3.get_resolution(h3_index))
+        except Exception:
+            res = int(config.h3_resolution)
         with self._lock:
             by_res = self._cell_cache_by_res.setdefault(res, {})
             cell = by_res.get(h3_index)
             if cell is not None:
                 cell.has_road = bool(cell.has_road or has_road)
                 cell.is_in_boundary = bool(cell.is_in_boundary or is_in_boundary)
+                meta = self.get_adaptive_cell_metadata(h3_index, config.h3_resolution, config)
+                setattr(cell, "base_h3_resolution", meta["base_h3_resolution"])
+                setattr(cell, "target_h3_resolution", meta["target_h3_resolution"])
+                setattr(cell, "gradient_m_per_km", meta["gradient_m_per_km"])
+                setattr(cell, "adaptive_refined", meta["adaptive_refined"])
                 return cell
         lat, lon = h3.cell_to_latlng(h3_index)
         elev, los_lat, los_lon = resolve_cell_profile(
@@ -403,12 +744,22 @@ class GridProvider:
             los_lat=los_lat,
             los_lon=los_lon,
         )
+        meta = self.get_adaptive_cell_metadata(h3_index, config.h3_resolution, config)
+        setattr(cell, "base_h3_resolution", meta["base_h3_resolution"])
+        setattr(cell, "target_h3_resolution", meta["target_h3_resolution"])
+        setattr(cell, "gradient_m_per_km", meta["gradient_m_per_km"])
+        setattr(cell, "adaptive_refined", meta["adaptive_refined"])
         with self._lock:
             by_res = self._cell_cache_by_res.setdefault(res, {})
             prev = by_res.get(h3_index)
             if prev is not None:
                 prev.has_road = bool(prev.has_road or has_road)
                 prev.is_in_boundary = bool(prev.is_in_boundary or is_in_boundary)
+                meta = self.get_adaptive_cell_metadata(h3_index, config.h3_resolution, config)
+                setattr(prev, "base_h3_resolution", meta["base_h3_resolution"])
+                setattr(prev, "target_h3_resolution", meta["target_h3_resolution"])
+                setattr(prev, "gradient_m_per_km", meta["gradient_m_per_km"])
+                setattr(prev, "adaptive_refined", meta["adaptive_refined"])
                 return prev
             by_res[h3_index] = cell
         return cell
@@ -433,8 +784,12 @@ class GridProvider:
         return out
 
     def build_full_boundary_grid(self, config: MeshConfig) -> Dict[str, H3Cell]:
-        full = self.get_full_cells(config.h3_resolution)
-        road = self.get_road_cells(config.h3_resolution)
+        if bool(getattr(config, "auto_refine_h3_on_gradient", False)):
+            full = self.get_adaptive_full_cells(config.h3_resolution, config)
+            road = self.get_adaptive_road_cells(config.h3_resolution, config)
+        else:
+            full = self.get_full_cells(config.h3_resolution)
+            road = self.get_road_cells(config.h3_resolution)
         return self.build_cells_dict(full, config, road_cells=road, is_in_boundary=True)
 
     def resolve_effective_resolution(

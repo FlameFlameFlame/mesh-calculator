@@ -169,6 +169,7 @@ def export_tower_coverage_geojson(hex_results: list, output_path: str):
 def export_grid_cells_geojson(
     cells: Dict,
     output_path: str,
+    base_h3_resolution: int | None = None,
     effective_h3_resolution: int | None = None,
 ):
     """
@@ -187,6 +188,10 @@ def export_grid_cells_geojson(
             h3_resolution = int(h3.get_resolution(h3_idx))
         except Exception:
             h3_resolution = None
+        cell_base = getattr(cell, 'base_h3_resolution', None)
+        cell_target = getattr(cell, 'target_h3_resolution', h3_resolution)
+        cell_gradient = getattr(cell, 'gradient_m_per_km', None)
+        cell_refined = bool(getattr(cell, 'adaptive_refined', False))
         features.append({
             'type': 'Feature',
             'geometry': {'type': 'Polygon', 'coordinates': [coords]},
@@ -196,6 +201,22 @@ def export_grid_cells_geojson(
                 'has_road': cell.has_road,
                 'is_in_unfit_area': cell.is_in_unfit_area,
                 'h3_resolution': h3_resolution,
+                'base_h3_resolution': (
+                    int(cell_base)
+                    if cell_base is not None
+                    else (int(base_h3_resolution) if base_h3_resolution is not None else h3_resolution)
+                ),
+                'target_h3_resolution': (
+                    int(cell_target)
+                    if cell_target is not None
+                    else h3_resolution
+                ),
+                'gradient_m_per_km': (
+                    float(cell_gradient)
+                    if cell_gradient is not None
+                    else 0.0
+                ),
+                'adaptive_refined': cell_refined,
                 'effective_h3_resolution': (
                     int(effective_h3_resolution)
                     if effective_h3_resolution is not None

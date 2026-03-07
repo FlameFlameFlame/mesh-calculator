@@ -5,11 +5,13 @@ import json
 import tempfile
 from pathlib import Path
 
+import h3
 import numpy as np
 import rasterio
 from rasterio.transform import from_origin
 from shapely.geometry import box, mapping
 
+from ..core.config import MeshConfig
 from ..core.grid_provider import GridProvider
 
 
@@ -116,5 +118,62 @@ def test_lazy_road_cells_lookup_for_unbundled_resolution():
             roads_at_10 = provider.get_road_cells(10)
             assert isinstance(roads_at_10, set)
             assert roads_at_10
+        finally:
+            provider.close()
+
+
+def test_adaptive_full_grid_has_no_parent_child_overlap():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        tif = tmp / "elevation.tif"
+        _make_dem(tif, width=800, height=800, west=43.7, north=40.3, pixel_deg=0.001)
+
+        provider = GridProvider.from_inputs(
+            elevation_path=str(tif),
+            boundary_geojson=_boundary_geojson(),
+            roads_geojson=_roads_geojson(),
+            resolutions=(8, 9, 10, 11),
+        )
+        try:
+            # Force steep terrain so adaptive refinement is exercised.
+            provider.get_h3_cell_max_elevation = lambda h3_idx: h3.cell_to_latlng(h3_idx)[0] * 10000.0
+            cfg = MeshConfig(h3_resolution=8, auto_refine_h3_on_gradient=True, auto_refine_h3_max_resolution=11)
+            adaptive = provider.get_adaptive_full_cells(8, cfg)
+            assert adaptive
+            for idx in adaptive:
+                res = int(h3.get_resolution(idx))
+                for parent_res in range(8, res):
+                    assert h3.cell_to_parent(idx, parent_res) not in adaptive
+        finally:
+            provider.close()
+
+
+def test_adaptive_ladder_and_radius_query_monotonic():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        tif = tmp / "elevation.tif"
+        _make_dem(tif, width=500, height=500, west=43.7, north=40.3, pixel_deg=0.001)
+
+        provider = GridProvider.from_inputs(
+            elevation_path=str(tif),
+            boundary_geojson=_boundary_geojson(),
+            roads_geojson=_roads_geojson(),
+            resolutions=(8, 9, 10, 11),
+        )
+        try:
+            cfg = MeshConfig(h3_resolution=8, auto_refine_h3_on_gradient=True, auto_refine_h3_max_resolution=11)
+            assert provider._ladder_target_resolution(120.0, 8, cfg) == 11
+            assert provider._ladder_target_resolution(80.0, 8, cfg) == 10
+            assert provider._ladder_target_resolution(55.0, 8, cfg) == 9
+            assert provider._ladder_target_resolution(10.0, 8, cfg) == 8
+
+            # Use a deterministic steep-elevation proxy to trigger mixed cells.
+            provider.get_h3_cell_max_elevation = lambda h3_idx: h3.cell_to_latlng(h3_idx)[0] * 10000.0
+            cells = provider.get_adaptive_full_cells(8, cfg)
+            center = next(iter(cells))
+            near = provider.adaptive_cells_within_radius(center, 1000.0, 8, cfg, candidate_cells=cells)
+            far = provider.adaptive_cells_within_radius(center, 2000.0, 8, cfg, candidate_cells=cells)
+            assert near
+            assert near.issubset(far)
         finally:
             provider.close()
