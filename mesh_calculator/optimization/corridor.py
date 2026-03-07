@@ -583,145 +583,238 @@ def _repair_broken_gaps(
     los_max_workers: Optional[int] = None,
 ) -> List[str]:
     """
-    For each broken gap in chain, expand the sub-corridor between the two
-    broken towers and re-run DP to find a relay path around the obstacle.
-
-    After a successful repair, prune any now-redundant towers that follow
-    anchor_b: if anchor_b has direct LOS to chain[i+k] for some k>1, the
-    intermediate towers chain[i+1..i+k-1] are removed.
+    For each broken gap in chain, locally wiggle the two endpoint towers
+    around their original placement and try to restore LOS.
 
     Args:
         chain:           Current tower chain (modified in-place and returned).
-        corridor:        Full corridor (with buffer cells already injected).
+        corridor:        Full corridor (used to register any newly created cells).
         corridor_pos:    Position lookup {h3_idx: position_in_corridor}.
-        search_radius_m: Search radius to use in this repair round.
-        repair_round:    1-based gap-repair round.
+        search_radius_m: Base wiggle radius (meters). Each local repair tries
+                         1x, 2x, and 3x of this radius.
+        repair_round:    Debug field for metadata compatibility.
         attempt_id:      Placement attempt id.
         surface:         MeshSurface.
         cache:           LOSCache (may be None).
-        user_budget:     Max total interior towers allowed (effective_budget - 2).
+        user_budget:     Unused by local wiggle repair; kept for compatibility.
         node_meta:       Optional dict populated with placement metadata for newly
-                         introduced nodes (algorithm='dp_repair', repair_round=r).
+                         introduced/moved nodes (algorithm='dp_repair').
     Returns:
         Updated chain (same list object).
     """
+    from ..core.geometry import h3_distance as _dist
+
     broken = _find_broken_gaps(
         chain, surface, cache, los_max_workers=los_max_workers
     )
     if not broken:
         return chain
 
-    new_ring = _radius_to_ring_m(surface.config, search_radius_m, minimum=1)
-    # Process in reverse so splices don't shift subsequent broken indices
-    for i in reversed(broken):
-        anchor_a = chain[i]
-        anchor_b = chain[i + 1]
-        pos_a = corridor_pos.get(anchor_a)
-        pos_b = corridor_pos.get(anchor_b)
-        if pos_a is None or pos_b is None:
-            logger.warning(
-                "Cannot find anchor positions for gap repair",
-                repair_round=repair_round, gap_idx=i,
-            )
-            continue
-        lo, hi = (pos_a, pos_b) if pos_a <= pos_b else (pos_b, pos_a)
-        sub_corridor = list(corridor[lo:hi + 1])
-        sub_set = set(sub_corridor)
+    cells = surface.cells
+    elevation_provider = surface.elevation_provider
+    max_candidates_per_side = 24
+
+    def _ensure_cell(h3_idx: str) -> bool:
+        if h3_idx in cells:
+            return True
+        if elevation_provider is None:
+            return False
         try:
-            _expand_segment_buffer(sub_corridor, sub_set, new_ring, surface)
-        except Exception:
-            pass
-        _append_search_debug_records(
-            surface=surface,
-            h3_indices=sub_corridor,
-            algorithm='dp',
-            phase='gap_repair',
-            attempt_id=attempt_id,
-            segment_idx=i,
-            repair_round=repair_round,
-            search_radius_m=search_radius_m,
-            search_ring=new_ring,
-            search_scope='gap_repair_subcorridor',
-        )
-        # Budget for this gap: remaining interior slots after already-placed towers.
-        # chain includes both endpoints, so interior count = len(chain) - 2.
-        already_interior = len(chain) - 2
-        gap_k = max(2, user_budget - already_interior)
-        result = _dp_place_towers_with_meta(
-            sub_corridor,
-            surface,
-            cache,
-            gap_k,
-            los_max_workers=los_max_workers,
-        )
-        if result is None:
-            logger.warning(
-                "Gap repair DP failed",
-                repair_round=repair_round, gap_idx=i,
-                anchor_a=anchor_a, anchor_b=anchor_b,
-                buffer_ring=new_ring,
+            lat, lon = h3.cell_to_latlng(h3_idx)
+            elev, los_lat, los_lon = _cell_profile(
+                surface.config, elevation_provider, h3_idx, lat, lon
             )
-            continue
-        new_seg, best_t = result
-        # Splice new_seg into chain replacing only the broken pair.
-        # anchor_a == new_seg[0], anchor_b == new_seg[-1].
-        chain[i:i + 2] = new_seg
-        # Register any newly introduced cells into corridor_pos so subsequent
-        # repair rounds can locate them as anchors.
-        for h3_cell in new_seg:
-            if h3_cell not in corridor_pos:
-                corridor_pos[h3_cell] = len(corridor)
-                corridor.append(h3_cell)
-            # Tag interior nodes introduced by this repair (not anchors)
-            if node_meta is not None and h3_cell not in (anchor_a, anchor_b):
-                node_meta[h3_cell] = {
-                    'algorithm': 'dp_repair',
-                    'dp_steps': best_t,
-                    'repair_round': repair_round,
-                }
-        logger.info(
-            "Gap repair successful",
-            repair_round=repair_round, gap_idx=i, new_nodes=len(new_seg),
-            buffer_ring=new_ring,
+            cells[h3_idx] = H3Cell(
+                h3_index=h3_idx,
+                lat=lat,
+                lon=lon,
+                elevation=elev,
+                has_road=False,
+                is_in_boundary=True,
+                los_lat=los_lat,
+                los_lon=los_lon,
+            )
+        except Exception:
+            return False
+        if h3_idx not in corridor_pos:
+            corridor_pos[h3_idx] = len(corridor)
+            corridor.append(h3_idx)
+        return True
+
+    def _candidate_pool(center_h3: str, radius_m: float, movable: bool) -> list[str]:
+        if not movable:
+            return [center_h3]
+        raw = set(_adaptive_cells_within_radius(surface, center_h3, radius_m))
+        raw.add(center_h3)
+        out: list[str] = []
+        for h3_idx in raw:
+            if not _ensure_cell(h3_idx):
+                continue
+            c = cells.get(h3_idx)
+            if c is None:
+                continue
+            if getattr(c, 'is_in_unfit_area', False):
+                continue
+            out.append(h3_idx)
+        if center_h3 not in out and _ensure_cell(center_h3):
+            out.append(center_h3)
+        ranked = sorted(
+            set(out),
+            key=lambda h: (-cells[h].elevation, _dist(center_h3, h), h),
         )
-        # Post-repair pruning: the new anchor_b (chain[i + len(new_seg) - 1])
-        # may now have direct LOS to a later tower, making intermediate towers
-        # redundant. Find the furthest reachable tower and remove the ones
-        # in between.
-        new_anchor_b_idx = i + len(new_seg) - 1
-        if new_anchor_b_idx + 2 <= len(chain) - 1:
-            new_anchor_b = chain[new_anchor_b_idx]
-            furthest_reachable = new_anchor_b_idx + 1  # default: no pruning
-            pairs = [
-                (new_anchor_b, chain[j])
-                for j in range(len(chain) - 1, new_anchor_b_idx + 1, -1)
-            ]
-            los_diag: dict = {}
-            los_results = compute_los_batch(
-                pairs,
-                surface.cells,
+        return ranked[:max_candidates_per_side]
+
+    for i in broken:
+        anchor_a0 = chain[i]
+        anchor_b0 = chain[i + 1]
+        prev_h3 = chain[i - 1] if i > 0 else None
+        next_h3 = chain[i + 2] if (i + 2) < len(chain) else None
+        fixed_a = (i == 0) or (anchor_a0 in surface.tower_by_h3)
+        fixed_b = ((i + 1) == (len(chain) - 1)) or (anchor_b0 in surface.tower_by_h3)
+        repaired = False
+
+        for local_round in range(1, 4):
+            radius_m = float(max(search_radius_m, 0.0) * local_round)
+            if radius_m <= 0.0:
+                break
+            search_ring = _radius_to_ring_m(surface.config, radius_m, minimum=1)
+            cand_a = _candidate_pool(anchor_a0, radius_m, not fixed_a)
+            cand_b = _candidate_pool(anchor_b0, radius_m, not fixed_b)
+            if not cand_a or not cand_b:
+                continue
+
+            _append_search_debug_records(
+                surface=surface,
+                h3_indices=sorted(set(cand_a + cand_b)),
+                algorithm='dp',
+                phase='gap_repair',
+                attempt_id=attempt_id,
+                segment_idx=i,
+                repair_round=local_round,
+                search_radius_m=radius_m,
+                search_ring=search_ring,
+                search_scope='gap_repair_subcorridor',
+            )
+
+            valid_a = set(cand_a)
+            valid_b = set(cand_b)
+
+            if prev_h3 is not None:
+                prev_pairs = [(prev_h3, a) for a in cand_a]
+                prev_diag: dict = {}
+                prev_results = compute_los_batch(
+                    prev_pairs,
+                    cells,
+                    surface.config,
+                    cache=cache,
+                    max_workers=los_max_workers,
+                    elevation_provider=surface.elevation_provider,
+                    compute_fn=compute_los,
+                    diagnostics=prev_diag,
+                    stage="gap_repair_wiggle_prev",
+                )
+                _record_los_diag(surface, prev_diag)
+                valid_a = {
+                    a for a in cand_a
+                    if (prev_results.get((prev_h3, a)) is not None)
+                    and prev_results[(prev_h3, a)].is_visible
+                }
+            if next_h3 is not None:
+                next_pairs = [(b, next_h3) for b in cand_b]
+                next_diag: dict = {}
+                next_results = compute_los_batch(
+                    next_pairs,
+                    cells,
+                    surface.config,
+                    cache=cache,
+                    max_workers=los_max_workers,
+                    elevation_provider=surface.elevation_provider,
+                    compute_fn=compute_los,
+                    diagnostics=next_diag,
+                    stage="gap_repair_wiggle_next",
+                )
+                _record_los_diag(surface, next_diag)
+                valid_b = {
+                    b for b in cand_b
+                    if (next_results.get((b, next_h3)) is not None)
+                    and next_results[(b, next_h3)].is_visible
+                }
+
+            cand_a = [a for a in cand_a if a in valid_a]
+            cand_b = [b for b in cand_b if b in valid_b]
+            if not cand_a or not cand_b:
+                continue
+
+            pair_candidates = [(a, b) for a in cand_a for b in cand_b]
+            pair_diag: dict = {}
+            pair_results = compute_los_batch(
+                pair_candidates,
+                cells,
                 surface.config,
                 cache=cache,
                 max_workers=los_max_workers,
                 elevation_provider=surface.elevation_provider,
                 compute_fn=compute_los,
-                diagnostics=los_diag,
-                stage="gap_repair_prune",
+                diagnostics=pair_diag,
+                stage="gap_repair_wiggle_pair",
             )
-            _record_los_diag(surface, los_diag)
-            for j in range(len(chain) - 1, new_anchor_b_idx + 1, -1):
-                pair = (new_anchor_b, chain[j])
-                los = los_results.get(pair)
-                if los is not None and los.is_visible:
-                    furthest_reachable = j
-                    break
-            if furthest_reachable > new_anchor_b_idx + 1:
-                pruned = chain[new_anchor_b_idx + 1:furthest_reachable]
-                del chain[new_anchor_b_idx + 1:furthest_reachable]
-                logger.info(
-                    "Post-repair pruned redundant towers",
-                    count=len(pruned), after_idx=new_anchor_b_idx,
+            _record_los_diag(surface, pair_diag)
+
+            best = None
+            best_score = None
+            for a, b in pair_candidates:
+                los = pair_results.get((a, b))
+                if los is None or not los.is_visible:
+                    continue
+                move_cost = _dist(anchor_a0, a) + _dist(anchor_b0, b)
+                score = (
+                    float(los.clearance_m),
+                    float(-move_cost),
+                    float(cells[a].elevation + cells[b].elevation),
                 )
+                tie = (a, b)
+                if best is None or score > best_score or (score == best_score and tie < best):
+                    best = tie
+                    best_score = score
+
+            if best is None:
+                continue
+
+            new_a, new_b = best
+            chain[i] = new_a
+            chain[i + 1] = new_b
+            if node_meta is not None:
+                if new_a != anchor_a0 and new_a not in surface.tower_by_h3:
+                    node_meta[new_a] = {
+                        'algorithm': 'dp_repair',
+                        'dp_steps': None,
+                        'repair_round': local_round,
+                    }
+                if new_b != anchor_b0 and new_b not in surface.tower_by_h3:
+                    node_meta[new_b] = {
+                        'algorithm': 'dp_repair',
+                        'dp_steps': None,
+                        'repair_round': local_round,
+                    }
+            logger.info(
+                "Gap repair wiggle successful",
+                gap_idx=i,
+                local_round=local_round,
+                radius_m=radius_m,
+                moved_a=(new_a != anchor_a0),
+                moved_b=(new_b != anchor_b0),
+            )
+            repaired = True
+            break
+
+        if not repaired:
+            logger.warning(
+                "Gap repair wiggle failed",
+                gap_idx=i,
+                base_radius_m=search_radius_m,
+                anchor_a=anchor_a0,
+                anchor_b=anchor_b0,
+            )
     return chain
 
 
@@ -892,7 +985,6 @@ def place_nodes_along_corridor(
         attempt_id: int,
         phase_label: str,
         run_gap_repair: bool = False,
-        gap_repair_base_radius_m: Optional[float] = None,
     ) -> tuple[List[str], Dict[str, dict], List[str], Dict[str, int], int, int]:
         working_corridor = list(corridor)
         injected_buffer, all_candidate_cells, selected_buffer_cells = (
@@ -1030,40 +1122,26 @@ def place_nodes_along_corridor(
                     all_nodes.append(n)
 
         if run_gap_repair and config.gap_repair_rounds > 0:
-            base_buffer_radius_m = max(0.0, float(config.road_buffer_m))
-            if base_buffer_radius_m <= 0.0:
-                base_buffer_radius_m = max(
-                    0.0,
-                    float(
-                        gap_repair_base_radius_m
-                        if gap_repair_base_radius_m is not None
-                        else search_radius_m
-                    ),
-                )
-            for repair_round in range(1, config.gap_repair_rounds + 1):
-                broken = _find_broken_gaps(
-                    all_nodes,
-                    surface,
-                    cache,
-                    los_max_workers=effective_los_workers,
-                    los_progress_callback=_make_los_progress('Checking/repairing broken LOS gaps'),
-                )
-                if not broken:
-                    break
-                # Iteration policy:
-                # 1st pass: road + 1*buffer
-                # 1st repair: road + 2*buffer, then road + 3*buffer, ...
-                repair_radius = float(base_buffer_radius_m * (repair_round + 1))
-                repair_ring = _radius_to_ring_m(config, repair_radius, minimum=1)
+            broken = _find_broken_gaps(
+                all_nodes,
+                surface,
+                cache,
+                los_max_workers=effective_los_workers,
+                los_progress_callback=_make_los_progress('Checking/repairing broken LOS gaps'),
+            )
+            if broken:
+                base_buffer_radius_m = max(0.0, float(config.road_buffer_m))
+                if base_buffer_radius_m <= 0.0:
+                    base_buffer_radius_m = max(0.0, float(search_radius_m))
                 logger.info(
-                    "Gap repair round %d/%d: %d broken pair(s), ring=%d, radius_m=%.0f",
-                    repair_round, config.gap_repair_rounds, len(broken),
-                    repair_ring, repair_radius,
+                    "Gap repair wiggle: %d broken pair(s), base_radius_m=%.0f",
+                    len(broken),
+                    base_buffer_radius_m,
                 )
                 all_nodes = _repair_broken_gaps(
                     all_nodes, working_corridor, corridor_pos,
-                    search_radius_m=repair_radius,
-                    repair_round=repair_round,
+                    search_radius_m=base_buffer_radius_m,
+                    repair_round=1,
                     attempt_id=attempt_id,
                     surface=surface,
                     cache=cache,
@@ -1152,7 +1230,7 @@ def place_nodes_along_corridor(
         search_radius_m=initial_search_radius_m,
         attempt_id=0,
         phase_label='initial',
-        run_gap_repair=False,
+        run_gap_repair=True,
     )
     selected_search_radius_m = initial_search_radius_m
     selected_attempt_id = 0
@@ -1164,7 +1242,7 @@ def place_nodes_along_corridor(
         )
         attempt_id = 1
         for fallback_radius_m in fallback_ladder:
-            if fallback_radius_m <= initial_search_radius_m:
+            if fallback_radius_m <= selected_search_radius_m:
                 continue
             (
                 nodes,
@@ -1177,7 +1255,7 @@ def place_nodes_along_corridor(
                 search_radius_m=fallback_radius_m,
                 attempt_id=attempt_id,
                 phase_label='fallback_initial',
-                run_gap_repair=False,
+                run_gap_repair=True,
             )
             selected_nodes, selected_meta = nodes, meta
             selected_search_radius_m = fallback_radius_m
@@ -1186,22 +1264,6 @@ def place_nodes_along_corridor(
             if broken_count <= 0:
                 break
             attempt_id += 1
-
-        if broken_count > 0:
-            (
-                selected_nodes,
-                selected_meta,
-                selected_working_corridor,
-                selected_corridor_pos,
-                broken_count,
-                selected_budget,
-            ) = _run_attempt(
-                search_radius_m=selected_search_radius_m,
-                attempt_id=selected_attempt_id,
-                phase_label='fallback_initial' if selected_attempt_id > 0 else 'initial',
-                run_gap_repair=True,
-                gap_repair_base_radius_m=selected_search_radius_m,
-            )
 
         selected_nodes, selected_meta, broken_count = _prune_unreachable_endpoint_fallback_nodes(
             selected_nodes,

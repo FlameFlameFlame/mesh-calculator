@@ -1,5 +1,6 @@
 # Change Summary
 
+- 2026-03-08: Reworked corridor recovery flow to run local broken-pair wiggle repair first on each attempt (`_repair_broken_gaps` with 3x buffer-step local rounds) and only then escalate to widened fallback search attempts when links remain broken; updated corridor regression tests to enforce repair-first/fallback-second sequencing and verified full suite (`165 passed`).
 - 2026-03-08: Updated corridor gap-repair radius progression to fixed buffer-size steps (`road + 2*buffer`, `road + 3*buffer`, …) by deriving repair radius from `road_buffer_m` per round, independent of H3 resolution.
 - 2026-03-08: Removed preloaded-cell-only restriction from corridor buffer neighbor queries so fallback/gap-repair search can discover and materialize new adaptive cells outside the initial prepared pool.
 - 2026-03-08: Updated corridor regression expectations for the new fixed-step gap-repair radius policy and revalidated full `mesh_calculator` suite (`165 passed`).

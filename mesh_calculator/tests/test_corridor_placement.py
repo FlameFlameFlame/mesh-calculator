@@ -302,8 +302,8 @@ class TestEndpointHandling(unittest.TestCase):
         self.assertIn("cell_7", nodes, "End endpoint must always be present")
 
 
-class TestDPFallbackBeforeGapRepair(unittest.TestCase):
-    """DP should exhaust fallback initial attempts before running gap repair."""
+class TestDPGapRepairBeforeFallback(unittest.TestCase):
+    """DP should run local broken-gap repair before widening fallback attempts."""
 
     def setUp(self):
         self.config = MeshConfig(
@@ -320,7 +320,7 @@ class TestDPFallbackBeforeGapRepair(unittest.TestCase):
     @patch('mesh_calculator.optimization.corridor._dp_place_towers_with_meta')
     @patch('mesh_calculator.optimization.corridor.compute_los')
     @patch('mesh_calculator.core.geometry.h3_distance')
-    def test_gap_repair_radius_starts_from_fallback_radius(
+    def test_repair_runs_before_fallback_widening(
         self,
         mock_distance,
         mock_compute_los,
@@ -340,14 +340,14 @@ class TestDPFallbackBeforeGapRepair(unittest.TestCase):
             distance_m=1000.0, is_visible=False,
         )
 
-        used_radii = []
+        repair_calls = []
 
         def _repair_passthrough(
             chain, _corridor, _corridor_pos, *,
             search_radius_m, repair_round, attempt_id,
             surface, cache, user_budget, node_meta=None, los_max_workers=None,
         ):
-            used_radii.append(float(search_radius_m))
+            repair_calls.append((int(attempt_id), float(search_radius_m)))
             return chain
 
         mock_repair.side_effect = _repair_passthrough
@@ -355,17 +355,18 @@ class TestDPFallbackBeforeGapRepair(unittest.TestCase):
         place_nodes_along_corridor(corridor, surface)
 
         self.assertEqual(
-            used_radii,
-            [200.0, 300.0],
-            "Gap repair must widen in fixed buffer-size steps (2x, 3x, ...)",
+            repair_calls,
+            [(0, 100.0), (1, 100.0)],
+            "Run broken-gap wiggle on initial attempt first, then fallback attempt(s)",
         )
+        self.assertEqual(mock_dp.call_count, 2, "Initial + one widened fallback attempt expected")
 
     @patch('mesh_calculator.optimization.corridor.h3.grid_disk')
     @patch('mesh_calculator.optimization.corridor._repair_broken_gaps')
     @patch('mesh_calculator.optimization.corridor._dp_place_towers_with_meta')
     @patch('mesh_calculator.optimization.corridor.compute_los')
     @patch('mesh_calculator.core.geometry.h3_distance')
-    def test_fallback_success_skips_gap_repair(
+    def test_successful_repair_skips_fallback_attempts(
         self,
         mock_distance,
         mock_compute_los,
@@ -379,10 +380,7 @@ class TestDPFallbackBeforeGapRepair(unittest.TestCase):
 
         mock_grid_disk.side_effect = lambda cell, ring: [cell]
         mock_distance.return_value = 1000.0
-        mock_dp.side_effect = [
-            (["cell_0", "cell_2"], 2),     # initial attempt fails
-            (["cell_0", "cell_1", "cell_2"], 3),  # fallback attempt succeeds
-        ]
+        mock_dp.return_value = (["cell_0", "cell_2"], 2)
 
         def _los(src, dst, *_a, **_k):
             visible = (src, dst) in {("cell_0", "cell_1"), ("cell_1", "cell_2")}
@@ -394,11 +392,13 @@ class TestDPFallbackBeforeGapRepair(unittest.TestCase):
             )
 
         mock_compute_los.side_effect = _los
+        mock_repair.side_effect = lambda chain, *_a, **_k: ["cell_0", "cell_1", "cell_2"]
 
         nodes = place_nodes_along_corridor(corridor, surface)
 
         self.assertEqual(nodes, ["cell_0", "cell_1", "cell_2"])
-        self.assertEqual(mock_repair.call_count, 0, "Gap repair should be last resort only")
+        self.assertEqual(mock_repair.call_count, 1, "Gap repair should run in initial attempt")
+        self.assertEqual(mock_dp.call_count, 1, "Fallback attempts should be skipped after repair success")
 
 
 class TestDPParallelDeterminism(unittest.TestCase):
