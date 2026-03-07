@@ -2,7 +2,7 @@
 Deterministic serial-vs-parallel regression probe for route pipeline outputs.
 
 Usage:
-    poetry run python -m mesh_calculator.utils.parallel_probe \
+    uv run python -m mesh_calculator.utils.parallel_probe \
       --project-dir /path/to/project
 """
 from __future__ import annotations

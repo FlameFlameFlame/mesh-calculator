@@ -35,13 +35,7 @@ This system optimizes wireless mesh network tower placement to connect target lo
 sudo apt-get install gdal-bin libgdal-dev libspatialindex-dev
 
 # Install Python package
-pip install -e .
-```
-
-### Install from requirements.txt
-
-```bash
-pip install -r requirements.txt
+uv sync --group dev
 ```
 
 ## Usage

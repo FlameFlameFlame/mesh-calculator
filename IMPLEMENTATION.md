@@ -96,7 +96,7 @@ mesh_calculator/
 
 ### Installation
 ```bash
-pip install -e .
+uv sync --group dev
 ```
 
 ### Run Optimizer

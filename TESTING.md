@@ -46,25 +46,20 @@
 
 ```bash
 cd mesh_calculator
-pip install -e .
-```
-
-Or install test requirements:
-```bash
-pip install pytest pytest-cov
+uv sync --group dev
 ```
 
 ### 2. Run Unit Tests
 
 ```bash
 # All tests
-pytest mesh_calculator/tests/ -v
+uv run pytest mesh_calculator/tests/ -v
 
 # Specific test file
-pytest mesh_calculator/tests/test_geometry.py -v
+uv run pytest mesh_calculator/tests/test_geometry.py -v
 
 # With coverage
-pytest mesh_calculator/tests/ --cov=mesh_calculator --cov-report=html
+uv run pytest mesh_calculator/tests/ --cov=mesh_calculator --cov-report=html
 ```
 
 Or run directly with Python:
@@ -90,7 +85,7 @@ This creates `test_data/` directory with:
 ### 4. Run Integration Test
 
 ```bash
-pytest mesh_calculator/tests/test_integration.py -v -s
+uv run pytest mesh_calculator/tests/test_integration.py -v -s
 ```
 
 Or directly:
@@ -207,7 +202,7 @@ Integration Test PASSED
 
 ### Missing Dependencies
 ```bash
-pip install h3 shapely geopandas rasterio networkx numpy scipy
+uv sync --group dev
 ```
 
 ### Import Errors
@@ -227,7 +222,7 @@ brew install gdal
 sudo apt-get install gdal-bin libgdal-dev
 
 # Then reinstall rasterio
-pip install --no-cache-dir rasterio
+uv pip install --reinstall --no-cache-dir rasterio
 ```
 
 ## Manual Testing
@@ -282,11 +277,10 @@ jobs:
 
       - name: Install Python dependencies
         run: |
-          pip install -e .
-          pip install pytest pytest-cov
+          uv sync --group dev
 
       - name: Run tests
-        run: pytest mesh_calculator/tests/ -v --cov=mesh_calculator
+        run: uv run pytest mesh_calculator/tests/ -v --cov=mesh_calculator
 
       - name: Upload coverage
         uses: codecov/codecov-action@v2
