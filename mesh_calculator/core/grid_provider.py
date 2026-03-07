@@ -34,7 +34,7 @@ from .road_corridor import road_geojson_to_h3_corridor
 
 logger = structlog.get_logger(__name__)
 
-_DEFAULT_BUNDLE_RESOLUTIONS = (8, 9, 10)
+_DEFAULT_BUNDLE_RESOLUTIONS = (8, 9)
 _GRID_BUNDLE_VERSION = 3
 _SUPPORTED_BUNDLE_VERSIONS = {3}
 _EARTH_R = 6_371_000.0
@@ -113,7 +113,7 @@ class GridProvider:
     Multi-resolution grid/elevation provider.
 
     Responsibilities:
-    - Bundle build/load for resolutions 8..11 (or configured set)
+    - Bundle build/load for resolutions 8..9 (or configured set)
     - H3 full/road cell lookup by resolution
     - Radius-to-ring conversions and disk expansion helpers
     - Terrain/elevation proxy methods used by LOS calculations
@@ -455,17 +455,15 @@ class GridProvider:
         return (
             int(base_resolution),
             bool(getattr(config, "auto_refine_h3_on_gradient", False)),
-            int(getattr(config, "auto_refine_h3_max_resolution", 10)),
+            int(getattr(config, "auto_refine_h3_max_resolution", 9)),
         )
 
     def _ladder_target_resolution(self, gradient_m_per_km: float, base_resolution: int, config: MeshConfig) -> int:
         target = int(base_resolution)
-        if gradient_m_per_km > 100.0:
-            target = 10
-        elif gradient_m_per_km > 50.0:
+        if gradient_m_per_km > 75.0:
             target = 9
         target = max(int(base_resolution), target)
-        target = min(target, int(getattr(config, "auto_refine_h3_max_resolution", 10)))
+        target = min(target, int(getattr(config, "auto_refine_h3_max_resolution", 9)))
         return target
 
     def _base_cell_local_gradient(self, base_h3: str, base_full: set[str]) -> float:
@@ -1002,8 +1000,7 @@ class GridProvider:
         Resolve effective resolution via hardcoded slope ladder.
 
         Ladder (by configured percentile gradient):
-        - >100 m/km -> 10
-        - >50  m/km -> 9
+        - >75  m/km -> 9
         """
         if not routes:
             return base_resolution, False, None, None
@@ -1031,9 +1028,7 @@ class GridProvider:
 
         pctl = float(np.percentile(np.asarray(slopes, dtype=np.float64), config.gradient_refine_percentile))
         target = base_resolution
-        if pctl > 100.0:
-            target = 10
-        elif pctl > 50.0:
+        if pctl > 75.0:
             target = 9
 
         target = max(base_resolution, target)
