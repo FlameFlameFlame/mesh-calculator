@@ -163,7 +163,7 @@ def test_adaptive_ladder_and_radius_query_monotonic():
         try:
             cfg = MeshConfig(h3_resolution=8, auto_refine_h3_on_gradient=True, auto_refine_h3_max_resolution=10)
             assert provider._ladder_target_resolution(120.0, 8, cfg) == 10
-            assert provider._ladder_target_resolution(80.0, 8, cfg) == 10
+            assert provider._ladder_target_resolution(80.0, 8, cfg) == 9
             assert provider._ladder_target_resolution(55.0, 8, cfg) == 9
             assert provider._ladder_target_resolution(10.0, 8, cfg) == 8
 

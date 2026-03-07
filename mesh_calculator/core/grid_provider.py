@@ -408,8 +408,6 @@ class GridProvider:
         target = int(base_resolution)
         if gradient_m_per_km > 100.0:
             target = 10
-        elif gradient_m_per_km > 75.0:
-            target = 10
         elif gradient_m_per_km > 50.0:
             target = 9
         target = max(int(base_resolution), target)
@@ -833,8 +831,6 @@ class GridProvider:
         pctl = float(np.percentile(np.asarray(slopes, dtype=np.float64), config.gradient_refine_percentile))
         target = base_resolution
         if pctl > 100.0:
-            target = 10
-        elif pctl > 75.0:
             target = 10
         elif pctl > 50.0:
             target = 9
