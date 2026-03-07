@@ -947,8 +947,14 @@ def place_nodes_along_corridor(
         all_candidate_cells = sorted(set(candidate_buffer_cells))
         best_by_road: dict = {}
         for nb in candidate_buffer_cells:
+            pending = pending_cells.get(nb)
+            if nb in cells:
+                elev = cells[nb].elevation
+            elif pending is not None:
+                elev = pending[2]
+            else:
+                continue
             closest = min(corridor_set, key=lambda r: h3_distance(nb, r))
-            elev = cells[nb].elevation
             if closest not in best_by_road or elev > best_by_road[closest][1]:
                 best_by_road[closest] = (nb, elev)
         injected = 0
@@ -970,6 +976,8 @@ def place_nodes_along_corridor(
                         los_lat=los_lat,
                         los_lon=los_lon,
                     )
+                else:
+                    continue
             try:
                 pos = working_corridor.index(road_h3)
             except ValueError:

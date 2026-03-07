@@ -87,7 +87,7 @@ class TestDPNonAdjacentLOS(unittest.TestCase):
         """
         corridor = make_corridor(5)
         cells = make_cells(5)
-        surface = MeshSurface(cells, self.config)
+        surface = MeshSurface(cells, self.config, elevation_provider=object())
         mock_distance.return_value = 1000.0
 
         mock_compute_los.side_effect = make_compute_los_func({
@@ -330,7 +330,7 @@ class TestDPGapRepairBeforeFallback(unittest.TestCase):
     ):
         corridor = make_corridor(3)
         cells = make_cells(3)
-        surface = MeshSurface(cells, self.config)
+        surface = MeshSurface(cells, self.config, elevation_provider=object())
 
         mock_grid_disk.side_effect = lambda cell, ring: [cell]
         mock_distance.return_value = 1000.0
@@ -399,6 +399,53 @@ class TestDPGapRepairBeforeFallback(unittest.TestCase):
         self.assertEqual(nodes, ["cell_0", "cell_1", "cell_2"])
         self.assertEqual(mock_repair.call_count, 1, "Gap repair should run in initial attempt")
         self.assertEqual(mock_dp.call_count, 1, "Fallback attempts should be skipped after repair success")
+
+
+class TestDPBufferCandidateMaterialization(unittest.TestCase):
+    """Buffer candidate scoring should handle pending (not-yet-materialized) cells."""
+
+    def setUp(self):
+        self.config = MeshConfig(
+            mast_height_m=10.0,
+            max_towers_per_route=6,
+            road_buffer_m=100.0,
+            gap_repair_rounds=0,
+        )
+
+    @patch('mesh_calculator.optimization.corridor._adaptive_cells_within_radius')
+    @patch('mesh_calculator.optimization.corridor._cell_profile')
+    @patch('mesh_calculator.optimization.corridor._dp_place_towers_with_meta')
+    @patch('mesh_calculator.optimization.corridor.compute_los')
+    @patch('mesh_calculator.core.geometry.h3_distance')
+    def test_pending_buffer_cell_does_not_keyerror(
+        self,
+        mock_distance,
+        mock_compute_los,
+        mock_dp,
+        mock_cell_profile,
+        mock_adaptive_cells,
+    ):
+        corridor = make_corridor(3)
+        cells = make_cells(3)
+        surface = MeshSurface(cells, self.config, elevation_provider=object())
+        pending_cell = "892c0547577ffff"
+
+        mock_distance.return_value = 1000.0
+        mock_adaptive_cells.return_value = {pending_cell}
+        mock_cell_profile.return_value = (120.0, 40.1234, 44.5678)
+        mock_dp.side_effect = lambda segment, *_a, **_k: ([segment[0], segment[-1]], 2)
+        mock_compute_los.return_value = LOSResult(
+            clearance_m=10.0,
+            path_loss_db=50.0,
+            distance_m=1000.0,
+            is_visible=True,
+        )
+
+        nodes = place_nodes_along_corridor(corridor, surface)
+
+        self.assertEqual(nodes[0], "cell_0")
+        self.assertTrue(nodes, "Placement should return a non-empty chain")
+        self.assertIn(pending_cell, surface.cells, "Pending buffer cell should be materialized")
 
 
 class TestDPParallelDeterminism(unittest.TestCase):
