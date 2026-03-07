@@ -179,7 +179,20 @@ class ElevationProvider:
             return None
         if clipped.width <= 0 or clipped.height <= 0:
             return None
-        return clipped.round_offsets().round_lengths()
+        rounded = clipped.round_offsets().round_lengths()
+        if rounded.width > 0 and rounded.height > 0:
+            return rounded
+
+        # For tiny intersections, round_lengths() can collapse to zero.
+        # Build a conservative integer window via floor/ceil so raster reads
+        # never see width/height == 0.
+        col0 = max(0, int(np.floor(clipped.col_off)))
+        row0 = max(0, int(np.floor(clipped.row_off)))
+        col1 = min(self.dataset.width, int(np.ceil(clipped.col_off + clipped.width)))
+        row1 = min(self.dataset.height, int(np.ceil(clipped.row_off + clipped.height)))
+        if col1 <= col0 or row1 <= row0:
+            return None
+        return Window(col0, row0, col1 - col0, row1 - row0)
 
     def _safe_max(self, arr: np.ma.MaskedArray, valid_mask: np.ndarray) -> Optional[float]:
         if arr.size == 0 or not np.any(valid_mask):
