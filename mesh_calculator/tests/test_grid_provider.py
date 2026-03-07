@@ -132,12 +132,12 @@ def test_adaptive_full_grid_has_no_parent_child_overlap():
             elevation_path=str(tif),
             boundary_geojson=_boundary_geojson(),
             roads_geojson=_roads_geojson(),
-            resolutions=(8, 9, 10, 11),
+            resolutions=(8, 9, 10),
         )
         try:
             # Force steep terrain so adaptive refinement is exercised.
             provider.get_h3_cell_max_elevation = lambda h3_idx: h3.cell_to_latlng(h3_idx)[0] * 10000.0
-            cfg = MeshConfig(h3_resolution=8, auto_refine_h3_on_gradient=True, auto_refine_h3_max_resolution=11)
+            cfg = MeshConfig(h3_resolution=8, auto_refine_h3_on_gradient=True, auto_refine_h3_max_resolution=10)
             adaptive = provider.get_adaptive_full_cells(8, cfg)
             assert adaptive
             for idx in adaptive:
@@ -158,11 +158,11 @@ def test_adaptive_ladder_and_radius_query_monotonic():
             elevation_path=str(tif),
             boundary_geojson=_boundary_geojson(),
             roads_geojson=_roads_geojson(),
-            resolutions=(8, 9, 10, 11),
+            resolutions=(8, 9, 10),
         )
         try:
-            cfg = MeshConfig(h3_resolution=8, auto_refine_h3_on_gradient=True, auto_refine_h3_max_resolution=11)
-            assert provider._ladder_target_resolution(120.0, 8, cfg) == 11
+            cfg = MeshConfig(h3_resolution=8, auto_refine_h3_on_gradient=True, auto_refine_h3_max_resolution=10)
+            assert provider._ladder_target_resolution(120.0, 8, cfg) == 10
             assert provider._ladder_target_resolution(80.0, 8, cfg) == 10
             assert provider._ladder_target_resolution(55.0, 8, cfg) == 9
             assert provider._ladder_target_resolution(10.0, 8, cfg) == 8

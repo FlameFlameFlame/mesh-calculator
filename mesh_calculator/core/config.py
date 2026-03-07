@@ -31,7 +31,7 @@ class MeshConfig:
     auto_refine_h3_on_gradient: bool = True
     gradient_refine_threshold_m_per_km: float = 100.0
     gradient_refine_percentile: float = 90.0
-    auto_refine_h3_max_resolution: int = 11
+    auto_refine_h3_max_resolution: int = 10
     export_full_grid_cells: bool = True
     max_coverage_radius_m: float = 15000.0  # Max tower coverage search radius in meters
     coverage_receiver_height_m: float = 1.5  # RX height above ground for tower-coverage maps
