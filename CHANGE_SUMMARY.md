@@ -59,3 +59,8 @@
 - 2026-03-07: Updated planning defaults in `MeshConfig` to `mast_height_m=5.0` and `road_buffer_m=100.0`, and aligned default-value regression tests accordingly.
 - 2026-03-07: Reordered DP corridor strategy to run initial + fallback widening attempts before any gap repair; gap repair is now final-resort and widens from the selected fallback radius using additive ladder increments.
 - 2026-03-07: Added corridor regression coverage for fallback-first ordering and for gap-repair radius progression from fallback base (`test_corridor_placement.py::TestDPFallbackBeforeGapRepair`).
+- 2026-03-07: Replaced +1 gradient auto-refine rule with a hardcoded H3 ladder in route pipeline: `pXX>100 m/km -> res 11`, `>75 -> 10`, `>50 -> 9` (never downscales below configured base resolution).
+- 2026-03-07: Completed provider-only route/coverage flow: `run_route_pipeline(...)` now requires `grid_provider` and resolves corridors through provider methods; route CLI now uses `--grid-bundle` and loads `GridProvider` directly from bundle.
+- 2026-03-07: Added `core/grid_provider.py` bundle metadata/versioning (`version=2`) with source-integrity fields (`boundary_sha256`, `roads_sha256`, elevation file metadata, resolution set) while retaining backward-compatible loading of legacy v1 bundles.
+- 2026-03-07: Fixed a lazy road-cell lookup bug in `GridProvider` by separating roads GeoDataFrame cache attribute/method names (`_roads_gdf_cache` + `_get_roads_gdf`) so non-prebuilt resolutions no longer risk runtime failures.
+- 2026-03-07: Added provider regression tests in `tests/test_grid_provider.py` covering bundle metadata round-trip and lazy road-cell retrieval for unbundled resolutions.

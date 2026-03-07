@@ -51,6 +51,10 @@ class LOSCache:
         los_dense_sample_step_m: float,
         los_dense_max_samples: int,
         los_verification_mode: str,
+        src_lat: Optional[float],
+        src_lon: Optional[float],
+        dst_lat: Optional[float],
+        dst_lon: Optional[float],
     ) -> Tuple:
         """
         Create normalized cache key (always src <= dst for symmetry).
@@ -76,6 +80,10 @@ class LOSCache:
                 tx_power_mw, antenna_gain_dbi, receiver_sensitivity_dbm,
                 min_fresnel_clearance_m,
                 los_dense_sample_step_m, los_dense_max_samples, los_verification_mode,
+                round(src_lat, 6) if src_lat is not None else None,
+                round(src_lon, 6) if src_lon is not None else None,
+                round(dst_lat, 6) if dst_lat is not None else None,
+                round(dst_lon, 6) if dst_lon is not None else None,
             )
         else:
             return (
@@ -83,6 +91,10 @@ class LOSCache:
                 tx_power_mw, antenna_gain_dbi, receiver_sensitivity_dbm,
                 min_fresnel_clearance_m,
                 los_dense_sample_step_m, los_dense_max_samples, los_verification_mode,
+                round(dst_lat, 6) if dst_lat is not None else None,
+                round(dst_lon, 6) if dst_lon is not None else None,
+                round(src_lat, 6) if src_lat is not None else None,
+                round(src_lon, 6) if src_lon is not None else None,
             )
 
     def get(
@@ -99,6 +111,10 @@ class LOSCache:
         los_dense_sample_step_m: float = 50.0,
         los_dense_max_samples: int = 400,
         los_verification_mode: str = "hybrid_accept_verify",
+        src_lat: Optional[float] = None,
+        src_lon: Optional[float] = None,
+        dst_lat: Optional[float] = None,
+        dst_lon: Optional[float] = None,
     ) -> Optional[LOSResult]:
         """
         Get cached LOS result if available.
@@ -123,6 +139,7 @@ class LOSCache:
             tx_power_mw, antenna_gain_dbi, receiver_sensitivity_dbm,
             min_fresnel_clearance_m,
             los_dense_sample_step_m, los_dense_max_samples, los_verification_mode,
+            src_lat, src_lon, dst_lat, dst_lon,
         )
 
         with self._lock:
@@ -148,6 +165,10 @@ class LOSCache:
         los_dense_sample_step_m: float = 50.0,
         los_dense_max_samples: int = 400,
         los_verification_mode: str = "hybrid_accept_verify",
+        src_lat: Optional[float] = None,
+        src_lon: Optional[float] = None,
+        dst_lat: Optional[float] = None,
+        dst_lon: Optional[float] = None,
     ):
         """
         Store LOS result in cache.
@@ -170,6 +191,7 @@ class LOSCache:
             tx_power_mw, antenna_gain_dbi, receiver_sensitivity_dbm,
             min_fresnel_clearance_m,
             los_dense_sample_step_m, los_dense_max_samples, los_verification_mode,
+            src_lat, src_lon, dst_lat, dst_lon,
         )
 
         with self._lock:

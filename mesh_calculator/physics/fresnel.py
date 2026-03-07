@@ -48,6 +48,14 @@ class FresnelProfileSummary:
     worst_obstruction_frac: float
 
 
+def _cell_los_coords(cell: H3Cell) -> tuple[float, float]:
+    """Return fixed LOS anchor coordinates, falling back to centroid."""
+    return (
+        float(getattr(cell, "los_lat", cell.lat)),
+        float(getattr(cell, "los_lon", cell.lon)),
+    )
+
+
 def _fraction_along_line(
     src_lat: float,
     src_lon: float,
@@ -73,6 +81,10 @@ def _coarse_profile_samples(
     h3_dst: str,
     src_cell: H3Cell,
     dst_cell: H3Cell,
+    src_lat: float,
+    src_lon: float,
+    dst_lat: float,
+    dst_lon: float,
     cells: Dict[str, H3Cell],
     elevation_provider=None,
 ) -> list[tuple[float, float]]:
@@ -99,7 +111,7 @@ def _coarse_profile_samples(
         c = cells.get(cell_h3)
         if c is not None:
             frac = _fraction_along_line(
-                src_cell.lat, src_cell.lon, dst_cell.lat, dst_cell.lon, c.lat, c.lon
+                src_lat, src_lon, dst_lat, dst_lon, c.lat, c.lon
             )
             samples.append(ProfilePoint(frac, float(c.elevation)))
             continue
@@ -111,7 +123,7 @@ def _coarse_profile_samples(
         except Exception:
             continue
         frac = _fraction_along_line(
-            src_cell.lat, src_cell.lon, dst_cell.lat, dst_cell.lon, lat, lon
+            src_lat, src_lon, dst_lat, dst_lon, lat, lon
         )
         samples.append(ProfilePoint(frac, elev))
 
@@ -128,6 +140,10 @@ def _coarse_profile_samples(
 def _dense_profile_samples(
     src_cell: H3Cell,
     dst_cell: H3Cell,
+    src_lat: float,
+    src_lon: float,
+    dst_lat: float,
+    dst_lon: float,
     total_distance_m: float,
     elevation_provider,
     sample_step_m: float,
@@ -152,8 +168,8 @@ def _dense_profile_samples(
     ]
     for i in range(1, n_samples):
         frac = i / n_samples
-        lat = src_cell.lat + (dst_cell.lat - src_cell.lat) * frac
-        lon = src_cell.lon + (dst_cell.lon - src_cell.lon) * frac
+        lat = src_lat + (dst_lat - src_lat) * frac
+        lon = src_lon + (dst_lon - src_lon) * frac
         try:
             elev = float(get_elevation(lat, lon))
         except Exception:
@@ -238,6 +254,10 @@ def _refine_dense_profile(
     metrics: list[ProfileMetric],
     src_cell: H3Cell,
     dst_cell: H3Cell,
+    src_lat: float,
+    src_lon: float,
+    dst_lat: float,
+    dst_lon: float,
     total_distance_m: float,
     elevation_provider,
     max_samples: int,
@@ -276,8 +296,8 @@ def _refine_dense_profile(
             if len(refined) >= max_samples:
                 break
             frac = start_frac + (end_frac - start_frac) * (step / n_steps)
-            lat = src_cell.lat + (dst_cell.lat - src_cell.lat) * frac
-            lon = src_cell.lon + (dst_cell.lon - src_cell.lon) * frac
+            lat = src_lat + (dst_lat - src_lat) * frac
+            lon = src_lon + (dst_lon - src_lon) * frac
             try:
                 elev = float(get_elevation(lat, lon))
             except Exception:
@@ -315,6 +335,8 @@ def compute_fresnel_profile_summary(
     dst_cell = cells[h3_dst]
     src_mast = config.mast_height_m if mast_height_src_m is None else mast_height_src_m
     dst_mast = config.mast_height_m if mast_height_dst_m is None else mast_height_dst_m
+    src_lat, src_lon = _cell_los_coords(src_cell)
+    dst_lat, dst_lon = _cell_los_coords(dst_cell)
 
     if h3_src == h3_dst:
         return FresnelProfileSummary(
@@ -329,7 +351,7 @@ def compute_fresnel_profile_summary(
     src_height = src_cell.elevation + src_mast
     dst_height = dst_cell.elevation + dst_mast
     total_distance = great_circle_distance(
-        src_cell.lat, src_cell.lon, dst_cell.lat, dst_cell.lon
+        src_lat, src_lon, dst_lat, dst_lon
     )
     if total_distance <= 0:
         return FresnelProfileSummary(
@@ -346,6 +368,10 @@ def compute_fresnel_profile_summary(
         h3_dst=h3_dst,
         src_cell=src_cell,
         dst_cell=dst_cell,
+        src_lat=src_lat,
+        src_lon=src_lon,
+        dst_lat=dst_lat,
+        dst_lon=dst_lon,
         cells=cells,
         elevation_provider=elevation_provider,
     )
@@ -379,6 +405,8 @@ def compute_fresnel_profile_summary_dense(
     dst_cell = cells[h3_dst]
     src_mast = config.mast_height_m if mast_height_src_m is None else mast_height_src_m
     dst_mast = config.mast_height_m if mast_height_dst_m is None else mast_height_dst_m
+    src_lat, src_lon = _cell_los_coords(src_cell)
+    dst_lat, dst_lon = _cell_los_coords(dst_cell)
 
     if h3_src == h3_dst:
         return FresnelProfileSummary(
@@ -393,7 +421,7 @@ def compute_fresnel_profile_summary_dense(
     src_height = src_cell.elevation + src_mast
     dst_height = dst_cell.elevation + dst_mast
     total_distance = great_circle_distance(
-        src_cell.lat, src_cell.lon, dst_cell.lat, dst_cell.lon
+        src_lat, src_lon, dst_lat, dst_lon
     )
     if total_distance <= 0:
         return FresnelProfileSummary(
@@ -408,6 +436,10 @@ def compute_fresnel_profile_summary_dense(
     dense_samples = _dense_profile_samples(
         src_cell=src_cell,
         dst_cell=dst_cell,
+        src_lat=src_lat,
+        src_lon=src_lon,
+        dst_lat=dst_lat,
+        dst_lon=dst_lon,
         total_distance_m=total_distance,
         elevation_provider=elevation_provider,
         sample_step_m=(
@@ -434,6 +466,10 @@ def compute_fresnel_profile_summary_dense(
         metrics=metrics,
         src_cell=src_cell,
         dst_cell=dst_cell,
+        src_lat=src_lat,
+        src_lon=src_lon,
+        dst_lat=dst_lat,
+        dst_lon=dst_lon,
         total_distance_m=total_distance,
         elevation_provider=elevation_provider,
         max_samples=(

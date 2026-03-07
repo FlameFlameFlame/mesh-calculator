@@ -21,7 +21,7 @@ class TestTowerCoverageRuntime(unittest.TestCase):
             sources=[CoverageSource(1, self.src_h3, self.src_lat, self.src_lon)],
             base_cells={},
             config=self.config,
-            elevation_provider=None,
+            grid_provider=None,
         )
         by_h3 = {r["h3_index"]: r for r in results}
         self.assertIn(self.src_h3, by_h3)
@@ -38,7 +38,7 @@ class TestTowerCoverageRuntime(unittest.TestCase):
             ],
             base_cells={},
             config=self.config,
-            elevation_provider=None,
+            grid_provider=None,
         )
         source_rows = [r for r in results if r["h3_index"] == self.src_h3]
         self.assertEqual(len(source_rows), 1)
@@ -53,7 +53,7 @@ class TestTowerCoverageRuntime(unittest.TestCase):
             sources=[CoverageSource(1, stale_h3, self.src_lat, self.src_lon)],
             base_cells={},
             config=config_res9,
-            elevation_provider=None,
+            grid_provider=None,
         )
         by_h3 = {r["h3_index"]: r for r in results}
         self.assertIn(expected_h3, by_h3)
@@ -79,7 +79,7 @@ class TestTowerCoverageRuntime(unittest.TestCase):
             sources=[CoverageSource(1, self.src_h3, self.src_lat, self.src_lon)],
             base_cells={},
             config=self.config,
-            elevation_provider=None,
+            grid_provider=None,
         )
         by_h3 = {r["h3_index"]: r for r in results}
         self.assertIn(neighbor_h3, by_h3)
@@ -110,7 +110,7 @@ class TestTowerCoverageRuntime(unittest.TestCase):
             ],
             base_cells={},
             config=self.config,
-            elevation_provider=None,
+            grid_provider=None,
         )
         by_h3 = {r["h3_index"]: r for r in results}
         self.assertIn(target_h3, by_h3)

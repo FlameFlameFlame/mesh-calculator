@@ -139,7 +139,7 @@ class TestTowerPhysicsGroundTruth(unittest.TestCase):
             ],
             base_cells=self.cells,
             config=self.config_strict,
-            elevation_provider=self.terrain,
+            grid_provider=self.terrain,
             max_radius_m=4000.0,
         )
         by_h3 = {rec["h3_index"]: rec for rec in coverage}

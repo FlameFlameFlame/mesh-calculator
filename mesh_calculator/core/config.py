@@ -31,7 +31,7 @@ class MeshConfig:
     auto_refine_h3_on_gradient: bool = True
     gradient_refine_threshold_m_per_km: float = 100.0
     gradient_refine_percentile: float = 90.0
-    auto_refine_h3_max_resolution: int = 10
+    auto_refine_h3_max_resolution: int = 11
     export_full_grid_cells: bool = True
     max_coverage_radius_m: float = 15000.0  # Max tower coverage search radius in meters
     coverage_receiver_height_m: float = 1.5  # RX height above ground for tower-coverage maps
@@ -45,6 +45,7 @@ class MeshConfig:
     min_fresnel_clearance_m: Optional[float] = None
     los_dense_sample_step_m: float = 50.0
     los_dense_max_samples: int = 400
+    cell_anchor_margin_m: float = 10.0
 
     # Physical constants
     earth_radius_m: float = 6371000.0  # Earth radius in meters
@@ -99,6 +100,7 @@ class InputPaths:
     target_sites: str  # GeoJSON sites with priorities
     existing_towers: Optional[str] = None  # Optional seed towers
     city_boundaries: Optional[str] = None  # City boundary polygons
+    grid_bundle: Optional[str] = None  # Optional persisted multi-resolution grid bundle
 
 
 @dataclass

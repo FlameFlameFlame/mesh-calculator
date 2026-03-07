@@ -15,7 +15,7 @@ from scipy.spatial import cKDTree
 import structlog
 
 from ..core.config import MeshConfig
-from ..core.grid import H3Cell
+from ..core.grid import H3Cell, resolve_cell_profile
 from ..data.cache import LOSCache
 from ..core.geometry import great_circle_distance
 from ..physics.path_loss import fspl_only
@@ -141,7 +141,7 @@ def _compute_shadow_link(
     source_cell: H3Cell,
     target_cell: H3Cell,
     config: MeshConfig,
-    elevation_provider=None,
+    grid_provider=None,
 ) -> tuple[float, float, float, bool]:
     """
     Compute strict terrain-shadow viability for tower coverage.
@@ -165,7 +165,7 @@ def _compute_shadow_link(
         target_cell=target_cell,
         distance_m=distance_m,
         config=config,
-        elevation_provider=elevation_provider,
+        elevation_provider=grid_provider,
     )
     worst_clearance = float("inf")
     for frac, terrain_elev in profile:
@@ -189,7 +189,7 @@ def compute_h3_tower_coverage(
     sources: Iterable[CoverageSource],
     base_cells: Dict[str, H3Cell],
     config: MeshConfig,
-    elevation_provider=None,
+    grid_provider=None,
     los_cache: LOSCache = None,
     max_radius_m: Optional[float] = None,
 ) -> list[dict]:
@@ -227,7 +227,13 @@ def compute_h3_tower_coverage(
     augmented_cells = dict(base_cells)
     for src in src_list:
         if src.h3_index not in augmented_cells:
-            elev = _cell_elevation(elevation_provider, src.h3_index, src.lat, src.lon)
+            elev, los_lat, los_lon = resolve_cell_profile(
+                grid_provider,
+                src.h3_index,
+                src.lat,
+                src.lon,
+                anchor_margin_m=config.cell_anchor_margin_m,
+            )
             augmented_cells[src.h3_index] = H3Cell(
                 h3_index=src.h3_index,
                 lat=src.lat,
@@ -235,12 +241,20 @@ def compute_h3_tower_coverage(
                 elevation=elev,
                 has_road=False,
                 is_in_boundary=False,
+                los_lat=los_lat,
+                los_lon=los_lon,
             )
 
     for h3_idx in candidate_h3s:
         if h3_idx not in augmented_cells:
             lat, lon = h3.cell_to_latlng(h3_idx)
-            elev = _cell_elevation(elevation_provider, h3_idx, lat, lon)
+            elev, los_lat, los_lon = resolve_cell_profile(
+                grid_provider,
+                h3_idx,
+                lat,
+                lon,
+                anchor_margin_m=config.cell_anchor_margin_m,
+            )
             augmented_cells[h3_idx] = H3Cell(
                 h3_index=h3_idx,
                 lat=lat,
@@ -248,6 +262,8 @@ def compute_h3_tower_coverage(
                 elevation=elev,
                 has_road=False,
                 is_in_boundary=False,
+                los_lat=los_lat,
+                los_lon=los_lon,
             )
 
     cand_list = [augmented_cells[h] for h in candidate_h3s]
@@ -289,7 +305,7 @@ def compute_h3_tower_coverage(
             source_cell=src_cell,
             target_cell=c,
             config=config,
-            elevation_provider=elevation_provider,
+            grid_provider=grid_provider,
         )
         if is_visible:
             return (ci, si, distance_m, clearance_m, path_loss_db)

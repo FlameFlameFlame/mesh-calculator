@@ -200,6 +200,67 @@ class TestLOSCache(unittest.TestCase):
         self.assertIsNotNone(cached_same)
         self.assertIsNone(cached_diff)
 
+    def test_cache_key_includes_endpoint_coordinates(self):
+        """Same H3 pair with different endpoint anchors must not collide."""
+        result = LOSResult(1.0, 100.0, 1000.0, True)
+        self.cache.put(
+            'h3_a', 'h3_b',
+            10.0, 10.0,
+            868e6,
+            result,
+            src_lat=40.0001,
+            src_lon=44.0001,
+            dst_lat=40.0002,
+            dst_lon=44.0002,
+        )
+
+        cached_same = self.cache.get(
+            'h3_a', 'h3_b',
+            10.0, 10.0,
+            868e6,
+            src_lat=40.0001,
+            src_lon=44.0001,
+            dst_lat=40.0002,
+            dst_lon=44.0002,
+        )
+        cached_diff = self.cache.get(
+            'h3_a', 'h3_b',
+            10.0, 10.0,
+            868e6,
+            src_lat=40.0101,
+            src_lon=44.0101,
+            dst_lat=40.0002,
+            dst_lon=44.0002,
+        )
+
+        self.assertIsNotNone(cached_same)
+        self.assertIsNone(cached_diff)
+
+    def test_cache_key_endpoint_coordinates_remain_symmetric(self):
+        """Symmetry should still hold when endpoint coordinates are provided."""
+        result = LOSResult(1.0, 100.0, 1000.0, True)
+        self.cache.put(
+            'h3_a', 'h3_b',
+            10.0, 11.0,
+            868e6,
+            result,
+            src_lat=40.1,
+            src_lon=44.1,
+            dst_lat=40.2,
+            dst_lon=44.2,
+        )
+
+        cached = self.cache.get(
+            'h3_b', 'h3_a',
+            11.0, 10.0,
+            868e6,
+            src_lat=40.2,
+            src_lon=44.2,
+            dst_lat=40.1,
+            dst_lon=44.1,
+        )
+        self.assertIsNotNone(cached)
+
 class TestLOSBatchExecution(unittest.TestCase):
     """Batch LOS computation is deterministic and reuses canonical pair work."""
 
