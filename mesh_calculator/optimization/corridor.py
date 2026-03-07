@@ -217,6 +217,7 @@ def _dp_place_towers_with_meta(
                 elevation_provider=elevation_provider,
                 compute_fn=compute_los,
                 diagnostics=los_diag,
+                stage="dp_search",
             )
         else:
             los_results = compute_los_batch_progress(
@@ -229,6 +230,7 @@ def _dp_place_towers_with_meta(
                 compute_fn=compute_los,
                 progress_callback=los_progress_callback,
                 diagnostics=los_diag,
+                stage="dp_search",
             )
         _record_los_diag(surface, los_diag)
         # Preserve deterministic DP tie behavior by applying transitions in the
@@ -545,6 +547,7 @@ def _find_broken_gaps(
             elevation_provider=surface.elevation_provider,
             compute_fn=compute_los,
             diagnostics=los_diag,
+            stage="gap_check",
         )
     else:
         los_results = compute_los_batch_progress(
@@ -557,6 +560,7 @@ def _find_broken_gaps(
             compute_fn=compute_los,
             progress_callback=los_progress_callback,
             diagnostics=los_diag,
+            stage="gap_check",
         )
     _record_los_diag(surface, los_diag)
     for i, pair in enumerate(pairs):
@@ -703,6 +707,7 @@ def _repair_broken_gaps(
                 elevation_provider=surface.elevation_provider,
                 compute_fn=compute_los,
                 diagnostics=los_diag,
+                stage="gap_repair_prune",
             )
             _record_los_diag(surface, los_diag)
             for j in range(len(chain) - 1, new_anchor_b_idx + 1, -1):
@@ -1368,6 +1373,7 @@ def wire_corridor_edges(
         elevation_provider=surface.elevation_provider,
         compute_fn=compute_los,
         diagnostics=los_diag,
+        stage="corridor_wire",
     )
     _record_los_diag(surface, los_diag)
     for h3_a, h3_b, tower_a, tower_b in pending_edges:

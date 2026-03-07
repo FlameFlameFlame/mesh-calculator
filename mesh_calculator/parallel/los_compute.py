@@ -67,6 +67,7 @@ def compute_los_batch(
     compute_fn=None,
     diagnostics: Dict[str, Any] | None = None,
     strict_failures: bool = False,
+    stage: str = "unknown",
 ) -> Dict[Tuple[str, str], LOSResult]:
     """
     Compute LOS for multiple cell pairs in parallel.
@@ -108,6 +109,7 @@ def compute_los_batch(
                 failure_details.append(((h3_src, h3_dst), str(exc)))
         logger.debug(
             "LOS batch executed serially",
+            stage=stage,
             pairs=len(pairs),
             unique_pairs=len(unique_pairs),
             workers=max_workers,
@@ -151,6 +153,7 @@ def compute_los_batch(
                         )
                     logger.debug(
                         "LOS batch chunk complete",
+                        stage=stage,
                         chunk_index=idx,
                         chunk_pairs=len(pair_batches[idx]),
                         workers=max_workers,
@@ -163,6 +166,7 @@ def compute_los_batch(
                 canonical_results.update(batch_result)
         logger.debug(
             "LOS batch executed in parallel",
+            stage=stage,
             pairs=len(pairs),
             unique_pairs=len(unique_pairs),
             workers=max_workers,
@@ -197,6 +201,7 @@ def compute_los_batch(
     elapsed_s = round(time.perf_counter() - started_at, 4)
     if diagnostics is not None:
         diagnostics.update({
+            "stage": stage,
             "pairs_requested": len(pairs),
             "unique_pairs": len(unique_pairs),
             "pairs_computed": len(canonical_results),
@@ -216,7 +221,8 @@ def compute_los_batch(
                 for pair, error in failure_details[:5]
             ]
     logger.debug(
-        "LOS batch diagnostics: requested=%d unique=%d computed=%d failed=%d chunks=%d chunk_failures=%d workers=%d elapsed_s=%.4f",
+        "LOS batch diagnostics: stage=%s requested=%d unique=%d computed=%d failed=%d chunks=%d chunk_failures=%d workers=%d elapsed_s=%.4f",
+        stage,
         len(pairs),
         len(unique_pairs),
         len(canonical_results),
@@ -243,6 +249,7 @@ def compute_los_batch_progress(
     strict_failures: bool = False,
     progress_callback=None,
     chunk_progress_callback=None,
+    stage: str = "unknown",
 ) -> Dict[Tuple[str, str], LOSResult]:
     """
     Compute LOS for multiple cell pairs with progress reporting.
@@ -266,7 +273,8 @@ def compute_los_batch_progress(
         compute_fn = compute_los
 
     logger.info(
-        "Computing LOS batch: pairs=%d workers=%d",
+        "Computing LOS batch: stage=%s pairs=%d workers=%d",
+        stage,
         len(pairs),
         max_workers,
     )
@@ -365,6 +373,7 @@ def compute_los_batch_progress(
                         )
                     logger.debug(
                         "LOS batch chunk complete",
+                        stage=stage,
                         chunk_index=idx,
                         chunk_pairs=len(pair_batches[idx]),
                         workers=max_workers,
@@ -407,7 +416,8 @@ def compute_los_batch_progress(
 
     elapsed_s = time.perf_counter() - started_at
     logger.info(
-        "LOS computation complete: successful=%d total=%d failed=%d workers=%d elapsed_s=%.3f",
+        "LOS computation complete: stage=%s successful=%d total=%d failed=%d workers=%d elapsed_s=%.3f",
+        stage,
         len(canonical_results),
         len(unique_pairs),
         len(failure_details),
@@ -434,6 +444,7 @@ def compute_los_batch_progress(
             results[alias] = result
     if diagnostics is not None:
         diagnostics.update({
+            "stage": stage,
             "pairs_requested": len(pairs),
             "unique_pairs": len(unique_pairs),
             "pairs_computed": len(canonical_results),

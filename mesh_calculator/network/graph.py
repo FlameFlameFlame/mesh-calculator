@@ -217,18 +217,35 @@ class MeshSurface:
             "pairs_computed": 0,
             "pairs_failed": 0,
             "chunk_failures": 0,
+            "by_stage": {},
         }
 
     def record_los_batch_diagnostics(self, diagnostics: Optional[dict]) -> None:
         """Aggregate per-call LOS batch diagnostics into surface-level counters."""
         if not diagnostics:
             return
+        stage = str(diagnostics.get("stage", "unknown"))
         self.los_batch_metrics["calls"] += 1
         self.los_batch_metrics["pairs_requested"] += int(diagnostics.get("pairs_requested", 0))
         self.los_batch_metrics["unique_pairs"] += int(diagnostics.get("unique_pairs", 0))
         self.los_batch_metrics["pairs_computed"] += int(diagnostics.get("pairs_computed", 0))
         self.los_batch_metrics["pairs_failed"] += int(diagnostics.get("pairs_failed", 0))
         self.los_batch_metrics["chunk_failures"] += int(diagnostics.get("chunk_failures", 0))
+        by_stage = self.los_batch_metrics.setdefault("by_stage", {})
+        stage_row = by_stage.setdefault(stage, {
+            "calls": 0,
+            "pairs_requested": 0,
+            "unique_pairs": 0,
+            "pairs_computed": 0,
+            "pairs_failed": 0,
+            "chunk_failures": 0,
+        })
+        stage_row["calls"] += 1
+        stage_row["pairs_requested"] += int(diagnostics.get("pairs_requested", 0))
+        stage_row["unique_pairs"] += int(diagnostics.get("unique_pairs", 0))
+        stage_row["pairs_computed"] += int(diagnostics.get("pairs_computed", 0))
+        stage_row["pairs_failed"] += int(diagnostics.get("pairs_failed", 0))
+        stage_row["chunk_failures"] += int(diagnostics.get("chunk_failures", 0))
 
     def place_tower(
         self,
@@ -357,6 +374,7 @@ class MeshSurface:
                 elevation_provider=self.elevation_provider,
                 compute_fn=compute_los,
                 diagnostics=los_diag,
+                stage="visibility",
             )
         else:
             progress_interval = max(1, total_pairs // 40) if total_pairs > 0 else 1
@@ -371,6 +389,7 @@ class MeshSurface:
                 diagnostics=los_diag,
                 progress_callback=progress_callback,
                 chunk_progress_callback=chunk_progress_callback,
+                stage="visibility",
             )
         self.record_los_batch_diagnostics(los_diag)
         for i, j in candidate_pairs:
@@ -482,6 +501,7 @@ class MeshSurface:
             elevation_provider=elev,
             compute_fn=compute_los,
             diagnostics=los_diag,
+            stage="coverage",
         )
         self.record_los_batch_diagnostics(los_diag)
         for h3_pair, refs in h3_pair_refs.items():
