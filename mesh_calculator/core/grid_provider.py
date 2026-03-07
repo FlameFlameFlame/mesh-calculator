@@ -35,8 +35,8 @@ from .road_corridor import road_geojson_to_h3_corridor
 logger = structlog.get_logger(__name__)
 
 _DEFAULT_BUNDLE_RESOLUTIONS = (8, 9, 10)
-_GRID_BUNDLE_VERSION = 2
-_SUPPORTED_BUNDLE_VERSIONS = {1, 2}
+_GRID_BUNDLE_VERSION = 3
+_SUPPORTED_BUNDLE_VERSIONS = {3}
 _EARTH_R = 6_371_000.0
 
 
@@ -128,6 +128,7 @@ class GridProvider:
         roads_geojson: Optional[dict] = None,
         full_cells_by_res: Optional[Dict[int, set[str]]] = None,
         road_cells_by_res: Optional[Dict[int, set[str]]] = None,
+        cell_static_by_res: Optional[Dict[int, dict[str, dict[str, float]]]] = None,
         bundle_path: Optional[str] = None,
     ):
         if not elevation_path or not os.path.isfile(elevation_path):
@@ -144,6 +145,7 @@ class GridProvider:
         self._elevation_provider = ElevationProvider(self.elevation_path)
         self._full_cells_by_res: Dict[int, set[str]] = full_cells_by_res or {}
         self._road_cells_by_res: Dict[int, set[str]] = road_cells_by_res or {}
+        self._cell_static_by_res: Dict[int, dict[str, dict[str, float]]] = cell_static_by_res or {}
         self._cell_cache_by_res: Dict[int, Dict[str, H3Cell]] = {}
         self._adaptive_mesh_cache: Dict[tuple, dict] = {}
         self._lock = threading.Lock()
@@ -168,6 +170,19 @@ class GridProvider:
             int(res): set(vals.get("road_cells", []))
             for res, vals in (payload.get("resolutions") or {}).items()
         }
+        missing_static = [
+            res for res, vals in (payload.get("resolutions") or {}).items()
+            if "cell_static" not in (vals or {})
+        ]
+        if missing_static:
+            raise ValueError(
+                "Grid bundle is missing required cell_static attributes for resolutions: "
+                + ", ".join(str(r) for r in missing_static)
+            )
+        cell_static_by_res = {
+            int(res): vals.get("cell_static", {})
+            for res, vals in (payload.get("resolutions") or {}).items()
+        }
         elev_path = elevation_path or payload.get("elevation_path")
         if elev_path and not os.path.isabs(elev_path):
             elev_path = os.path.join(os.path.dirname(os.path.abspath(bundle_path)), elev_path)
@@ -177,6 +192,7 @@ class GridProvider:
             roads_geojson=payload.get("roads_geojson"),
             full_cells_by_res=full_cells_by_res,
             road_cells_by_res=road_cells_by_res,
+            cell_static_by_res=cell_static_by_res,
             bundle_path=os.path.abspath(bundle_path),
         )
         provider.bundle_metadata = payload.get("metadata") or {}
@@ -217,15 +233,32 @@ class GridProvider:
                 logger.warning("Failed to build roads GeoDataFrame for bundle", exc_info=True)
                 roads_gdf = None
 
+        elev_provider = ElevationProvider(elevation_path)
         by_res = {}
         for res in res_list:
             full_cells = set(shapely_to_h3_cells(boundary_poly, res))
             road_cells = set()
             if roads_gdf is not None and len(roads_gdf):
                 road_cells = set(find_h3_cells_on_roads(roads_gdf, res)) & full_cells
+            static_attrs: dict[str, dict[str, float]] = {}
+            for h3_idx in full_cells:
+                lat, lon = h3.cell_to_latlng(h3_idx)
+                elev, los_lat, los_lon = resolve_cell_profile(
+                    elev_provider,
+                    h3_idx,
+                    lat,
+                    lon,
+                )
+                static_attrs[h3_idx] = {
+                    "elevation_max_m": float(elev),
+                    "los_anchor_lat": float(los_lat),
+                    "los_anchor_lon": float(los_lon),
+                    "h3_resolution": int(h3.get_resolution(h3_idx)),
+                }
             by_res[str(res)] = {
                 "full_cells": sorted(full_cells),
                 "road_cells": sorted(road_cells),
+                "cell_static": static_attrs,
             }
             logger.info(
                 "Grid bundle resolution built",
@@ -233,6 +266,7 @@ class GridProvider:
                 full_cells=len(full_cells),
                 road_cells=len(road_cells),
             )
+        elev_provider.close()
 
         bundle_dir = os.path.dirname(os.path.abspath(bundle_path))
         os.makedirs(bundle_dir, exist_ok=True)
@@ -287,6 +321,8 @@ class GridProvider:
             roads_gdf = gpd.GeoDataFrame.from_features(roads_fc["features"], crs="EPSG:4326")
         full_cells_by_res: Dict[int, set[str]] = {}
         road_cells_by_res: Dict[int, set[str]] = {}
+        cell_static_by_res: Dict[int, dict[str, dict[str, float]]] = {}
+        elev_provider = ElevationProvider(elevation_path)
         for res in res_list:
             full = set(shapely_to_h3_cells(boundary_poly, res))
             full_cells_by_res[res] = full
@@ -294,12 +330,30 @@ class GridProvider:
                 road_cells_by_res[res] = set(find_h3_cells_on_roads(roads_gdf, res)) & full
             else:
                 road_cells_by_res[res] = set()
+            static_attrs: dict[str, dict[str, float]] = {}
+            for h3_idx in full:
+                lat, lon = h3.cell_to_latlng(h3_idx)
+                elev, los_lat, los_lon = resolve_cell_profile(
+                    elev_provider,
+                    h3_idx,
+                    lat,
+                    lon,
+                )
+                static_attrs[h3_idx] = {
+                    "elevation_max_m": float(elev),
+                    "los_anchor_lat": float(los_lat),
+                    "los_anchor_lon": float(los_lon),
+                    "h3_resolution": int(h3.get_resolution(h3_idx)),
+                }
+            cell_static_by_res[res] = static_attrs
+        elev_provider.close()
         return cls(
             elevation_path=elevation_path,
             boundary_geojson=boundary_geojson,
             roads_geojson=roads_fc,
             full_cells_by_res=full_cells_by_res,
             road_cells_by_res=road_cells_by_res,
+            cell_static_by_res=cell_static_by_res,
         )
 
     def close(self) -> None:
@@ -639,6 +693,53 @@ class GridProvider:
                 out.add(h3_idx)
         return out
 
+    def adaptive_union_within_radius(
+        self,
+        centers: Iterable[str],
+        radius_m: float,
+        base_resolution: int,
+        config: MeshConfig,
+        *,
+        candidate_cells: Optional[set[str]] = None,
+    ) -> set[str]:
+        """Return union of adaptive cells within radius from multiple center cells."""
+        centers = list(centers)
+        if not centers:
+            return set()
+        if radius_m <= 0:
+            return set(centers)
+        mesh = self._build_adaptive_mesh(base_resolution, config)
+        kdtree = mesh.get("kdtree")
+        if kdtree is not None:
+            center_lats = []
+            center_lons = []
+            for h3_idx in centers:
+                lat, lon = h3.cell_to_latlng(h3_idx)
+                center_lats.append(lat)
+                center_lons.append(lon)
+            queries = _to_xyz(np.asarray(center_lats), np.asarray(center_lons))
+            idxs = kdtree.query_ball_point(queries, r=float(radius_m))
+            union_ids: set[str] = set()
+            for group in idxs:
+                for i in group:
+                    h3_idx = mesh["cell_ids"][i]
+                    if candidate_cells is None or h3_idx in candidate_cells:
+                        union_ids.add(h3_idx)
+            return union_ids
+
+        out: set[str] = set()
+        for center_h3 in centers:
+            out.update(
+                self.adaptive_cells_within_radius(
+                    center_h3,
+                    radius_m,
+                    base_resolution,
+                    config,
+                    candidate_cells=candidate_cells,
+                )
+            )
+        return out
+
     def adaptive_corridor_from_features(
         self,
         features: list,
@@ -725,13 +826,19 @@ class GridProvider:
                 setattr(cell, "adaptive_refined", meta["adaptive_refined"])
                 return cell
         lat, lon = h3.cell_to_latlng(h3_index)
-        elev, los_lat, los_lon = resolve_cell_profile(
-            self._elevation_provider,
-            h3_index,
-            lat,
-            lon,
-            anchor_margin_m=config.cell_anchor_margin_m,
-        )
+        static = self._cell_static_by_res.get(res, {}).get(h3_index)
+        if static is not None:
+            elev = float(static.get("elevation_max_m", 0.0))
+            los_lat = float(static.get("los_anchor_lat", lat))
+            los_lon = float(static.get("los_anchor_lon", lon))
+        else:
+            elev, los_lat, los_lon = resolve_cell_profile(
+                self._elevation_provider,
+                h3_index,
+                lat,
+                lon,
+                anchor_margin_m=config.cell_anchor_margin_m,
+            )
         cell = H3Cell(
             h3_index=h3_index,
             lat=lat,
@@ -762,6 +869,105 @@ class GridProvider:
             by_res[h3_index] = cell
         return cell
 
+    def materialize_cells(
+        self,
+        h3_indices: Iterable[str],
+        config: MeshConfig,
+        *,
+        road_cells: Optional[set[str]] = None,
+        is_in_boundary: bool = True,
+        include_stats: bool = False,
+    ):
+        road_set = road_cells or set()
+        indices = list(dict.fromkeys(h3_indices))
+        out: Dict[str, H3Cell] = {}
+        stats = {
+            "requested": len(indices),
+            "cache_hits": 0,
+            "from_static": 0,
+            "from_dem": 0,
+        }
+        adaptive_mesh = self._build_adaptive_mesh(config.h3_resolution, config)
+        adaptive_meta = adaptive_mesh.get("cell_meta", {})
+
+        for h3_idx in indices:
+            try:
+                res = int(h3.get_resolution(h3_idx))
+            except Exception:
+                res = int(config.h3_resolution)
+            has_road = h3_idx in road_set
+
+            with self._lock:
+                by_res = self._cell_cache_by_res.setdefault(res, {})
+                cell = by_res.get(h3_idx)
+                if cell is not None:
+                    cell.has_road = bool(cell.has_road or has_road)
+                    cell.is_in_boundary = bool(cell.is_in_boundary or is_in_boundary)
+                    meta = adaptive_meta.get(h3_idx)
+                    if meta is None:
+                        meta = {
+                            "base_h3_resolution": int(config.h3_resolution),
+                            "target_h3_resolution": int(h3.get_resolution(h3_idx)),
+                            "gradient_m_per_km": 0.0,
+                            "adaptive_refined": False,
+                        }
+                    setattr(cell, "base_h3_resolution", meta["base_h3_resolution"])
+                    setattr(cell, "target_h3_resolution", meta["target_h3_resolution"])
+                    setattr(cell, "gradient_m_per_km", meta["gradient_m_per_km"])
+                    setattr(cell, "adaptive_refined", meta["adaptive_refined"])
+                    out[h3_idx] = cell
+                    stats["cache_hits"] += 1
+                    continue
+
+            lat, lon = h3.cell_to_latlng(h3_idx)
+            static = self._cell_static_by_res.get(res, {}).get(h3_idx)
+            if static is not None:
+                elev = float(static.get("elevation_max_m", 0.0))
+                los_lat = float(static.get("los_anchor_lat", lat))
+                los_lon = float(static.get("los_anchor_lon", lon))
+                stats["from_static"] += 1
+            else:
+                elev, los_lat, los_lon = resolve_cell_profile(
+                    self._elevation_provider,
+                    h3_idx,
+                    lat,
+                    lon,
+                    anchor_margin_m=config.cell_anchor_margin_m,
+                )
+                stats["from_dem"] += 1
+            cell = H3Cell(
+                h3_index=h3_idx,
+                lat=lat,
+                lon=lon,
+                elevation=elev,
+                has_road=has_road,
+                is_in_boundary=is_in_boundary,
+                los_lat=los_lat,
+                los_lon=los_lon,
+            )
+            meta = adaptive_meta.get(h3_idx)
+            if meta is None:
+                meta = {
+                    "base_h3_resolution": int(config.h3_resolution),
+                    "target_h3_resolution": int(h3.get_resolution(h3_idx)),
+                    "gradient_m_per_km": 0.0,
+                    "adaptive_refined": False,
+                }
+            setattr(cell, "base_h3_resolution", meta["base_h3_resolution"])
+            setattr(cell, "target_h3_resolution", meta["target_h3_resolution"])
+            setattr(cell, "gradient_m_per_km", meta["gradient_m_per_km"])
+            setattr(cell, "adaptive_refined", meta["adaptive_refined"])
+
+            with self._lock:
+                by_res = self._cell_cache_by_res.setdefault(res, {})
+                by_res[h3_idx] = cell
+            out[h3_idx] = cell
+
+        if include_stats:
+            stats["materialized"] = len(out)
+            return out, stats
+        return out
+
     def build_cells_dict(
         self,
         h3_indices: Iterable[str],
@@ -770,16 +976,12 @@ class GridProvider:
         road_cells: Optional[set[str]] = None,
         is_in_boundary: bool = True,
     ) -> Dict[str, H3Cell]:
-        road_set = road_cells or set()
-        out: Dict[str, H3Cell] = {}
-        for h3_idx in h3_indices:
-            out[h3_idx] = self.get_or_create_cell(
-                h3_idx,
-                config,
-                has_road=(h3_idx in road_set),
-                is_in_boundary=is_in_boundary,
-            )
-        return out
+        return self.materialize_cells(
+            h3_indices,
+            config,
+            road_cells=road_cells,
+            is_in_boundary=is_in_boundary,
+        )
 
     def build_full_boundary_grid(self, config: MeshConfig) -> Dict[str, H3Cell]:
         if bool(getattr(config, "auto_refine_h3_on_gradient", False)):
@@ -801,7 +1003,6 @@ class GridProvider:
 
         Ladder (by configured percentile gradient):
         - >100 m/km -> 10
-        - >75  m/km -> 10
         - >50  m/km -> 9
         """
         if not routes:

@@ -19,6 +19,15 @@ class _FakeElevationProvider:
     def resolve_effective_resolution(self, _routes, base_resolution: int, _config):
         return base_resolution, False, None, None
 
+    def adaptive_resolution_summary(self, base_resolution: int, _config):
+        return {
+            "h3_resolution_mode": "adaptive_mixed",
+            "base_h3_resolution": int(base_resolution),
+            "effective_h3_resolution_min": int(base_resolution),
+            "effective_h3_resolution_max": int(base_resolution),
+            "cells_by_resolution": {int(base_resolution): 0},
+        }
+
     def get_or_create_cell(
         self,
         h3_index: str,
@@ -38,13 +47,41 @@ class _FakeElevationProvider:
             is_in_boundary=is_in_boundary,
         )
 
+    def materialize_cells(
+        self,
+        h3_indices,
+        config,
+        *,
+        road_cells=None,
+        is_in_boundary=True,
+        include_stats=False,
+    ):
+        road_set = road_cells or set()
+        out = {}
+        for h3_idx in h3_indices:
+            out[h3_idx] = self.get_or_create_cell(
+                h3_idx,
+                config,
+                has_road=(h3_idx in road_set),
+                is_in_boundary=is_in_boundary,
+            )
+        if include_stats:
+            return out, {
+                "requested": len(out),
+                "cache_hits": 0,
+                "from_static": len(out),
+                "from_dem": 0,
+                "materialized": len(out),
+            }
+        return out
+
     def radius_m_to_ring(self, _radius_m: float, _resolution: int, minimum_one: bool = False) -> int:
         return 1 if minimum_one else 0
 
     def expand_disk(self, h3_index: str, rings: int) -> set[str]:
         return set(h3.grid_disk(h3_index, rings))
 
-    def corridor_from_features(self, _features, resolution: int, site1=None, site2=None):
+    def corridor_from_features(self, _features, resolution: int, site1=None, site2=None, config=None):
         if not site1 or not site2:
             return []
         return [
@@ -52,12 +89,23 @@ class _FakeElevationProvider:
             h3.latlng_to_cell(site2["lat"], site2["lon"], resolution),
         ]
 
+    def locate_adaptive_cell(self, lat, lon, resolution, _config, prefer_road=False):
+        return h3.latlng_to_cell(lat, lon, resolution)
+
+    def get_adaptive_full_cells(self, _base_resolution, _config):
+        return set()
+
+    def adaptive_union_within_radius(self, _centers, _radius_m, _base_resolution, _config, *, candidate_cells=None):
+        return set()
+
+    def adaptive_cells_within_radius(self, _center_h3, _radius_m, _base_resolution, _config, *, candidate_cells=None):
+        return set()
+
     def close(self) -> None:
         return None
 
 
 def _prepare_pipeline_monkeypatch(monkeypatch, captured: dict) -> None:
-    monkeypatch.setattr(rp, "_expand_cells_with_buffer", lambda *_a, **_k: {})
     monkeypatch.setattr(rp, "place_nodes_along_corridor", lambda *_a, **_k: [])
     monkeypatch.setattr(rp, "install_nodes", lambda *_a, **_k: None)
     monkeypatch.setattr(rp, "wire_corridor_edges", lambda *_a, **_k: None)

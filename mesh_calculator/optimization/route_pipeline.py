@@ -8,6 +8,7 @@ edges, road-cell coverage, and optionally tags city links.
 import json
 import logging
 import os
+import time
 from typing import Callable, List, Optional
 
 import h3
@@ -34,10 +35,6 @@ from ..optimization.corridor import (
 logger = logging.getLogger(__name__)
 
 
-def _provider_supports(provider, method_name: str) -> bool:
-    return provider is not None and callable(getattr(type(provider), method_name, None))
-
-
 def _locate_site_cell(
     grid_provider: GridProvider,
     lat: float,
@@ -46,123 +43,69 @@ def _locate_site_cell(
     *,
     prefer_road: bool = False,
 ) -> str:
-    if _provider_supports(grid_provider, "locate_adaptive_cell"):
-        return grid_provider.locate_adaptive_cell(
-            float(lat),
-            float(lon),
-            mesh_config.h3_resolution,
-            mesh_config,
-            prefer_road=prefer_road,
-        )
-    return h3.latlng_to_cell(float(lat), float(lon), mesh_config.h3_resolution)
+    return grid_provider.locate_adaptive_cell(
+        float(lat),
+        float(lon),
+        mesh_config.h3_resolution,
+        mesh_config,
+        prefer_road=prefer_road,
+    )
 
 
-def _build_corridor_cells(
+def _prepare_cells_with_buffer(
     corridor: List[str],
     mesh_config: MeshConfig,
     grid_provider: GridProvider,
     existing_cells: dict,
-) -> dict:
+) -> tuple[dict, dict, dict, dict]:
     """
-    Build H3Cell objects for corridor cells not already in existing_cells.
-
-    Args:
-        corridor: Ordered list of H3 indices.
-        grid_provider: For terrain elevation and cached cell profile lookups.
-        existing_cells: Already-created cells (skipped to avoid overwriting).
+    Build corridor + buffer cells in one provider batch materialization call.
 
     Returns:
-        Dict of new H3Cell objects keyed by H3 index.
+        (new_corridor_cells, new_buffer_cells, materialize_stats, prep_stats)
     """
-    new_cells = {}
-    for h3_idx in corridor:
-        if h3_idx in existing_cells or h3_idx in new_cells:
-            continue
-        cell = grid_provider.get_or_create_cell(
-            h3_idx,
-            mesh_config,
-            has_road=True,
-            is_in_boundary=True,
-        )
-        new_cells[h3_idx] = cell
-    return new_cells
+    prep_started = time.perf_counter()
+    existing = set(existing_cells.keys())
+    corridor_set = set(corridor)
+    missing_corridor = corridor_set - existing
 
-
-def _expand_cells_with_buffer(
-    road_cells: List[str],
-    mesh_config: MeshConfig,
-    grid_provider: GridProvider,
-    existing_cells: dict,
-) -> dict:
-    """
-    Expand corridor cells with a spatial buffer at the main H3 resolution.
-
-    Uses grid_disk at the working resolution — k rings of neighbors around
-    each road cell. Each ring step adds ~one hex-edge-length of radius.
-
-    Returns:
-        Dict of new H3Cell objects (not already in existing_cells).
-    """
-    if mesh_config.road_buffer_m <= 0:
-        return {}
-
-    edge_m = h3.average_hexagon_edge_length(mesh_config.h3_resolution, unit='m')
-    buffer_rings = grid_provider.radius_m_to_ring(
-        mesh_config.road_buffer_m,
-        mesh_config.h3_resolution,
-        minimum_one=True,
-    )
-
-    if (
-        bool(getattr(mesh_config, "auto_refine_h3_on_gradient", False))
-        and _provider_supports(grid_provider, "get_adaptive_full_cells")
-    ):
-        candidate_pool = grid_provider.get_adaptive_full_cells(
+    buffer_candidates: set[str] = set()
+    if mesh_config.road_buffer_m > 0:
+        full_pool = grid_provider.get_adaptive_full_cells(
             mesh_config.h3_resolution,
             mesh_config,
         )
-    elif _provider_supports(grid_provider, "get_full_cells"):
-        candidate_pool = grid_provider.get_full_cells(mesh_config.h3_resolution)
-    else:
-        candidate_pool = set(existing_cells.keys()) | set(road_cells)
-
-    road_cell_set = set(road_cells)
-    new_main_cells: set = set()
-    for road_cell in road_cells:
-        if _provider_supports(grid_provider, "adaptive_cells_within_radius"):
-            neighbors = grid_provider.adaptive_cells_within_radius(
-                road_cell,
-                mesh_config.road_buffer_m,
-                mesh_config.h3_resolution,
-                mesh_config,
-                candidate_cells=candidate_pool,
-            )
-        else:
-            if _provider_supports(grid_provider, "expand_disk"):
-                neighbors = grid_provider.expand_disk(road_cell, buffer_rings)
-            else:
-                neighbors = h3.grid_disk(road_cell, buffer_rings)
-        for neighbor in neighbors:
-            if neighbor not in road_cell_set and neighbor not in existing_cells:
-                new_main_cells.add(neighbor)
-
-    new_cells = {}
-    for h3_idx in new_main_cells:
-        if h3_idx in existing_cells:
-            continue
-        cell = grid_provider.get_or_create_cell(
-            h3_idx,
+        expanded = grid_provider.adaptive_union_within_radius(
+            corridor,
+            mesh_config.road_buffer_m,
+            mesh_config.h3_resolution,
             mesh_config,
-            has_road=False,
-            is_in_boundary=True,
+            candidate_cells=full_pool,
         )
-        new_cells[h3_idx] = cell
+        buffer_candidates = expanded - corridor_set - existing
 
-    logger.info(
-        "Buffer expansion: added %d new cells (buffer_m=%.0f, rings=%d, edge_m=%.0f)",
-        len(new_cells), mesh_config.road_buffer_m, buffer_rings, edge_m,
+    all_new = missing_corridor | buffer_candidates
+    cells, mat_stats = grid_provider.materialize_cells(
+        all_new,
+        mesh_config,
+        road_cells=missing_corridor,
+        is_in_boundary=True,
+        include_stats=True,
     )
-    return new_cells
+    new_corridor = {h3_idx: cells[h3_idx] for h3_idx in missing_corridor if h3_idx in cells}
+    new_buffer = {h3_idx: cells[h3_idx] for h3_idx in buffer_candidates if h3_idx in cells}
+    prep_stats = {
+        "corridor_cells_new": len(new_corridor),
+        "buffer_cells_new": len(new_buffer),
+        "prepared_cells_total": len(cells),
+        "prepare_cells_and_buffer_s": time.perf_counter() - prep_started,
+    }
+    logger.info(
+        "Buffer expansion: added %d new cells (buffer_m=%.0f)",
+        len(new_buffer),
+        mesh_config.road_buffer_m,
+    )
+    return new_corridor, new_buffer, mat_stats, prep_stats
 
 
 def _trim_unfit_ends(corridor: List[str], cells: dict):
@@ -320,19 +263,10 @@ def run_route_pipeline(
         raise ValueError("run_route_pipeline requires grid_provider")
 
     base_h3_resolution = mesh_config.h3_resolution
-    if _provider_supports(grid_provider, "adaptive_resolution_summary"):
-        adaptive_summary = grid_provider.adaptive_resolution_summary(
-            base_h3_resolution,
-            mesh_config,
-        )
-    else:
-        adaptive_summary = {
-            "h3_resolution_mode": "fixed",
-            "base_h3_resolution": base_h3_resolution,
-            "effective_h3_resolution_min": base_h3_resolution,
-            "effective_h3_resolution_max": base_h3_resolution,
-            "cells_by_resolution": {base_h3_resolution: 0},
-        }
+    adaptive_summary = grid_provider.adaptive_resolution_summary(
+        base_h3_resolution,
+        mesh_config,
+    )
     effective_h3_resolution = adaptive_summary.get(
         "effective_h3_resolution_max",
         base_h3_resolution,
@@ -356,6 +290,15 @@ def run_route_pipeline(
     los_cache = LOSCache()
 
     route_summaries = []
+    prep_metrics = {
+        "corridor_extract_s": 0.0,
+        "prepare_cells_and_buffer_s": 0.0,
+        "trim_unfit_s": 0.0,
+        "prepared_cells_total": 0,
+        "materialized_cache_hits": 0,
+        "materialized_from_static": 0,
+        "materialized_from_dem": 0,
+    }
 
     for route_idx, route in enumerate(routes, start=1):
         route_base = (route_idx - 1) * route_weight
@@ -375,21 +318,15 @@ def run_route_pipeline(
         )
 
         # Convert GeoJSON features to ordered H3 corridor (site1→site2)
-        try:
-            corridor = grid_provider.corridor_from_features(
-                route.features,
-                mesh_config.h3_resolution,
-                site1=route.site1,
-                site2=route.site2,
-                config=mesh_config,
-            )
-        except TypeError:
-            corridor = grid_provider.corridor_from_features(
-                route.features,
-                mesh_config.h3_resolution,
-                site1=route.site1,
-                site2=route.site2,
-            )
+        t_corridor = time.perf_counter()
+        corridor = grid_provider.corridor_from_features(
+            route.features,
+            mesh_config.h3_resolution,
+            site1=route.site1,
+            site2=route.site2,
+            config=mesh_config,
+        )
+        prep_metrics["corridor_extract_s"] += time.perf_counter() - t_corridor
         _emit_progress(
             stage='route',
             step='Preparing corridor',
@@ -445,17 +382,20 @@ def run_route_pipeline(
             # Do NOT extend corridor to site with h3.grid_path_cells —
             # that creates off-road straight-line paths through cities.
 
-        # Build cells for this corridor and add to shared surface
-        new_cells = _build_corridor_cells(
-            corridor, mesh_config, grid_provider, surface.cells
+        # Build corridor + buffer cells in one provider materialization batch.
+        new_cells, buffer_cells, materialize_stats, prep_stats = _prepare_cells_with_buffer(
+            corridor,
+            mesh_config,
+            grid_provider,
+            surface.cells,
         )
         surface.cells.update(new_cells)
-
-        # Expand with road buffer: add nearby off-road cells for elevated terrain
-        buffer_cells = _expand_cells_with_buffer(
-            corridor, mesh_config, grid_provider, surface.cells
-        )
         surface.cells.update(buffer_cells)
+        prep_metrics["prepare_cells_and_buffer_s"] += prep_stats["prepare_cells_and_buffer_s"]
+        prep_metrics["prepared_cells_total"] += prep_stats["prepared_cells_total"]
+        prep_metrics["materialized_cache_hits"] += materialize_stats["cache_hits"]
+        prep_metrics["materialized_from_static"] += materialize_stats["from_static"]
+        prep_metrics["materialized_from_dem"] += materialize_stats["from_dem"]
         _emit_progress(
             stage='route',
             step='Preparing cells and buffer',
@@ -469,14 +409,24 @@ def run_route_pipeline(
             "Added %d corridor + %d buffer cells (total: %d)",
             len(new_cells), len(buffer_cells), len(surface.cells),
         )
+        logger.info(
+            "Route prep stats: prepared=%d cache_hits=%d from_static=%d from_dem=%d prep_s=%.3f",
+            prep_stats["prepared_cells_total"],
+            materialize_stats["cache_hits"],
+            materialize_stats["from_static"],
+            materialize_stats["from_dem"],
+            prep_stats["prepare_cells_and_buffer_s"],
+        )
 
         # Mark city-interior corridor cells as unfit
+        t_trim = time.perf_counter()
         if city_boundaries_geojson:
             _mark_city_cells(surface.cells, corridor, city_boundaries_geojson)
 
         # Trim city-interior cells from both corridor ends.
         # Anchor towers go at the boundary entry cells (city edge), not inside the city.
         trimmed_corridor, entry1_h3, entry2_h3 = _trim_unfit_ends(corridor, surface.cells)
+        prep_metrics["trim_unfit_s"] += time.perf_counter() - t_trim
         if len(trimmed_corridor) < 2:
             logger.warning(
                 "Route '%s' corridor has no eligible cells after city trimming — skipping",
@@ -563,16 +513,13 @@ def run_route_pipeline(
                     int(h3.get_resolution(entry_h3)),
                     unit='m',
                 )
-                if _provider_supports(grid_provider, "adaptive_cells_within_radius"):
-                    neighbors_1ring = grid_provider.adaptive_cells_within_radius(
-                        entry_h3,
-                        max(edge_m * 1.2, 1.0),
-                        mesh_config.h3_resolution,
-                        mesh_config,
-                        candidate_cells=set(surface.tower_by_h3.keys()),
-                    )
-                else:
-                    neighbors_1ring = h3.grid_disk(entry_h3, 1)
+                neighbors_1ring = grid_provider.adaptive_cells_within_radius(
+                    entry_h3,
+                    max(edge_m * 1.2, 1.0),
+                    mesh_config.h3_resolution,
+                    mesh_config,
+                    candidate_cells=set(surface.tower_by_h3.keys()),
+                )
                 existing_anchor_h3 = next(
                     (nb for nb in neighbors_1ring if nb in surface.tower_by_h3),
                     None,
@@ -614,11 +561,13 @@ def run_route_pipeline(
                     )
                     continue
                 if site_h3 not in surface.cells:
-                    surface.cells[site_h3] = grid_provider.get_or_create_cell(
-                        site_h3,
-                        mesh_config,
-                        has_road=False,
-                        is_in_boundary=False,
+                    surface.cells.update(
+                        grid_provider.materialize_cells(
+                            [site_h3],
+                            mesh_config,
+                            road_cells=set(),
+                            is_in_boundary=False,
+                        )
                     )
                 _apply_site_offset(
                     site_h3,
@@ -673,6 +622,8 @@ def run_route_pipeline(
             'corridor_cells': len(corridor),
             'towers_new': new_tower_count,
             'towers_reused': len(placed) - new_tower_count,
+            'prepared_cells_total': prep_stats["prepared_cells_total"],
+            'prepare_cells_and_buffer_s': prep_stats["prepare_cells_and_buffer_s"],
         })
         _emit_progress(
             stage='route',
@@ -760,6 +711,11 @@ def run_route_pipeline(
         'h3_auto_refined': h3_auto_refined,
         'h3_auto_refine_reason': h3_auto_refine_reason,
         'route_summaries': route_summaries,
+        'prep_metrics': prep_metrics,
+        'prepared_cells_total': prep_metrics["prepared_cells_total"],
+        'materialized_cache_hits': prep_metrics["materialized_cache_hits"],
+        'materialized_from_static': prep_metrics["materialized_from_static"],
+        'materialized_from_dem': prep_metrics["materialized_from_dem"],
         'los_cache': cache_stats,
         'elevation_cache': elev_stats,
     }
