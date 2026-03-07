@@ -356,8 +356,8 @@ class TestDPFallbackBeforeGapRepair(unittest.TestCase):
 
         self.assertEqual(
             used_radii,
-            [300.0, 500.0],
-            "Gap repair must start at selected fallback radius and then widen from it",
+            [200.0, 300.0],
+            "Gap repair must widen in fixed buffer-size steps (2x, 3x, ...)",
         )
 
     @patch('mesh_calculator.optimization.corridor.h3.grid_disk')

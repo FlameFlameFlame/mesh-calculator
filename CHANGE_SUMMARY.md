@@ -1,5 +1,8 @@
 # Change Summary
 
+- 2026-03-08: Updated corridor gap-repair radius progression to fixed buffer-size steps (`road + 2*buffer`, `road + 3*buffer`, …) by deriving repair radius from `road_buffer_m` per round, independent of H3 resolution.
+- 2026-03-08: Removed preloaded-cell-only restriction from corridor buffer neighbor queries so fallback/gap-repair search can discover and materialize new adaptive cells outside the initial prepared pool.
+- 2026-03-08: Updated corridor regression expectations for the new fixed-step gap-repair radius policy and revalidated full `mesh_calculator` suite (`165 passed`).
 - 2026-03-07: Added live LOS-link progress plumbing for visibility calculation: `compute_los_batch_progress(...)` now supports a callback, and `MeshSurface.update_visibility_edges(...)` reports completed/total link checks so route-pipeline progress can show real link-calculation advancement.
 - 2026-03-07: Removed road-cell coverage computation/export from route pipeline (`compute_cell_coverage` + `coverage.geojson`) so optimization now focuses on tower placement + visibility edges; runtime coverage remains in mesh-generator APIs.
 - 2026-03-07: Fixed adaptive buffer under-expansion in `GridProvider` radius queries by switching from pure center-distance checks to cell-footprint-aware distance (`center_distance <= radius + center_cell_radius + candidate_cell_radius`), so small positive buffers (e.g. 100m) include adjacent/touching cells.

@@ -414,7 +414,6 @@ def _expand_segment_buffer(
             surface,
             road_h3,
             radius_m,
-            candidate_cells=set(cells.keys()),
         )
         for nb in neighbors:
             if nb in segment_set:
@@ -823,16 +822,35 @@ def place_nodes_along_corridor(
         if search_ring <= 0:
             return 0, [], []
         candidate_buffer_cells = []
+        pending_cells: dict[str, tuple[float, float, float, float, float]] = {}
         for road_h3 in list(corridor_set):
             neighbors = _adaptive_cells_within_radius(
                 surface,
                 road_h3,
                 search_radius_m,
-                candidate_cells=set(cells.keys()),
             )
             for nb in neighbors:
-                if nb not in corridor_set and nb in cells and not cells[nb].has_road:
+                if nb in corridor_set:
+                    continue
+                if nb in cells:
+                    if not cells[nb].has_road:
+                        candidate_buffer_cells.append(nb)
+                    continue
+                if surface.elevation_provider is None:
+                    continue
+                try:
+                    lat, lon = h3.cell_to_latlng(nb)
+                    elev, los_lat, los_lon = _cell_profile(
+                        config,
+                        surface.elevation_provider,
+                        nb,
+                        lat,
+                        lon,
+                    )
+                    pending_cells[nb] = (lat, lon, elev, los_lat, los_lon)
                     candidate_buffer_cells.append(nb)
+                except Exception:
+                    continue
         all_candidate_cells = sorted(set(candidate_buffer_cells))
         best_by_road: dict = {}
         for nb in candidate_buffer_cells:
@@ -845,6 +863,20 @@ def place_nodes_along_corridor(
         for road_h3, (nb, _elev) in best_by_road.items():
             if nb in corridor_set:
                 continue
+            if nb not in cells:
+                pending = pending_cells.get(nb)
+                if pending is not None:
+                    lat, lon, elev, los_lat, los_lon = pending
+                    cells[nb] = H3Cell(
+                        h3_index=nb,
+                        lat=lat,
+                        lon=lon,
+                        elevation=elev,
+                        has_road=False,
+                        is_in_boundary=True,
+                        los_lat=los_lat,
+                        los_lon=los_lon,
+                    )
             try:
                 pos = working_corridor.index(road_h3)
             except ValueError:
@@ -998,16 +1030,16 @@ def place_nodes_along_corridor(
                     all_nodes.append(n)
 
         if run_gap_repair and config.gap_repair_rounds > 0:
-            repair_ladder = _normalize_radii(
-                config.gap_repair_search_radius_ladder_m,
-                default_value=0.0,
-            )
-            repair_base_radius = (
-                float(gap_repair_base_radius_m)
-                if gap_repair_base_radius_m is not None
-                else float(search_radius_m)
-            )
-            repair_base_radius = max(0.0, repair_base_radius)
+            base_buffer_radius_m = max(0.0, float(config.road_buffer_m))
+            if base_buffer_radius_m <= 0.0:
+                base_buffer_radius_m = max(
+                    0.0,
+                    float(
+                        gap_repair_base_radius_m
+                        if gap_repair_base_radius_m is not None
+                        else search_radius_m
+                    ),
+                )
             for repair_round in range(1, config.gap_repair_rounds + 1):
                 broken = _find_broken_gaps(
                     all_nodes,
@@ -1018,8 +1050,10 @@ def place_nodes_along_corridor(
                 )
                 if not broken:
                     break
-                repair_delta = repair_ladder[min(repair_round - 1, len(repair_ladder) - 1)]
-                repair_radius = repair_base_radius + repair_delta
+                # Iteration policy:
+                # 1st pass: road + 1*buffer
+                # 1st repair: road + 2*buffer, then road + 3*buffer, ...
+                repair_radius = float(base_buffer_radius_m * (repair_round + 1))
                 repair_ring = _radius_to_ring_m(config, repair_radius, minimum=1)
                 logger.info(
                     "Gap repair round %d/%d: %d broken pair(s), ring=%d, radius_m=%.0f",
