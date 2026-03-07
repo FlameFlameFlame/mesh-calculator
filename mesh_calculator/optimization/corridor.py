@@ -624,220 +624,11 @@ def _repair_broken_gaps(
     return chain
 
 
-def _greedy_place_towers(
-    corridor: List[str],
-    surface: MeshSurface,
-    cache: LOSCache,
-    k: int,
-    out_meta: Optional[Dict[str, dict]] = None,
-    search_radius_m: Optional[float] = None,
-    attempt_id: int = 0,
-    segment_idx: int = 0,
-) -> List[str]:
-    """
-    Buffer-aware furthest-clear-LOS greedy tower placement.
-
-    For each placement step, expands a buffer ring around the current
-    position and around each candidate road cell ahead. Tests LOS for all
-    (src, dst) buffer-pair combinations using compute_los_batch (parallel).
-    Places a tower at the furthest road position with any visible pair.
-    Buffer cells not already in surface.cells are created on-demand from
-    elevation_provider, enabling off-road hilltop positions.
-
-    Returns:
-        Ordered list of H3 indices where towers should be placed.
-    """
-    if len(corridor) < 2:
-        return list(corridor)
-
-    from ..core.geometry import h3_distance
-    from ..parallel.los_compute import compute_los_batch
-
-    cells = surface.cells
-    config = surface.config
-    elevation_provider = surface.elevation_provider
-
-    # Greedy keeps at least a 1-ring neighborhood even when search radius is 0.
-    effective_radius_m = (
-        float(search_radius_m)
-        if search_radius_m is not None
-        else _effective_initial_search_radius_m(config)
-    )
-    buffer_ring = _radius_to_ring_m(config, effective_radius_m, minimum=1)
-
-    # Identify road cells and assign road-position index to every corridor cell
-    road_cells = [c for c in corridor if cells.get(c) and cells[c].has_road]
-    if not road_cells:
-        road_cells = list(corridor)  # fallback: treat all as road
-
-    road_idx_map: Dict[str, int] = {c: i for i, c in enumerate(road_cells)}
-
-    # Map every corridor cell → its road-cell index (forward-fill)
-    cell_road_pos: Dict[str, int] = {}
-    last_road_j = 0
-    for c in corridor:
-        if c in road_idx_map:
-            last_road_j = road_idx_map[c]
-        cell_road_pos[c] = last_road_j
-
-    def _get_or_create_cell(h3_idx: str) -> Optional[H3Cell]:
-        if h3_idx in cells:
-            return cells[h3_idx]
-        if elevation_provider is None:
-            return None
-        lat, lon = h3.cell_to_latlng(h3_idx)
-        elev, los_lat, los_lon = _cell_profile(
-            config, elevation_provider, h3_idx, lat, lon
-        )
-        cell = H3Cell(
-            h3_index=h3_idx,
-            lat=lat,
-            lon=lon,
-            elevation=elev,
-            has_road=False,
-            is_in_boundary=False,
-            los_lat=los_lat,
-            los_lon=los_lon,
-        )
-        cells[h3_idx] = cell
-        return cell
-
-    def _get_buffer(cell: str) -> set:
-        buf = set()
-        edge_m = h3.average_hexagon_edge_length(config.h3_resolution, unit='m')
-        radius_m = max(float(buffer_ring) * edge_m, 0.0)
-        for nb in _adaptive_cells_within_radius(surface, cell, radius_m):
-            if _get_or_create_cell(nb) is not None:
-                buf.add(nb)
-        buf.add(cell)
-        return buf
-
-    chain = [corridor[0]]
-    current = corridor[0]
-    current_road_j = 0
-    step_idx = 0
-
-    def _try_append_endpoint_if_reachable() -> None:
-        """Append corridor endpoint only if directly reachable from current tail."""
-        end = corridor[-1]
-        if chain[-1] == end:
-            return
-        tail = chain[-1]
-        los_to_end = compute_los(
-            tail, end, cells, config, cache,
-            elevation_provider=elevation_provider,
-        )
-        if los_to_end.is_visible:
-            chain.append(end)
-            if out_meta is not None and end not in out_meta:
-                out_meta[end] = {
-                    'algorithm': 'greedy',
-                    'dp_steps': None,
-                    'repair_round': None,
-                }
-        else:
-            logger.warning(
-                "Greedy endpoint not reachable; skipping forced endpoint append",
-                tail=tail, endpoint=end, clearance_m=los_to_end.clearance_m,
-            )
-
-    while True:
-        if len(chain) >= k:
-            _try_append_endpoint_if_reachable()
-            break
-        if current_road_j >= len(road_cells) - 1:
-            _try_append_endpoint_if_reachable()
-            break
-
-        src_buffer = _get_buffer(current)
-
-        # Collect candidate destinations: buffer rings around road cells ahead,
-        # within visibility range.
-        dst_candidates: Dict[str, int] = {}  # cell -> road_j
-        for road_j in range(current_road_j + 1, len(road_cells)):
-            road_c = road_cells[road_j]
-            if h3_distance(current, road_c) > config.max_visibility_m:
-                break
-            for nb in _get_buffer(road_c):
-                if nb not in dst_candidates:
-                    if nb not in cell_road_pos:
-                        cell_road_pos[nb] = road_j
-                    dst_candidates[nb] = cell_road_pos[nb]
-
-        if not dst_candidates:
-            # Nothing reachable — advance search origin without placing a tower
-            current_road_j += 1
-            if current_road_j < len(road_cells):
-                current = road_cells[current_road_j]
-            continue
-
-        _append_search_debug_records(
-            surface=surface,
-            h3_indices=list(set(src_buffer).union(dst_candidates.keys())),
-            algorithm='greedy',
-            phase='initial',
-            attempt_id=attempt_id,
-            segment_idx=segment_idx,
-            repair_round=None,
-            search_radius_m=effective_radius_m,
-            search_ring=buffer_ring,
-            search_scope='greedy_step_candidates',
-            step_idx=step_idx,
-        )
-
-        # Build (src, dst) pairs within visibility range
-        pairs = [
-            (src, dst)
-            for src in src_buffer
-            for dst in dst_candidates
-            if h3_distance(src, dst) <= config.max_visibility_m
-        ]
-
-        if not pairs:
-            current_road_j += 1
-            if current_road_j < len(road_cells):
-                current = road_cells[current_road_j]
-            continue
-
-        # Parallel LOS batch check
-        results = compute_los_batch(
-            pairs, cells, config, cache,
-            elevation_provider=elevation_provider,
-        )
-
-        # Find furthest visible destination by road position; break ties by clearance
-        best_j = -1
-        best_dst = None
-        best_clr = float('-inf')
-        for (src, dst), los in results.items():
-            if los.is_visible:
-                j = dst_candidates[dst]
-                if j > best_j or (j == best_j and los.clearance_m > best_clr):
-                    best_j, best_dst, best_clr = j, dst, los.clearance_m
-
-        if best_j < 0:
-            # No LOS anywhere — advance search origin without placing a tower
-            current_road_j += 1
-            if current_road_j < len(road_cells):
-                current = road_cells[current_road_j]
-            continue
-
-        chain.append(best_dst)
-        if out_meta is not None:
-            out_meta[best_dst] = {'algorithm': 'greedy', 'dp_steps': None, 'repair_round': None}
-        current = best_dst
-        current_road_j = best_j
-        step_idx += 1
-
-    return chain
-
-
 def place_nodes_along_corridor(
     corridor: List[str],
     surface: MeshSurface,
     cache: LOSCache = None,
     out_meta: Optional[Dict[str, dict]] = None,
-    strategy: str = 'dp',
 ) -> List[str]:
     """
     Place nodes along a corridor ensuring LOS connectivity.
@@ -948,7 +739,7 @@ def place_nodes_along_corridor(
             _append_search_debug_records(
                 surface=surface,
                 h3_indices=all_candidate_cells,
-                algorithm='greedy' if strategy == 'greedy' else 'dp',
+                algorithm='dp',
                 phase=phase_label,
                 attempt_id=attempt_id,
                 segment_idx=-1,
@@ -961,7 +752,7 @@ def place_nodes_along_corridor(
             _append_search_debug_records(
                 surface=surface,
                 h3_indices=selected_buffer_cells,
-                algorithm='greedy' if strategy == 'greedy' else 'dp',
+                algorithm='dp',
                 phase=phase_label,
                 attempt_id=attempt_id,
                 segment_idx=-1,
@@ -1008,7 +799,7 @@ def place_nodes_along_corridor(
             _append_search_debug_records(
                 surface=surface,
                 h3_indices=segment,
-                algorithm='greedy' if strategy == 'greedy' else 'dp',
+                algorithm='dp',
                 phase=phase_label,
                 attempt_id=attempt_id,
                 segment_idx=bi,
@@ -1023,44 +814,34 @@ def place_nodes_along_corridor(
                 effective_budget * seg_len / max(total_corridor_len, 1)
             ))
 
-            if strategy == 'greedy':
-                seg_nodes = _greedy_place_towers(
-                    segment, surface, cache, seg_k, out_meta=node_meta,
-                    search_radius_m=search_radius_m,
-                    attempt_id=attempt_id,
-                    segment_idx=bi,
+            seg_result = _dp_place_towers_with_meta(segment, surface, cache, seg_k)
+            seg_nodes = seg_result[0] if seg_result is not None else None
+            seg_best_t = seg_result[1] if seg_result is not None else None
+
+            if seg_nodes is None:
+                logger.warning(
+                    "DP found no feasible LOS chain — gap repair will handle it",
+                    seg_len=len(segment), k=seg_k,
+                    start=segment[0], end=segment[-1],
                 )
+                seg_nodes = [segment[0], segment[-1]]
                 seg_best_t = None
-            else:
-                seg_result = _dp_place_towers_with_meta(segment, surface, cache, seg_k)
-                seg_nodes = seg_result[0] if seg_result is not None else None
-                seg_best_t = seg_result[1] if seg_result is not None else None
 
-                if seg_nodes is None:
-                    logger.warning(
-                        "DP found no feasible LOS chain — gap repair will handle it",
-                        seg_len=len(segment), k=seg_k,
-                        start=segment[0], end=segment[-1],
-                    )
-                    seg_nodes = [segment[0], segment[-1]]
-                    seg_best_t = None
-
-            if strategy != 'greedy':
-                for node_h3 in seg_nodes:
-                    if node_h3 in surface.tower_by_h3:
-                        continue
-                    if seg_best_t is not None:
-                        node_meta[node_h3] = {
-                            'algorithm': 'dp',
-                            'dp_steps': seg_best_t,
-                            'repair_round': None,
-                        }
-                    else:
-                        node_meta[node_h3] = {
-                            'algorithm': 'endpoint_fallback',
-                            'dp_steps': None,
-                            'repair_round': None,
-                        }
+            for node_h3 in seg_nodes:
+                if node_h3 in surface.tower_by_h3:
+                    continue
+                if seg_best_t is not None:
+                    node_meta[node_h3] = {
+                        'algorithm': 'dp',
+                        'dp_steps': seg_best_t,
+                        'repair_round': None,
+                    }
+                else:
+                    node_meta[node_h3] = {
+                        'algorithm': 'endpoint_fallback',
+                        'dp_steps': None,
+                        'repair_round': None,
+                    }
 
             for seg_h3 in segment:
                 if seg_h3 not in corridor_pos:
@@ -1072,44 +853,43 @@ def place_nodes_along_corridor(
                     seen.add(n)
                     all_nodes.append(n)
 
-        if strategy != 'greedy':
-            if run_gap_repair and config.gap_repair_rounds > 0:
-                repair_ladder = _normalize_radii(
-                    config.gap_repair_search_radius_ladder_m,
-                    default_value=0.0,
+        if run_gap_repair and config.gap_repair_rounds > 0:
+            repair_ladder = _normalize_radii(
+                config.gap_repair_search_radius_ladder_m,
+                default_value=0.0,
+            )
+            repair_base_radius = (
+                float(gap_repair_base_radius_m)
+                if gap_repair_base_radius_m is not None
+                else float(search_radius_m)
+            )
+            repair_base_radius = max(0.0, repair_base_radius)
+            for repair_round in range(1, config.gap_repair_rounds + 1):
+                broken = _find_broken_gaps(all_nodes, surface, cache)
+                if not broken:
+                    break
+                repair_delta = repair_ladder[min(repair_round - 1, len(repair_ladder) - 1)]
+                repair_radius = repair_base_radius + repair_delta
+                repair_ring = _radius_to_ring_m(config, repair_radius, minimum=1)
+                logger.info(
+                    "Gap repair round %d/%d: %d broken pair(s), ring=%d, radius_m=%.0f",
+                    repair_round, config.gap_repair_rounds, len(broken),
+                    repair_ring, repair_radius,
                 )
-                repair_base_radius = (
-                    float(gap_repair_base_radius_m)
-                    if gap_repair_base_radius_m is not None
-                    else float(search_radius_m)
+                all_nodes = _repair_broken_gaps(
+                    all_nodes, working_corridor, corridor_pos,
+                    search_radius_m=repair_radius,
+                    repair_round=repair_round,
+                    attempt_id=attempt_id,
+                    surface=surface,
+                    cache=cache,
+                    user_budget=effective_budget - 2,
+                    node_meta=node_meta,
                 )
-                repair_base_radius = max(0.0, repair_base_radius)
-                for repair_round in range(1, config.gap_repair_rounds + 1):
-                    broken = _find_broken_gaps(all_nodes, surface, cache)
-                    if not broken:
-                        break
-                    repair_delta = repair_ladder[min(repair_round - 1, len(repair_ladder) - 1)]
-                    repair_radius = repair_base_radius + repair_delta
-                    repair_ring = _radius_to_ring_m(config, repair_radius, minimum=1)
-                    logger.info(
-                        "Gap repair round %d/%d: %d broken pair(s), ring=%d, radius_m=%.0f",
-                        repair_round, config.gap_repair_rounds, len(broken),
-                        repair_ring, repair_radius,
-                    )
-                    all_nodes = _repair_broken_gaps(
-                        all_nodes, working_corridor, corridor_pos,
-                        search_radius_m=repair_radius,
-                        repair_round=repair_round,
-                        attempt_id=attempt_id,
-                        surface=surface,
-                        cache=cache,
-                        user_budget=effective_budget - 2,
-                        node_meta=node_meta,
-                    )
-            pre_fill_count = len(all_nodes)
-            all_nodes = _fill_visibility_gaps(all_nodes, working_corridor, config.max_visibility_m)
-            if len(all_nodes) > pre_fill_count:
-                logger.debug("After gap-fill", count=len(all_nodes))
+        pre_fill_count = len(all_nodes)
+        all_nodes = _fill_visibility_gaps(all_nodes, working_corridor, config.max_visibility_m)
+        if len(all_nodes) > pre_fill_count:
+            logger.debug("After gap-fill", count=len(all_nodes))
 
         broken_after = len(_find_broken_gaps(all_nodes, surface, cache))
         return all_nodes, node_meta, working_corridor, corridor_pos, broken_after, effective_budget
@@ -1178,7 +958,7 @@ def place_nodes_along_corridor(
     selected_search_radius_m = initial_search_radius_m
     selected_attempt_id = 0
 
-    if strategy != 'greedy' and broken_count > 0:
+    if broken_count > 0:
         fallback_ladder = _normalize_radii(
             config.fallback_initial_search_radius_ladder_m,
             default_value=initial_search_radius_m,
@@ -1236,7 +1016,7 @@ def place_nodes_along_corridor(
                     h3_a=selected_nodes[i], h3_b=selected_nodes[i + 1],
                 )
 
-    logger.debug("Nodes placed along corridor", strategy=strategy, count=len(selected_nodes))
+    logger.debug("Nodes placed along corridor", count=len(selected_nodes))
     if out_meta is not None:
         out_meta.update(selected_meta)
     return selected_nodes

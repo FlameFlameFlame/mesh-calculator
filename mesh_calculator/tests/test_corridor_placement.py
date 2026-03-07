@@ -1,7 +1,7 @@
 """
 Tests for corridor placement algorithm (MaxMin DP).
 
-The greedy _walk_segment algorithm has been replaced with a MaxMin Bottleneck
+The legacy _walk_segment algorithm has been replaced with a MaxMin Bottleneck
 Path DP that finds the globally optimal tower chain maximising minimum Fresnel
 clearance.  These tests verify the DP's core behaviours:
 
@@ -299,60 +299,6 @@ class TestEndpointHandling(unittest.TestCase):
 
         self.assertIn("cell_0", nodes, "Start endpoint must always be present")
         self.assertIn("cell_7", nodes, "End endpoint must always be present")
-
-
-class TestGreedyEndpointAppend(unittest.TestCase):
-    """Greedy should not force-append an unreachable corridor endpoint."""
-
-    def setUp(self):
-        self.config = MeshConfig(
-            mast_height_m=10.0,
-            max_towers_per_route=10,
-        )
-
-    @patch('mesh_calculator.optimization.corridor.h3.grid_disk')
-    @patch('mesh_calculator.core.geometry.h3_distance')
-    @patch('mesh_calculator.optimization.corridor.compute_los')
-    @patch('mesh_calculator.parallel.los_compute.compute_los_batch')
-    def test_unreachable_endpoint_not_appended(
-        self, mock_batch, mock_compute_los, mock_distance, mock_grid_disk
-    ):
-        corridor = make_corridor(5)  # cell_0 .. cell_4 (endpoint)
-        cells = make_cells(5)
-        surface = MeshSurface(cells, self.config)
-
-        # Keep buffers local to each cell in this test.
-        mock_grid_disk.side_effect = lambda cell, ring: [cell]
-        mock_distance.return_value = 1000.0
-
-        # Greedy can progress 0->1->2->3, but not to endpoint cell_4.
-        def _batch(pairs, cells_arg, config_arg, cache_arg, elevation_provider=None):
-            out = {}
-            for src, dst in pairs:
-                try:
-                    si = int(src.split('_')[1])
-                    di = int(dst.split('_')[1])
-                except Exception:
-                    si, di = -1, -1
-                vis = (di == si + 1 and di <= 3)
-                out[(src, dst)] = LOSResult(
-                    clearance_m=10.0 if vis else -999.0,
-                    path_loss_db=50.0 if vis else 999.0,
-                    distance_m=1000.0,
-                    is_visible=vis,
-                )
-            return out
-
-        mock_batch.side_effect = _batch
-        mock_compute_los.return_value = LOSResult(
-            clearance_m=-999.0, path_loss_db=999.0,
-            distance_m=1000.0, is_visible=False,
-        )
-
-        nodes = place_nodes_along_corridor(corridor, surface, strategy='greedy')
-
-        self.assertEqual(nodes[-1], "cell_3")
-        self.assertNotIn("cell_4", nodes)
 
 
 class TestDPFallbackBeforeGapRepair(unittest.TestCase):

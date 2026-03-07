@@ -59,7 +59,7 @@ class Tower:
         tower_id: Unique tower identifier
         h3_index: H3 cell index where tower is placed
         lat, lon: Tower coordinates
-        source: Source of tower placement ('seed', 'route', 'bridge', 'greedy', 'corridor')
+        source: Source of tower placement ('seed', 'route', 'bridge', 'corridor')
         placement_meta: Debug metadata about how/why this tower was placed.
             Keys: algorithm ('dp'|'dp_repair'|'peak_fallback'|'endpoint_fallback'|'site'),
                   dp_steps (int, tower count t used in winning DP solution),
