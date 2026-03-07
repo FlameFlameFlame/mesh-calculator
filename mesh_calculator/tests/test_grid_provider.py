@@ -34,7 +34,8 @@ def _make_dem(path: Path, width: int, height: int, west: float, north: float, pi
 
 
 def _boundary_geojson():
-    poly = box(43.8, 39.8, 44.2, 40.2)
+    # Keep test geometry small to reduce H3 materialization cost.
+    poly = box(43.94, 40.00, 44.06, 40.12)
     return {
         "type": "FeatureCollection",
         "features": [
@@ -55,7 +56,7 @@ def _roads_geojson():
                 "type": "Feature",
                 "geometry": {
                     "type": "LineString",
-                    "coordinates": [[43.82, 39.95], [44.18, 40.05]],
+                    "coordinates": [[43.95, 40.02], [44.05, 40.10]],
                 },
                 "properties": {"osm_way_id": 1},
             }
@@ -68,7 +69,7 @@ def test_grid_bundle_metadata_and_load_roundtrip():
         tmp = Path(tmpdir)
         tif = tmp / "elevation.tif"
         bundle = tmp / "grid_bundle.json"
-        _make_dem(tif, width=800, height=800, west=43.7, north=40.3, pixel_deg=0.001)
+        _make_dem(tif, width=180, height=180, west=43.90, north=40.18, pixel_deg=0.001)
 
         payload = GridProvider.build_bundle(
             bundle_path=str(bundle),
@@ -115,7 +116,7 @@ def test_strict_bundle_loader_rejects_old_version():
         tmp = Path(tmpdir)
         tif = tmp / "elevation.tif"
         bundle = tmp / "grid_bundle.json"
-        _make_dem(tif, width=200, height=200, west=43.7, north=40.3, pixel_deg=0.001)
+        _make_dem(tif, width=100, height=100, west=43.90, north=40.18, pixel_deg=0.001)
 
         payload = {
             "version": 2,
@@ -138,7 +139,7 @@ def test_lazy_road_cells_lookup_for_unbundled_resolution():
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         tif = tmp / "elevation.tif"
-        _make_dem(tif, width=500, height=500, west=43.7, north=40.3, pixel_deg=0.001)
+        _make_dem(tif, width=150, height=150, west=43.90, north=40.18, pixel_deg=0.001)
 
         provider = GridProvider.from_inputs(
             elevation_path=str(tif),
@@ -158,7 +159,7 @@ def test_adaptive_small_buffer_includes_touching_neighbors():
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         tif = tmp / "elevation.tif"
-        _make_dem(tif, width=500, height=500, west=43.7, north=40.3, pixel_deg=0.001)
+        _make_dem(tif, width=150, height=150, west=43.90, north=40.18, pixel_deg=0.001)
 
         provider = GridProvider.from_inputs(
             elevation_path=str(tif),
