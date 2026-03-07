@@ -1,5 +1,7 @@
 # Change Summary
 
+- 2026-03-07: Restored and completed parallelization diagnostics hardening: `compute_los_batch(...)` / `compute_los_batch_progress(...)` now collect per-pair failures, support optional strict-failure mode, and emit deterministic diagnostics payloads (`pairs_failed`, `chunk_failures`, timing/chunk stats) for reproducibility debugging.
+- 2026-03-07: Added route-level debug observability for parallel investigations: `run_route_pipeline(...)` now supports `debug_snapshot_dir` per-route JSON snapshots and summary-level `los_batch` counters; added `mesh_calculator/utils/parallel_probe.py` to compare worker-count runs (`1,2,4,8`) with artifact/fingerprint diffs.
 - 2026-03-07: Standardized batch-parallel LOS execution in `parallel/los_compute.py` with config-aware worker selection (`MeshConfig.los_parallel_workers`), `min_pairs_for_parallel` serial fallback threshold, deterministic chunk merge order, and per-batch timing/progress logging.
 - 2026-03-07: Refactored corridor planner hot paths to batch LOS checks: DP transitions per layer, broken-gap scans, gap-repair furthest-reachable scans, and corridor edge wiring now route through `compute_los_batch(...)` while preserving deterministic DP transition order.
 - 2026-03-07: Added nested parallel protection by threading `los_max_workers` through corridor APIs and forcing `los_max_workers=1` inside hierarchical outer threadpool flows (`connect_sites_by_priority`, `connect_priority1_mesh`) to avoid oversubscription.

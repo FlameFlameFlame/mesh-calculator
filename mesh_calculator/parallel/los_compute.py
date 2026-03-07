@@ -3,7 +3,7 @@ Parallel LOS computation using multithreading.
 """
 import os
 import time
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import structlog
@@ -32,14 +32,18 @@ def _compute_pair_batch(
     cache: LOSCache | None,
     elevation_provider,
     compute_fn,
-) -> Dict[Tuple[str, str], LOSResult]:
+) -> tuple[Dict[Tuple[str, str], LOSResult], List[tuple[Tuple[str, str], str]]]:
     out: Dict[Tuple[str, str], LOSResult] = {}
+    failures: List[tuple[Tuple[str, str], str]] = []
     for h3_src, h3_dst in batch:
-        out[(h3_src, h3_dst)] = compute_fn(
-            h3_src, h3_dst, cells, config, cache,
-            elevation_provider=elevation_provider,
-        )
-    return out
+        try:
+            out[(h3_src, h3_dst)] = compute_fn(
+                h3_src, h3_dst, cells, config, cache,
+                elevation_provider=elevation_provider,
+            )
+        except Exception as exc:
+            failures.append(((h3_src, h3_dst), str(exc)))
+    return out, failures
 
 
 def _pair_aliases(
@@ -61,6 +65,8 @@ def compute_los_batch(
     min_pairs_for_parallel: int = 32,
     elevation_provider=None,
     compute_fn=None,
+    diagnostics: Dict[str, Any] | None = None,
+    strict_failures: bool = False,
 ) -> Dict[Tuple[str, str], LOSResult]:
     """
     Compute LOS for multiple cell pairs in parallel.
@@ -87,12 +93,19 @@ def compute_los_batch(
     unique_pairs = list(pair_aliases.keys())
     started_at = time.perf_counter()
     canonical_results: Dict[Tuple[str, str], LOSResult] = {}
+    failure_details: List[tuple[Tuple[str, str], str]] = []
+    chunk_failures = 0
+    chunk_count = 1
+    batch_size = len(unique_pairs)
     if len(unique_pairs) < max(1, int(min_pairs_for_parallel)) or max_workers <= 1:
         for h3_src, h3_dst in unique_pairs:
-            canonical_results[(h3_src, h3_dst)] = compute_fn(
-                h3_src, h3_dst, cells, config, cache,
-                elevation_provider=elevation_provider,
-            )
+            try:
+                canonical_results[(h3_src, h3_dst)] = compute_fn(
+                    h3_src, h3_dst, cells, config, cache,
+                    elevation_provider=elevation_provider,
+                )
+            except Exception as exc:
+                failure_details.append(((h3_src, h3_dst), str(exc)))
         logger.debug(
             "LOS batch executed serially",
             pairs=len(pairs),
@@ -106,6 +119,7 @@ def compute_los_batch(
             unique_pairs[i:i + batch_size]
             for i in range(0, len(unique_pairs), batch_size)
         ]
+        chunk_count = len(pair_batches)
         ordered_batches: list[Dict[Tuple[str, str], LOSResult] | None] = [None] * len(pair_batches)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
@@ -123,8 +137,18 @@ def compute_los_batch(
             for future in as_completed(futures):
                 idx = futures[future]
                 try:
-                    batch_result = future.result()
+                    batch_result, batch_failures = future.result()
                     ordered_batches[idx] = batch_result
+                    if batch_failures:
+                        chunk_failures += 1
+                        failure_details.extend(batch_failures)
+                        logger.warning(
+                            "LOS chunk had per-pair failures: chunk=%d failed_pairs=%d sample_pair=%s sample_error=%s",
+                            idx,
+                            len(batch_failures),
+                            batch_failures[0][0],
+                            batch_failures[0][1],
+                        )
                     logger.debug(
                         "LOS batch chunk complete",
                         chunk_index=idx,
@@ -132,7 +156,8 @@ def compute_los_batch(
                         workers=max_workers,
                     )
                 except Exception as e:
-                    logger.warning("LOS computation failed: %s", str(e))
+                    chunk_failures += 1
+                    logger.warning("LOS chunk failed: chunk=%d error=%s", idx, str(e))
         for batch_result in ordered_batches:
             if batch_result:
                 canonical_results.update(batch_result)
@@ -146,6 +171,21 @@ def compute_los_batch(
             elapsed_s=round(time.perf_counter() - started_at, 4),
         )
 
+    if strict_failures and failure_details:
+        sample_pair, sample_error = failure_details[0]
+        raise RuntimeError(
+            "LOS batch encountered failures "
+            f"(failed_pairs={len(failure_details)}, sample_pair={sample_pair}, error={sample_error})"
+        )
+
+    if len(canonical_results) + len(failure_details) != len(unique_pairs):
+        logger.warning(
+            "LOS batch invariant mismatch: unique=%d computed=%d failed=%d",
+            len(unique_pairs),
+            len(canonical_results),
+            len(failure_details),
+        )
+
     results: Dict[Tuple[str, str], LOSResult] = {}
     for key, aliases in pair_aliases.items():
         result = canonical_results.get(key)
@@ -153,6 +193,39 @@ def compute_los_batch(
             continue
         for alias in aliases:
             results[alias] = result
+
+    elapsed_s = round(time.perf_counter() - started_at, 4)
+    if diagnostics is not None:
+        diagnostics.update({
+            "pairs_requested": len(pairs),
+            "unique_pairs": len(unique_pairs),
+            "pairs_computed": len(canonical_results),
+            "pairs_failed": len(failure_details),
+            "chunk_failures": chunk_failures,
+            "workers": max_workers,
+            "chunks": chunk_count,
+            "batch_size": batch_size,
+            "elapsed_s": elapsed_s,
+        })
+        if failure_details:
+            diagnostics["failure_samples"] = [
+                {
+                    "pair": [pair[0], pair[1]],
+                    "error": error,
+                }
+                for pair, error in failure_details[:5]
+            ]
+    logger.debug(
+        "LOS batch diagnostics: requested=%d unique=%d computed=%d failed=%d chunks=%d chunk_failures=%d workers=%d elapsed_s=%.4f",
+        len(pairs),
+        len(unique_pairs),
+        len(canonical_results),
+        len(failure_details),
+        chunk_count,
+        chunk_failures,
+        max_workers,
+        elapsed_s,
+    )
     return results
 
 
@@ -166,6 +239,8 @@ def compute_los_batch_progress(
     progress_interval: int = 100,
     elevation_provider=None,
     compute_fn=None,
+    diagnostics: Dict[str, Any] | None = None,
+    strict_failures: bool = False,
 ) -> Dict[Tuple[str, str], LOSResult]:
     """
     Compute LOS for multiple cell pairs with progress reporting.
@@ -200,14 +275,21 @@ def compute_los_batch_progress(
     canonical_results: Dict[Tuple[str, str], LOSResult] = {}
     started_at = time.perf_counter()
     completed = 0
+    failure_details: List[tuple[Tuple[str, str], str]] = []
+    chunk_failures = 0
+    chunk_count = 1
+    batch_size = len(unique_pairs)
 
     if len(unique_pairs) < max(1, int(min_pairs_for_parallel)) or max_workers <= 1:
         for h3_src, h3_dst in unique_pairs:
-            canonical_results[(h3_src, h3_dst)] = compute_fn(
-                h3_src, h3_dst, cells, config, cache,
-                elevation_provider=elevation_provider,
-            )
-            completed += 1
+            try:
+                canonical_results[(h3_src, h3_dst)] = compute_fn(
+                    h3_src, h3_dst, cells, config, cache,
+                    elevation_provider=elevation_provider,
+                )
+                completed += 1
+            except Exception as exc:
+                failure_details.append(((h3_src, h3_dst), str(exc)))
             if completed % progress_interval == 0:
                 logger.debug(
                     "LOS progress: completed=%d total=%d pct=%.1f",
@@ -221,6 +303,7 @@ def compute_los_batch_progress(
             unique_pairs[i:i + batch_size]
             for i in range(0, len(unique_pairs), batch_size)
         ]
+        chunk_count = len(pair_batches)
         ordered_batches: list[Dict[Tuple[str, str], LOSResult] | None] = [None] * len(pair_batches)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
@@ -238,9 +321,19 @@ def compute_los_batch_progress(
             for future in as_completed(futures):
                 idx = futures[future]
                 try:
-                    batch_result = future.result()
+                    batch_result, batch_failures = future.result()
                     ordered_batches[idx] = batch_result
                     completed += len(batch_result)
+                    if batch_failures:
+                        chunk_failures += 1
+                        failure_details.extend(batch_failures)
+                        logger.warning(
+                            "LOS chunk had per-pair failures: chunk=%d failed_pairs=%d sample_pair=%s sample_error=%s",
+                            idx,
+                            len(batch_failures),
+                            batch_failures[0][0],
+                            batch_failures[0][1],
+                        )
                     logger.debug(
                         "LOS batch chunk complete",
                         chunk_index=idx,
@@ -248,7 +341,8 @@ def compute_los_batch_progress(
                         workers=max_workers,
                     )
                 except Exception as e:
-                    logger.warning("LOS computation failed: %s", str(e))
+                    chunk_failures += 1
+                    logger.warning("LOS chunk failed: chunk=%d error=%s", idx, str(e))
                 if completed % progress_interval == 0:
                     logger.debug(
                         "LOS progress: completed=%d total=%d pct=%.1f",
@@ -260,12 +354,29 @@ def compute_los_batch_progress(
             if batch_result:
                 canonical_results.update(batch_result)
 
+    if strict_failures and failure_details:
+        sample_pair, sample_error = failure_details[0]
+        raise RuntimeError(
+            "LOS batch encountered failures "
+            f"(failed_pairs={len(failure_details)}, sample_pair={sample_pair}, error={sample_error})"
+        )
+
+    if len(canonical_results) + len(failure_details) != len(unique_pairs):
+        logger.warning(
+            "LOS batch invariant mismatch: unique=%d computed=%d failed=%d",
+            len(unique_pairs),
+            len(canonical_results),
+            len(failure_details),
+        )
+
+    elapsed_s = time.perf_counter() - started_at
     logger.info(
-        "LOS computation complete: successful=%d total=%d workers=%d elapsed_s=%.3f",
+        "LOS computation complete: successful=%d total=%d failed=%d workers=%d elapsed_s=%.3f",
         len(canonical_results),
         len(unique_pairs),
+        len(failure_details),
         max_workers,
-        (time.perf_counter() - started_at),
+        elapsed_s,
     )
 
     # Log cache stats if available
@@ -285,4 +396,24 @@ def compute_los_batch_progress(
             continue
         for alias in aliases:
             results[alias] = result
+    if diagnostics is not None:
+        diagnostics.update({
+            "pairs_requested": len(pairs),
+            "unique_pairs": len(unique_pairs),
+            "pairs_computed": len(canonical_results),
+            "pairs_failed": len(failure_details),
+            "chunk_failures": chunk_failures,
+            "workers": max_workers,
+            "chunks": chunk_count,
+            "batch_size": batch_size,
+            "elapsed_s": round(elapsed_s, 4),
+        })
+        if failure_details:
+            diagnostics["failure_samples"] = [
+                {
+                    "pair": [pair[0], pair[1]],
+                    "error": error,
+                }
+                for pair, error in failure_details[:5]
+            ]
     return results

@@ -209,6 +209,25 @@ class MeshSurface:
         self.visibility_graph = VisibilityGraph()
         self._next_tower_id = 1
         self.gap_repair_debug: list = []  # debug records from algorithm search phases
+        self.los_batch_metrics: dict = {
+            "calls": 0,
+            "pairs_requested": 0,
+            "unique_pairs": 0,
+            "pairs_computed": 0,
+            "pairs_failed": 0,
+            "chunk_failures": 0,
+        }
+
+    def record_los_batch_diagnostics(self, diagnostics: Optional[dict]) -> None:
+        """Aggregate per-call LOS batch diagnostics into surface-level counters."""
+        if not diagnostics:
+            return
+        self.los_batch_metrics["calls"] += 1
+        self.los_batch_metrics["pairs_requested"] += int(diagnostics.get("pairs_requested", 0))
+        self.los_batch_metrics["unique_pairs"] += int(diagnostics.get("unique_pairs", 0))
+        self.los_batch_metrics["pairs_computed"] += int(diagnostics.get("pairs_computed", 0))
+        self.los_batch_metrics["pairs_failed"] += int(diagnostics.get("pairs_failed", 0))
+        self.los_batch_metrics["chunk_failures"] += int(diagnostics.get("chunk_failures", 0))
 
     def place_tower(
         self,
@@ -299,6 +318,7 @@ class MeshSurface:
             (tower_list[i].h3_index, tower_list[j].h3_index)
             for i, j in candidate_pairs
         ]
+        los_diag: dict = {}
         los_results = compute_los_batch(
             h3_pairs,
             self.cells,
@@ -306,7 +326,9 @@ class MeshSurface:
             cache,
             elevation_provider=self.elevation_provider,
             compute_fn=compute_los,
+            diagnostics=los_diag,
         )
+        self.record_los_batch_diagnostics(los_diag)
         for i, j in candidate_pairs:
             t1, t2 = tower_list[i], tower_list[j]
             result = los_results.get((t1.h3_index, t2.h3_index))
@@ -407,6 +429,7 @@ class MeshSurface:
             t = tower_list[ti]
             h3_pair_refs.setdefault((c.h3_index, t.h3_index), []).append((ci, ti))
 
+        los_diag: dict = {}
         los_results = compute_los_batch(
             list(h3_pair_refs.keys()),
             cells,
@@ -414,7 +437,9 @@ class MeshSurface:
             cache,
             elevation_provider=elev,
             compute_fn=compute_los,
+            diagnostics=los_diag,
         )
+        self.record_los_batch_diagnostics(los_diag)
         for h3_pair, refs in h3_pair_refs.items():
             result = los_results.get(h3_pair)
             if result is None or not result.is_visible:

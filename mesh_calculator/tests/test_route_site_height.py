@@ -4,6 +4,7 @@ Route-pipeline tests for per-site endpoint height handling.
 from __future__ import annotations
 
 import h3
+import json
 
 from ..core.config import MeshConfig, RouteSpec
 from ..optimization import route_pipeline as rp
@@ -223,3 +224,38 @@ def test_city_anchor_site_height_applied_to_entry_cell(monkeypatch, tmp_path):
 
     surface = captured["surface"]
     assert surface.cells[entry_h3].antenna_height_offset_m == 9.0
+
+
+def test_route_pipeline_emits_debug_snapshot_and_los_batch_metrics(monkeypatch, tmp_path):
+    captured = {}
+    _prepare_pipeline_monkeypatch(monkeypatch, captured)
+
+    cfg = MeshConfig(h3_resolution=8)
+    provider = _FakeElevationProvider()
+    route = RouteSpec(
+        route_id="r_dbg",
+        features=[{}],
+        site1={"name": "A", "lat": 40.2, "lon": 44.5, "site_height_m": 0.0},
+        site2={"name": "B", "lat": 40.22, "lon": 44.52, "site_height_m": 0.0},
+        max_towers_per_route=5,
+    )
+    snapshot_dir = tmp_path / "snapshots"
+    summary = rp.run_route_pipeline(
+        routes=[route],
+        mesh_config=cfg,
+        grid_provider=provider,
+        city_boundaries_geojson=None,
+        output_dir=str(tmp_path),
+        debug_snapshot_dir=str(snapshot_dir),
+    )
+
+    snapshot_path = snapshot_dir / "r_dbg.debug.json"
+    assert snapshot_path.is_file()
+    payload = json.loads(snapshot_path.read_text())
+    assert payload["route_id"] == "r_dbg"
+    assert "corridor" in payload
+    assert "prepared_cells" in payload
+    assert "placement" in payload
+
+    assert "los_batch" in summary
+    assert summary["los_batch"]["calls"] >= 0

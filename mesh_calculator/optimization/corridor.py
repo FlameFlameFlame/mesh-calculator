@@ -16,6 +16,14 @@ from ..network.graph import MeshSurface, _los_decision_debug
 logger = structlog.get_logger(__name__)
 
 
+def _record_los_diag(surface: MeshSurface, diagnostics: Optional[dict]) -> None:
+    """Best-effort forwarding of LOS batch diagnostics to surface counters."""
+    try:
+        surface.record_los_batch_diagnostics(diagnostics)
+    except Exception:
+        logger.debug("Failed to record LOS diagnostics", exc_info=True)
+
+
 def _cell_elevation(elevation_provider, h3_idx: str, lat: float, lon: float) -> float:
     """Get elevation with backward-compatible provider fallback."""
     if elevation_provider is None:
@@ -197,6 +205,7 @@ def _dp_place_towers_with_meta(
         if not pair_sequence:
             continue
 
+        los_diag: dict = {}
         los_results = compute_los_batch(
             pair_sequence,
             cells,
@@ -205,7 +214,9 @@ def _dp_place_towers_with_meta(
             max_workers=los_max_workers,
             elevation_provider=elevation_provider,
             compute_fn=compute_los,
+            diagnostics=los_diag,
         )
+        _record_los_diag(surface, los_diag)
         # Preserve deterministic DP tie behavior by applying transitions in the
         # exact same order as the original nested i/j loops.
         for (i, j), pair in zip(transitions, pair_sequence):
@@ -508,6 +519,7 @@ def _find_broken_gaps(
     if len(chain) < 2:
         return broken
     pairs = [(chain[i], chain[i + 1]) for i in range(len(chain) - 1)]
+    los_diag: dict = {}
     los_results = compute_los_batch(
         pairs,
         surface.cells,
@@ -516,7 +528,9 @@ def _find_broken_gaps(
         max_workers=los_max_workers,
         elevation_provider=surface.elevation_provider,
         compute_fn=compute_los,
+        diagnostics=los_diag,
     )
+    _record_los_diag(surface, los_diag)
     for i, pair in enumerate(pairs):
         los = los_results.get(pair)
         if los is None or not los.is_visible:
@@ -651,6 +665,7 @@ def _repair_broken_gaps(
                 (new_anchor_b, chain[j])
                 for j in range(len(chain) - 1, new_anchor_b_idx + 1, -1)
             ]
+            los_diag: dict = {}
             los_results = compute_los_batch(
                 pairs,
                 surface.cells,
@@ -659,7 +674,9 @@ def _repair_broken_gaps(
                 max_workers=los_max_workers,
                 elevation_provider=surface.elevation_provider,
                 compute_fn=compute_los,
+                diagnostics=los_diag,
             )
+            _record_los_diag(surface, los_diag)
             for j in range(len(chain) - 1, new_anchor_b_idx + 1, -1):
                 pair = (new_anchor_b, chain[j])
                 los = los_results.get(pair)
@@ -1275,6 +1292,7 @@ def wire_corridor_edges(
         return
 
     pairs = [(h3_a, h3_b) for h3_a, h3_b, _tower_a, _tower_b in pending_edges]
+    los_diag: dict = {}
     los_results = compute_los_batch(
         pairs,
         surface.cells,
@@ -1283,7 +1301,9 @@ def wire_corridor_edges(
         max_workers=los_max_workers,
         elevation_provider=surface.elevation_provider,
         compute_fn=compute_los,
+        diagnostics=los_diag,
     )
+    _record_los_diag(surface, los_diag)
     for h3_a, h3_b, tower_a, tower_b in pending_edges:
         los = los_results.get((h3_a, h3_b))
         if los is None:

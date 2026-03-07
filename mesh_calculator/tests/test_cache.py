@@ -2,6 +2,7 @@
 Unit tests for caching.
 """
 import unittest
+import h3
 from unittest.mock import patch
 
 from ..core.config import MeshConfig
@@ -391,3 +392,140 @@ class TestLOSBatchExecution(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class _FlatElevationProvider:
+    def get_elevation(self, _lat: float, _lon: float) -> float:
+        return 100.0
+
+
+class TestLOSBatchDiagnosticsAndRealDeterminism(unittest.TestCase):
+    def setUp(self):
+        self.config = MeshConfig(
+            h3_resolution=8,
+            mast_height_m=12.0,
+            min_fresnel_clearance_m=0.0,
+        )
+        start = h3.latlng_to_cell(40.0, 44.0, self.config.h3_resolution)
+        candidates = list(h3.grid_disk(start, 2))
+        self.real_cells = {}
+        for h3_idx in candidates:
+            lat, lon = h3.cell_to_latlng(h3_idx)
+            self.real_cells[h3_idx] = H3Cell(
+                h3_index=h3_idx,
+                lat=lat,
+                lon=lon,
+                elevation=100.0,
+                has_road=True,
+                is_in_boundary=True,
+            )
+        keys = list(self.real_cells.keys())[:8]
+        self.real_pairs = []
+        for i in range(len(keys)):
+            for j in range(i + 1, len(keys)):
+                self.real_pairs.append((keys[i], keys[j]))
+
+    def test_batch_collects_failures_in_diagnostics(self):
+        cells = {
+            "a": H3Cell("a", 40.0, 44.0, 100.0, has_road=True),
+            "b": H3Cell("b", 40.1, 44.1, 100.0, has_road=True),
+            "c": H3Cell("c", 40.2, 44.2, 100.0, has_road=True),
+        }
+        pairs = [("a", "b"), ("b", "c")]
+
+        def _fake_compute(src, dst, *_a, **_k):
+            if {src, dst} == {"b", "c"}:
+                raise RuntimeError("boom")
+            return LOSResult(
+                clearance_m=5.0,
+                path_loss_db=90.0,
+                distance_m=1000.0,
+                is_visible=True,
+            )
+
+        diagnostics = {}
+        results = compute_los_batch(
+            pairs,
+            cells,
+            self.config,
+            max_workers=2,
+            min_pairs_for_parallel=1,
+            compute_fn=_fake_compute,
+            diagnostics=diagnostics,
+        )
+        self.assertIn(("a", "b"), results)
+        self.assertNotIn(("b", "c"), results)
+        self.assertEqual(diagnostics["pairs_requested"], 2)
+        self.assertEqual(diagnostics["unique_pairs"], 2)
+        self.assertEqual(diagnostics["pairs_computed"], 1)
+        self.assertEqual(diagnostics["pairs_failed"], 1)
+
+    def test_batch_strict_failures_raises(self):
+        cells = {
+            "a": H3Cell("a", 40.0, 44.0, 100.0, has_road=True),
+            "b": H3Cell("b", 40.1, 44.1, 100.0, has_road=True),
+        }
+        pairs = [("a", "b")]
+
+        def _fail(*_a, **_k):
+            raise RuntimeError("fail")
+
+        with self.assertRaises(RuntimeError):
+            compute_los_batch(
+                pairs,
+                cells,
+                self.config,
+                max_workers=2,
+                min_pairs_for_parallel=1,
+                compute_fn=_fail,
+                strict_failures=True,
+            )
+
+    def test_parallel_matches_serial_with_real_los(self):
+        serial = compute_los_batch(
+            self.real_pairs,
+            self.real_cells,
+            self.config,
+            max_workers=1,
+            min_pairs_for_parallel=1,
+            elevation_provider=_FlatElevationProvider(),
+        )
+        parallel = compute_los_batch(
+            self.real_pairs,
+            self.real_cells,
+            self.config,
+            max_workers=4,
+            min_pairs_for_parallel=1,
+            elevation_provider=_FlatElevationProvider(),
+        )
+        self.assertEqual(set(serial.keys()), set(parallel.keys()))
+        for key in serial:
+            self.assertAlmostEqual(serial[key].clearance_m, parallel[key].clearance_m, places=6)
+            self.assertAlmostEqual(serial[key].path_loss_db, parallel[key].path_loss_db, places=6)
+            self.assertAlmostEqual(serial[key].distance_m, parallel[key].distance_m, places=6)
+            self.assertEqual(serial[key].is_visible, parallel[key].is_visible)
+
+    def test_parallel_is_repeatable_with_real_los(self):
+        baseline = compute_los_batch(
+            self.real_pairs,
+            self.real_cells,
+            self.config,
+            max_workers=4,
+            min_pairs_for_parallel=1,
+            elevation_provider=_FlatElevationProvider(),
+        )
+        for _ in range(4):
+            current = compute_los_batch(
+                self.real_pairs,
+                self.real_cells,
+                self.config,
+                max_workers=4,
+                min_pairs_for_parallel=1,
+                elevation_provider=_FlatElevationProvider(),
+            )
+            self.assertEqual(set(baseline.keys()), set(current.keys()))
+            for key in baseline:
+                self.assertAlmostEqual(baseline[key].clearance_m, current[key].clearance_m, places=6)
+                self.assertAlmostEqual(baseline[key].path_loss_db, current[key].path_loss_db, places=6)
+                self.assertAlmostEqual(baseline[key].distance_m, current[key].distance_m, places=6)
+                self.assertEqual(baseline[key].is_visible, current[key].is_visible)

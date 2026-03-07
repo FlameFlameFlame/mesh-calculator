@@ -183,6 +183,7 @@ def run_route_pipeline(
     boundary_geojson: Optional[dict] = None,
     output_dir: str = "output",
     progress_callback: Optional[Callable[[dict], None]] = None,
+    debug_snapshot_dir: Optional[str] = None,
 ) -> dict:
     """
     Run the full route-based tower placement pipeline.
@@ -207,6 +208,7 @@ def run_route_pipeline(
         boundary_geojson: Optional boundary geometry used for full-grid export.
         output_dir: Directory to write output files.
         progress_callback: Optional callback receiving structured progress dicts.
+        debug_snapshot_dir: Optional directory to emit per-route debug snapshots.
 
     Returns:
         Summary dict with tower count, route count, etc.
@@ -252,6 +254,8 @@ def run_route_pipeline(
             logger.debug("Progress callback failed", exc_info=True)
 
     os.makedirs(output_dir, exist_ok=True)
+    if debug_snapshot_dir:
+        os.makedirs(debug_snapshot_dir, exist_ok=True)
 
     logger.info(
         "Starting route pipeline: %d route(s), output=%s",
@@ -303,6 +307,17 @@ def run_route_pipeline(
     for route_idx, route in enumerate(routes, start=1):
         route_base = (route_idx - 1) * route_weight
         route_label = _route_label(route)
+        route_debug = None
+        route_debug_gap_start = len(surface.gap_repair_debug)
+        if debug_snapshot_dir:
+            route_debug = {
+                "route_id": route.route_id,
+                "route_index": route_idx,
+                "route_total": total_routes,
+                "route_label": route_label,
+                "max_towers_per_route": route.max_towers_per_route,
+                "los_parallel_workers": mesh_config.los_parallel_workers,
+            }
         _emit_progress(
             stage='route',
             step='Preparing corridor',
@@ -327,6 +342,11 @@ def run_route_pipeline(
             config=mesh_config,
         )
         prep_metrics["corridor_extract_s"] += time.perf_counter() - t_corridor
+        if route_debug is not None:
+            route_debug["corridor"] = {
+                "cells_total": len(corridor),
+                "h3_indices": corridor,
+            }
         _emit_progress(
             stage='route',
             step='Preparing corridor',
@@ -346,6 +366,14 @@ def run_route_pipeline(
                 'towers_placed': 0,
                 'skipped': True,
             })
+            if route_debug is not None:
+                route_debug["skipped"] = "corridor_too_short"
+                snapshot_path = os.path.join(
+                    debug_snapshot_dir,
+                    f"{route.route_id}.debug.json",
+                )
+                with open(snapshot_path, "w") as f:
+                    json.dump(route_debug, f, indent=2)
             _emit_progress(
                 stage='route',
                 step='Route skipped (corridor too short)',
@@ -391,6 +419,13 @@ def run_route_pipeline(
         )
         surface.cells.update(new_cells)
         surface.cells.update(buffer_cells)
+        if route_debug is not None:
+            route_debug["prepared_cells"] = {
+                "corridor_new": len(new_cells),
+                "buffer_new": len(buffer_cells),
+                "prepared_total": prep_stats["prepared_cells_total"],
+                "materialized": materialize_stats,
+            }
         prep_metrics["prepare_cells_and_buffer_s"] += prep_stats["prepare_cells_and_buffer_s"]
         prep_metrics["prepared_cells_total"] += prep_stats["prepared_cells_total"]
         prep_metrics["materialized_cache_hits"] += materialize_stats["cache_hits"]
@@ -426,6 +461,13 @@ def run_route_pipeline(
         # Trim city-interior cells from both corridor ends.
         # Anchor towers go at the boundary entry cells (city edge), not inside the city.
         trimmed_corridor, entry1_h3, entry2_h3 = _trim_unfit_ends(corridor, surface.cells)
+        if route_debug is not None:
+            route_debug["trimmed_corridor"] = {
+                "cells_total": len(trimmed_corridor),
+                "entry1_h3": entry1_h3,
+                "entry2_h3": entry2_h3,
+                "removed_unfit": len(corridor) - len(trimmed_corridor),
+            }
         prep_metrics["trim_unfit_s"] += time.perf_counter() - t_trim
         if len(trimmed_corridor) < 2:
             logger.warning(
@@ -439,6 +481,15 @@ def run_route_pipeline(
                 'towers_reused': 0,
                 'skipped': True,
             })
+            if route_debug is not None:
+                route_debug["skipped"] = "no_eligible_corridor_after_trim"
+                route_debug["search_hexes"] = surface.gap_repair_debug[route_debug_gap_start:]
+                snapshot_path = os.path.join(
+                    debug_snapshot_dir,
+                    f"{route.route_id}.debug.json",
+                )
+                with open(snapshot_path, "w") as f:
+                    json.dump(route_debug, f, indent=2)
             _emit_progress(
                 stage='route',
                 step='Route skipped (no eligible corridor)',
@@ -590,6 +641,7 @@ def run_route_pipeline(
         placed = place_nodes_along_corridor(
             trimmed_corridor, surface, los_cache, out_meta=placement_meta,
         )
+        edges_before = surface.visibility_graph.edge_count()
         install_nodes(placed, surface, source=route.route_id,
                       placement_meta=placement_meta)
         towers_after = len(surface.towers)
@@ -608,6 +660,16 @@ def run_route_pipeline(
         # even when straight-line LOS (used by update_visibility_edges) is blocked
         # by terrain.
         wire_corridor_edges(placed, trimmed_corridor, surface, los_cache)
+        if route_debug is not None:
+            route_debug["placement"] = {
+                "placed_h3": placed,
+                "placement_meta": placement_meta,
+                "towers_before": towers_before,
+                "towers_after": towers_after,
+                "corridor_edges_added": (
+                    surface.visibility_graph.edge_count() - edges_before
+                ),
+            }
 
         mesh_config.max_towers_per_route = saved_max
 
@@ -625,6 +687,14 @@ def run_route_pipeline(
             'prepared_cells_total': prep_stats["prepared_cells_total"],
             'prepare_cells_and_buffer_s': prep_stats["prepare_cells_and_buffer_s"],
         })
+        if route_debug is not None:
+            route_debug["search_hexes"] = surface.gap_repair_debug[route_debug_gap_start:]
+            snapshot_path = os.path.join(
+                debug_snapshot_dir,
+                f"{route.route_id}.debug.json",
+            )
+            with open(snapshot_path, "w") as f:
+                json.dump(route_debug, f, indent=2)
         _emit_progress(
             stage='route',
             step='Finalizing route links',
@@ -717,6 +787,7 @@ def run_route_pipeline(
         'materialized_from_static': prep_metrics["materialized_from_static"],
         'materialized_from_dem': prep_metrics["materialized_from_dem"],
         'los_cache': cache_stats,
+        'los_batch': dict(surface.los_batch_metrics),
         'elevation_cache': elev_stats,
     }
 
