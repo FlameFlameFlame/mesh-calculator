@@ -239,8 +239,8 @@ class MeshSurface:
         tower = Tower(
             tower_id=self._next_tower_id,
             h3_index=h3_index,
-            lat=cell.lat,
-            lon=cell.lon,
+            lat=float(getattr(cell, "los_lat", cell.lat)),
+            lon=float(getattr(cell, "los_lon", cell.lon)),
             source=source,
             placement_meta=placement_meta or {},
         )
@@ -481,7 +481,7 @@ class MeshSurface:
             sources=sources,
             base_cells=self.cells,
             config=self.config,
-            elevation_provider=self.elevation_provider,
+            grid_provider=self.elevation_provider,
             los_cache=los_cache,
         )
 

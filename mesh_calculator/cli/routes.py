@@ -10,6 +10,7 @@ import logging
 import click
 
 from ..core.config import MeshConfig, RouteSpec
+from ..core.grid_provider import GridProvider
 from ..logging_config import setup_logging
 from ..optimization.route_pipeline import run_route_pipeline
 
@@ -23,9 +24,10 @@ logger = logging.getLogger(__name__)
     help='Path to routes.json file',
 )
 @click.option(
-    '--elevation',
+    '--grid-bundle',
+    'grid_bundle',
     type=click.Path(exists=True), required=True,
-    help='Path to GeoTIFF elevation file',
+    help='Path to persisted grid bundle JSON',
 )
 @click.option(
     '--city-boundaries',
@@ -40,7 +42,7 @@ logger = logging.getLogger(__name__)
 @click.option('--quiet', is_flag=True, help='Suppress info-level logging')
 def routes_cmd(
     routes_path: str,
-    elevation: str,
+    grid_bundle: str,
     city_boundaries: str,
     output: str,
     verbose: bool,
@@ -105,13 +107,14 @@ def routes_cmd(
             city_boundaries_geojson = json.load(f)
         logger.info("Loaded city boundaries from %s", city_boundaries)
 
-    summary = run_route_pipeline(
-        routes=route_specs,
-        mesh_config=mesh_config,
-        elevation_path=elevation,
-        city_boundaries_geojson=city_boundaries_geojson,
-        output_dir=output,
-    )
+    with GridProvider.from_bundle(grid_bundle) as grid_provider:
+        summary = run_route_pipeline(
+            routes=route_specs,
+            mesh_config=mesh_config,
+            grid_provider=grid_provider,
+            city_boundaries_geojson=city_boundaries_geojson,
+            output_dir=output,
+        )
 
     click.echo(
         f"\nDone: {summary['total_towers']} towers, "

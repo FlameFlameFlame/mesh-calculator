@@ -27,6 +27,35 @@ def _cell_elevation(provider: ElevationProvider, h3_idx: str, lat: float, lon: f
     return provider.get_elevation(lat, lon)
 
 
+def resolve_cell_profile(
+    provider: Optional[ElevationProvider],
+    h3_idx: str,
+    lat: float,
+    lon: float,
+    anchor_margin_m: float = 10.0,
+) -> tuple[float, float, float]:
+    """
+    Resolve cell terrain/effective LOS anchor.
+
+    Returns:
+        (elevation_m, los_lat, los_lon)
+    """
+    if provider is None:
+        return 0.0, float(lat), float(lon)
+
+    if callable(getattr(type(provider), "get_h3_cell_anchor_point", None)):
+        try:
+            a_lat, a_lon, elev = provider.get_h3_cell_anchor_point(
+                h3_idx, margin_m=anchor_margin_m
+            )
+            return float(elev), float(a_lat), float(a_lon)
+        except Exception:
+            pass
+
+    elev = _cell_elevation(provider, h3_idx, lat, lon)
+    return float(elev), float(lat), float(lon)
+
+
 def shapely_to_h3_cells(shapely_geom, resolution: int) -> set:
     """Convert a Shapely polygon to H3 cells using h3 v4 API."""
     coords = list(shapely_geom.exterior.coords)
@@ -74,6 +103,14 @@ class H3Cell:
     received_power_dbm: Optional[float] = None   # Computed link budget result
     is_covered: bool = False                      # received_power >= sensitivity AND LOS
     antenna_height_offset_m: float = 0.0         # Additional endpoint AGL height above global mast
+    los_lat: Optional[float] = None              # Fixed LOS anchor latitude inside cell
+    los_lon: Optional[float] = None              # Fixed LOS anchor longitude inside cell
+
+    def __post_init__(self):
+        if self.los_lat is None:
+            self.los_lat = float(self.lat)
+        if self.los_lon is None:
+            self.los_lon = float(self.lon)
 
 
 def load_boundary(boundary_path: str) -> Polygon:
@@ -239,7 +276,13 @@ def generate_road_grid(
     logger.debug("Loading elevation data for cells")
     for i, h3_idx in enumerate(valid_cells):
         lat, lon = h3_to_lat_lon(h3_idx)
-        elevation = _cell_elevation(elevation_provider, h3_idx, lat, lon)
+        elevation, los_lat, los_lon = resolve_cell_profile(
+            elevation_provider,
+            h3_idx,
+            lat,
+            lon,
+            anchor_margin_m=config.cell_anchor_margin_m,
+        )
 
         cell = H3Cell(
             h3_index=h3_idx,
@@ -247,7 +290,9 @@ def generate_road_grid(
             lon=lon,
             elevation=elevation,
             has_road=(h3_idx in original_road_cells),
-            is_in_boundary=True
+            is_in_boundary=True,
+            los_lat=los_lat,
+            los_lon=los_lon,
         )
 
         cells_dict[h3_idx] = cell
@@ -302,14 +347,22 @@ def generate_full_grid(
     logger.debug("Loading elevation data for cells")
     for i, h3_idx in enumerate(all_cells):
         lat, lon = h3_to_lat_lon(h3_idx)
-        elevation = _cell_elevation(elevation_provider, h3_idx, lat, lon)
+        elevation, los_lat, los_lon = resolve_cell_profile(
+            elevation_provider,
+            h3_idx,
+            lat,
+            lon,
+            anchor_margin_m=config.cell_anchor_margin_m,
+        )
 
         cell = H3Cell(
             h3_index=h3_idx,
             lat=lat,
             lon=lon,
             elevation=elevation,
-            is_in_boundary=True
+            is_in_boundary=True,
+            los_lat=los_lat,
+            los_lon=los_lon,
         )
 
         cells_dict[h3_idx] = cell

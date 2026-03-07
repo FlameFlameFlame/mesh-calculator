@@ -5,7 +5,7 @@ from typing import Dict
 
 from ..core.grid import H3Cell
 from ..core.config import MeshConfig
-from ..core.geometry import h3_distance
+from ..core.geometry import great_circle_distance, h3_distance
 from ..data.cache import LOSCache, LOSResult
 from .fresnel import (
     compute_fresnel_profile_summary,
@@ -31,6 +31,20 @@ def _endpoint_mast_height_m(
     return config.mast_height_m + offset
 
 
+def _endpoint_los_coords(
+    h3_idx: str,
+    cells: Dict[str, H3Cell],
+) -> tuple[float, float]:
+    """Resolve fixed LOS anchor coordinates for an endpoint cell."""
+    cell = cells.get(h3_idx)
+    if cell is None:
+        raise ValueError(f"Cell not found: {h3_idx}")
+    return (
+        float(getattr(cell, "los_lat", cell.lat)),
+        float(getattr(cell, "los_lon", cell.lon)),
+    )
+
+
 def compute_los(
     h3_src: str,
     h3_dst: str,
@@ -54,6 +68,8 @@ def compute_los(
     """
     src_mast_height_m = _endpoint_mast_height_m(h3_src, cells, config)
     dst_mast_height_m = _endpoint_mast_height_m(h3_dst, cells, config)
+    src_lat, src_lon = _endpoint_los_coords(h3_src, cells)
+    dst_lat, dst_lon = _endpoint_los_coords(h3_dst, cells)
     max_allowed_ratio = max_allowed_fresnel_obstruction_ratio()
 
     # Same-cell: trivially visible at zero distance, skip path loss calculation
@@ -80,6 +96,10 @@ def compute_los(
                 los_dense_sample_step_m=config.los_dense_sample_step_m,
                 los_dense_max_samples=config.los_dense_max_samples,
                 los_verification_mode=_LOS_VERIFICATION_MODE,
+                src_lat=src_lat,
+                src_lon=src_lon,
+                dst_lat=dst_lat,
+                dst_lon=dst_lon,
             )
         return result
 
@@ -99,12 +119,16 @@ def compute_los(
             los_dense_sample_step_m=config.los_dense_sample_step_m,
             los_dense_max_samples=config.los_dense_max_samples,
             los_verification_mode=_LOS_VERIFICATION_MODE,
+            src_lat=src_lat,
+            src_lon=src_lon,
+            dst_lat=dst_lat,
+            dst_lon=dst_lon,
         )
         if cached is not None:
             return cached
 
     # Check distance constraint
-    distance = h3_distance(h3_src, h3_dst)
+    distance = great_circle_distance(src_lat, src_lon, dst_lat, dst_lon)
     if distance > config.max_visibility_m:
         result = LOSResult(
             clearance_m=-999.0,
@@ -125,6 +149,10 @@ def compute_los(
                 los_dense_sample_step_m=config.los_dense_sample_step_m,
                 los_dense_max_samples=config.los_dense_max_samples,
                 los_verification_mode=_LOS_VERIFICATION_MODE,
+                src_lat=src_lat,
+                src_lon=src_lon,
+                dst_lat=dst_lat,
+                dst_lon=dst_lon,
             )
         return result
 
@@ -140,6 +168,40 @@ def compute_los(
     d1 = coarse_summary.d1_m
     d2 = coarse_summary.d2_m
     obstruction_ratio = coarse_summary.max_obstruction_ratio
+
+    if distance_m <= 0.0:
+        result = LOSResult(
+            clearance_m=clearance,
+            path_loss_db=0.0,
+            distance_m=0.0,
+            is_visible=fresnel_obstruction_ratio_accepts(obstruction_ratio),
+        )
+        setattr(result, "fresnel_obstruction_ratio", float(obstruction_ratio))
+        setattr(result, "max_allowed_fresnel_obstruction_ratio", float(max_allowed_ratio))
+        setattr(
+            result,
+            "fresnel_obstruction_margin_ratio",
+            float(max_allowed_ratio - obstruction_ratio),
+        )
+        if use_cache:
+            cache.put(
+                h3_src, h3_dst,
+                src_mast_height_m, dst_mast_height_m,
+                config.frequency_hz,
+                result,
+                tx_power_mw=config.tx_power_mw,
+                antenna_gain_dbi=config.antenna_gain_dbi,
+                receiver_sensitivity_dbm=config.receiver_sensitivity_dbm,
+                min_fresnel_clearance_m=config.min_fresnel_clearance_m,
+                los_dense_sample_step_m=config.los_dense_sample_step_m,
+                los_dense_max_samples=config.los_dense_max_samples,
+                los_verification_mode=_LOS_VERIFICATION_MODE,
+                src_lat=src_lat,
+                src_lon=src_lon,
+                dst_lat=dst_lat,
+                dst_lon=dst_lon,
+            )
+        return result
 
     # Compute path loss
     path_loss = compute_path_loss(
@@ -202,6 +264,10 @@ def compute_los(
             los_dense_sample_step_m=config.los_dense_sample_step_m,
             los_dense_max_samples=config.los_dense_max_samples,
             los_verification_mode=_LOS_VERIFICATION_MODE,
+            src_lat=src_lat,
+            src_lon=src_lon,
+            dst_lat=dst_lat,
+            dst_lon=dst_lon,
         )
 
     return result

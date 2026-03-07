@@ -39,6 +39,7 @@ class ElevationProvider:
         self.transform = self.dataset.transform
         self._cache = {}
         self._cell_max_cache = {}
+        self._cell_anchor_cache = {}
         self._line_peak_cache = {}
         self._data = None  # Lazy-load full array if needed
         self._lock = threading.Lock()
@@ -252,6 +253,166 @@ class ElevationProvider:
             self._cell_max_cache[h3_index] = 0.0
             return 0.0
 
+    @staticmethod
+    def _to_local_xy(polygon: Polygon) -> tuple[Polygon, float, float, float]:
+        """Project lon/lat polygon to a local-meter plane for buffering."""
+        lon0 = float(polygon.centroid.x)
+        lat0 = float(polygon.centroid.y)
+        cos_lat = float(np.cos(np.radians(lat0)))
+        if abs(cos_lat) < 1e-6:
+            cos_lat = 1e-6
+        m_per_deg = 111_320.0
+
+        def _ll_to_xy(lon: float, lat: float) -> tuple[float, float]:
+            x = (lon - lon0) * cos_lat * m_per_deg
+            y = (lat - lat0) * m_per_deg
+            return (x, y)
+
+        exterior = [_ll_to_xy(lon, lat) for lon, lat in polygon.exterior.coords]
+        holes = [
+            [_ll_to_xy(lon, lat) for lon, lat in ring.coords]
+            for ring in polygon.interiors
+        ]
+        return Polygon(exterior, holes), lon0, lat0, cos_lat
+
+    @staticmethod
+    def _from_local_xy(
+        polygon_xy: Polygon,
+        lon0: float,
+        lat0: float,
+        cos_lat: float,
+    ) -> Polygon:
+        """Project local-meter polygon back to lon/lat."""
+        m_per_deg = 111_320.0
+
+        def _xy_to_ll(x: float, y: float) -> tuple[float, float]:
+            lon = lon0 + (x / (cos_lat * m_per_deg))
+            lat = lat0 + (y / m_per_deg)
+            return (lon, lat)
+
+        exterior = [_xy_to_ll(x, y) for x, y in polygon_xy.exterior.coords]
+        holes = [
+            [_xy_to_ll(x, y) for x, y in ring.coords]
+            for ring in polygon_xy.interiors
+        ]
+        return Polygon(exterior, holes)
+
+    def _shrink_polygon_m(self, polygon: Polygon, margin_m: float) -> Optional[Polygon]:
+        """Shrink polygon inward by margin meters in local tangent plane."""
+        if margin_m <= 0.0 or polygon.is_empty:
+            return polygon
+        poly_xy, lon0, lat0, cos_lat = self._to_local_xy(polygon)
+        try:
+            shrunk_xy = poly_xy.buffer(-float(margin_m))
+        except Exception:
+            return None
+        if shrunk_xy.is_empty:
+            return None
+        if shrunk_xy.geom_type == "MultiPolygon":
+            geoms = list(shrunk_xy.geoms)
+            if not geoms:
+                return None
+            shrunk_xy = max(geoms, key=lambda g: g.area)
+        if shrunk_xy.geom_type != "Polygon":
+            return None
+        return self._from_local_xy(shrunk_xy, lon0, lat0, cos_lat)
+
+    def _max_pixel_in_polygon(self, polygon: Polygon) -> Optional[tuple[float, float, float]]:
+        """Return (lat, lon, elevation) of the highest valid DEM pixel in polygon."""
+        minx, miny, maxx, maxy = polygon.bounds
+        raw_window = window_from_bounds(minx, miny, maxx, maxy, transform=self.transform)
+        win = self._clip_window(raw_window)
+        if win is None:
+            return None
+        with self._lock:
+            band = self.dataset.read(1, window=win, masked=True)
+        w_transform = window_transform(win, self.transform)
+        inside = geometry_mask(
+            [mapping(polygon)],
+            out_shape=band.shape,
+            transform=w_transform,
+            invert=True,
+            all_touched=True,
+        )
+        valid = inside & (~np.ma.getmaskarray(band))
+        if not np.any(valid):
+            return None
+        values = band.data[valid]
+        values = values[np.isfinite(values)]
+        if values.size == 0:
+            return None
+        max_elev = float(np.max(values))
+        candidates = np.where(valid & (band.data == max_elev))
+        if len(candidates[0]) == 0:
+            return None
+
+        centroid = polygon.centroid
+        row_off = int(win.row_off)
+        col_off = int(win.col_off)
+        best_row = None
+        best_col = None
+        best_d2 = float("inf")
+        for r, c in zip(candidates[0], candidates[1]):
+            global_row = row_off + int(r)
+            global_col = col_off + int(c)
+            px_lon, px_lat = rasterio.transform.xy(
+                self.transform, global_row, global_col, offset="center"
+            )
+            d2 = (float(px_lat) - centroid.y) ** 2 + (float(px_lon) - centroid.x) ** 2
+            if d2 < best_d2:
+                best_d2 = d2
+                best_row = global_row
+                best_col = global_col
+        if best_row is None or best_col is None:
+            return None
+        px_lon, px_lat = rasterio.transform.xy(
+            self.transform, best_row, best_col, offset="center"
+        )
+        return float(px_lat), float(px_lon), max_elev
+
+    def get_h3_cell_anchor_point(
+        self,
+        h3_index: str,
+        margin_m: float = 10.0,
+    ) -> tuple[float, float, float]:
+        """
+        Return fixed subcell LOS anchor (lat, lon, elevation) for an H3 cell.
+
+        The anchor is the highest DEM pixel inside the inward-buffered polygon.
+        Falls back to zero-margin search, then to centroid elevation.
+        """
+        key = (h3_index, round(float(margin_m), 3))
+        cached = self._cell_anchor_cache.get(key)
+        if cached is not None:
+            return cached
+
+        lat_c, lon_c = h3.cell_to_latlng(h3_index)
+        try:
+            boundary = h3.cell_to_boundary(h3_index)
+            polygon = Polygon([(lon, lat) for lat, lon in boundary])
+            if polygon.is_empty:
+                fallback = (float(lat_c), float(lon_c), float(self.get_elevation(lat_c, lon_c)))
+                self._cell_anchor_cache[key] = fallback
+                return fallback
+
+            candidates: list[Polygon] = []
+            shrunk = self._shrink_polygon_m(polygon, float(margin_m))
+            if shrunk is not None and not shrunk.is_empty:
+                candidates.append(shrunk)
+            candidates.append(polygon)
+
+            for poly in candidates:
+                anchor = self._max_pixel_in_polygon(poly)
+                if anchor is not None:
+                    self._cell_anchor_cache[key] = anchor
+                    return anchor
+        except Exception as e:
+            logger.warning("Failed to resolve H3 anchor point", h3_index=h3_index, error=str(e))
+
+        fallback = (float(lat_c), float(lon_c), float(self.get_elevation(lat_c, lon_c)))
+        self._cell_anchor_cache[key] = fallback
+        return fallback
+
     def get_line_peak_elevation(
         self,
         src_lat: float,
@@ -367,6 +528,7 @@ class ElevationProvider:
         return {
             'cache_size': len(self._cache),
             'cell_max_cache_size': len(self._cell_max_cache),
+            'cell_anchor_cache_size': len(self._cell_anchor_cache),
             'line_peak_cache_size': len(self._line_peak_cache),
             'cache_memory_mb': len(self._cache) * 24 / (1024 * 1024),  # Approx
         }
@@ -375,6 +537,7 @@ class ElevationProvider:
         """Clear the elevation cache."""
         self._cache.clear()
         self._cell_max_cache.clear()
+        self._cell_anchor_cache.clear()
         self._line_peak_cache.clear()
 
     def close(self):

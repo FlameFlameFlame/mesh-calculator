@@ -6,7 +6,7 @@ import h3
 
 import structlog
 
-from ..core.grid import H3Cell
+from ..core.grid import H3Cell, resolve_cell_profile
 from ..core.config import MeshConfig
 from ..data.cache import LOSCache
 from ..physics.los import has_los, compute_los
@@ -25,6 +25,23 @@ def _cell_elevation(elevation_provider, h3_idx: str, lat: float, lon: float) -> 
         except Exception:
             pass
     return float(elevation_provider.get_elevation(lat, lon))
+
+
+def _cell_profile(
+    config: MeshConfig,
+    elevation_provider,
+    h3_idx: str,
+    lat: float,
+    lon: float,
+) -> tuple[float, float, float]:
+    """Resolve (elevation, los_lat, los_lon) for dynamically-added cells."""
+    return resolve_cell_profile(
+        elevation_provider,
+        h3_idx,
+        lat,
+        lon,
+        anchor_margin_m=config.cell_anchor_margin_m,
+    )
 
 
 def _effective_initial_search_radius_m(config: MeshConfig) -> float:
@@ -314,7 +331,7 @@ def _expand_segment_buffer(
                 elev = cells[nb].elevation
             elif elevation_provider is not None:
                 lat, lon = h3.cell_to_latlng(nb)
-                elev = _cell_elevation(elevation_provider, nb, lat, lon)
+                elev, _, _ = _cell_profile(surface.config, elevation_provider, nb, lat, lon)
             else:
                 continue
             closest = min(
@@ -331,10 +348,14 @@ def _expand_segment_buffer(
         if nb not in cells and elevation_provider is not None:
             lat, lon = h3.cell_to_latlng(nb)
             from ..core.grid import H3Cell
+            elev2, los_lat, los_lon = _cell_profile(
+                surface.config, elevation_provider, nb, lat, lon
+            )
             cells[nb] = H3Cell(
                 h3_index=nb, lat=lat, lon=lon,
-                elevation=elev,
+                elevation=elev2,
                 has_road=False, is_in_boundary=False,
+                los_lat=los_lat, los_lon=los_lon,
             )
         try:
             pos = segment.index(road_h3)
@@ -625,9 +646,19 @@ def _greedy_place_towers(
         if elevation_provider is None:
             return None
         lat, lon = h3.cell_to_latlng(h3_idx)
-        elev = _cell_elevation(elevation_provider, h3_idx, lat, lon)
-        cell = H3Cell(h3_index=h3_idx, lat=lat, lon=lon, elevation=elev,
-                      has_road=False, is_in_boundary=False)
+        elev, los_lat, los_lon = _cell_profile(
+            config, elevation_provider, h3_idx, lat, lon
+        )
+        cell = H3Cell(
+            h3_index=h3_idx,
+            lat=lat,
+            lon=lon,
+            elevation=elev,
+            has_road=False,
+            is_in_boundary=False,
+            los_lat=los_lat,
+            los_lon=los_lon,
+        )
         cells[h3_idx] = cell
         return cell
 

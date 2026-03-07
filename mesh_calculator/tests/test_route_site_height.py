@@ -10,21 +10,53 @@ from ..optimization import route_pipeline as rp
 
 
 class _FakeElevationProvider:
-    def __init__(self, _path: str):
-        pass
-
     def get_elevation(self, _lat: float, _lon: float) -> float:
         return 100.0
 
     def cache_stats(self) -> dict:
         return {}
 
+    def resolve_effective_resolution(self, _routes, base_resolution: int, _config):
+        return base_resolution, False, None, None
+
+    def get_or_create_cell(
+        self,
+        h3_index: str,
+        _config,
+        *,
+        has_road: bool = False,
+        is_in_boundary: bool = True,
+    ):
+        from ..core.grid import H3Cell
+        lat, lon = h3.cell_to_latlng(h3_index)
+        return H3Cell(
+            h3_index=h3_index,
+            lat=lat,
+            lon=lon,
+            elevation=100.0,
+            has_road=has_road,
+            is_in_boundary=is_in_boundary,
+        )
+
+    def radius_m_to_ring(self, _radius_m: float, _resolution: int, minimum_one: bool = False) -> int:
+        return 1 if minimum_one else 0
+
+    def expand_disk(self, h3_index: str, rings: int) -> set[str]:
+        return set(h3.grid_disk(h3_index, rings))
+
+    def corridor_from_features(self, _features, resolution: int, site1=None, site2=None):
+        if not site1 or not site2:
+            return []
+        return [
+            h3.latlng_to_cell(site1["lat"], site1["lon"], resolution),
+            h3.latlng_to_cell(site2["lat"], site2["lon"], resolution),
+        ]
+
     def close(self) -> None:
         return None
 
 
 def _prepare_pipeline_monkeypatch(monkeypatch, captured: dict) -> None:
-    monkeypatch.setattr(rp, "ElevationProvider", _FakeElevationProvider)
     monkeypatch.setattr(rp, "_expand_cells_with_buffer", lambda *_a, **_k: {})
     monkeypatch.setattr(rp, "place_nodes_along_corridor", lambda *_a, **_k: [])
     monkeypatch.setattr(rp, "install_nodes", lambda *_a, **_k: None)
@@ -53,13 +85,7 @@ def test_non_city_anchor_site_height_offset_uses_max_on_reuse(monkeypatch, tmp_p
     site_b = {"name": "B", "lat": 40.2200, "lon": 44.5200}
     site_c = {"name": "C", "lat": 40.2400, "lon": 44.5400}
 
-    def _corridor(_features, resolution, site1, site2):
-        return [
-            h3.latlng_to_cell(site1["lat"], site1["lon"], resolution),
-            h3.latlng_to_cell(site2["lat"], site2["lon"], resolution),
-        ]
-
-    monkeypatch.setattr(rp, "road_geojson_to_h3_corridor", _corridor)
+    provider = _FakeElevationProvider()
 
     routes = [
         RouteSpec(
@@ -81,7 +107,7 @@ def test_non_city_anchor_site_height_offset_uses_max_on_reuse(monkeypatch, tmp_p
     rp.run_route_pipeline(
         routes=routes,
         mesh_config=cfg,
-        elevation_path=str(tmp_path / "fake.tif"),
+        grid_provider=provider,
         city_boundaries_geojson=None,
         output_dir=str(tmp_path),
     )
@@ -103,7 +129,12 @@ def test_city_anchor_site_height_applied_to_entry_cell(monkeypatch, tmp_path):
     entry_h3 = h3.latlng_to_cell(40.1100, 44.1100, cfg.h3_resolution)
     end_h3 = h3.latlng_to_cell(remote_site["lat"], remote_site["lon"], cfg.h3_resolution)
 
-    monkeypatch.setattr(rp, "road_geojson_to_h3_corridor", lambda *_a, **_k: [entry_h3, end_h3])
+    provider = _FakeElevationProvider()
+    monkeypatch.setattr(
+        provider,
+        "corridor_from_features",
+        lambda *_a, **_k: [entry_h3, end_h3],
+    )
     monkeypatch.setattr(rp, "_trim_unfit_ends", lambda corridor, _cells: (corridor, entry_h3, end_h3))
 
     city_poly = {
@@ -137,7 +168,7 @@ def test_city_anchor_site_height_applied_to_entry_cell(monkeypatch, tmp_path):
     rp.run_route_pipeline(
         routes=routes,
         mesh_config=cfg,
-        elevation_path=str(tmp_path / "fake.tif"),
+        grid_provider=provider,
         city_boundaries_geojson=city_poly,
         output_dir=str(tmp_path),
     )

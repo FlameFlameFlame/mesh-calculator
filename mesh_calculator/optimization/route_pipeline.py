@@ -11,14 +11,10 @@ import os
 from typing import Callable, List, Optional
 
 import h3
-import numpy as np
-from shapely.geometry import shape as shapely_shape
 
 from ..core.config import MeshConfig, RouteSpec
-from ..core.elevation import ElevationProvider
-from ..core.geometry import great_circle_distance, h3_to_lat_lon
-from ..core.grid import H3Cell, generate_full_grid
-from ..core.road_corridor import road_geojson_to_h3_corridor
+from ..core.grid import H3Cell, resolve_cell_profile
+from ..core.grid_provider import GridProvider
 from ..data.cache import LOSCache
 from ..data.exporters import (
     export_coverage_geojson,
@@ -39,24 +35,27 @@ from ..optimization.corridor import (
 logger = logging.getLogger(__name__)
 
 
-def _cell_elevation(
-    elevation_provider: ElevationProvider,
+def _cell_profile(
+    mesh_config: MeshConfig,
+    grid_provider: GridProvider,
     h3_idx: str,
     lat: float,
     lon: float,
-) -> float:
-    """Get H3 cell elevation with provider capability fallback."""
-    if callable(getattr(type(elevation_provider), "get_h3_cell_max_elevation", None)):
-        try:
-            return elevation_provider.get_h3_cell_max_elevation(h3_idx)
-        except Exception:
-            pass
-    return elevation_provider.get_elevation(lat, lon)
+) -> tuple[float, float, float]:
+    """Resolve (elevation, los_lat, los_lon) for a cell."""
+    return resolve_cell_profile(
+        grid_provider,
+        h3_idx,
+        lat,
+        lon,
+        anchor_margin_m=mesh_config.cell_anchor_margin_m,
+    )
 
 
 def _build_corridor_cells(
     corridor: List[str],
-    elevation_provider: ElevationProvider,
+    mesh_config: MeshConfig,
+    grid_provider: GridProvider,
     existing_cells: dict,
 ) -> dict:
     """
@@ -64,7 +63,7 @@ def _build_corridor_cells(
 
     Args:
         corridor: Ordered list of H3 indices.
-        elevation_provider: For terrain elevation lookups.
+        grid_provider: For terrain elevation and cached cell profile lookups.
         existing_cells: Already-created cells (skipped to avoid overwriting).
 
     Returns:
@@ -74,23 +73,20 @@ def _build_corridor_cells(
     for h3_idx in corridor:
         if h3_idx in existing_cells or h3_idx in new_cells:
             continue
-        lat, lon = h3.cell_to_latlng(h3_idx)
-        elevation = _cell_elevation(elevation_provider, h3_idx, lat, lon)
-        new_cells[h3_idx] = H3Cell(
-            h3_index=h3_idx,
-            lat=lat,
-            lon=lon,
-            elevation=elevation,
+        cell = grid_provider.get_or_create_cell(
+            h3_idx,
+            mesh_config,
             has_road=True,
             is_in_boundary=True,
         )
+        new_cells[h3_idx] = cell
     return new_cells
 
 
 def _expand_cells_with_buffer(
     road_cells: List[str],
     mesh_config: MeshConfig,
-    elevation_provider: ElevationProvider,
+    grid_provider: GridProvider,
     existing_cells: dict,
 ) -> dict:
     """
@@ -106,12 +102,16 @@ def _expand_cells_with_buffer(
         return {}
 
     edge_m = h3.average_hexagon_edge_length(mesh_config.h3_resolution, unit='m')
-    buffer_rings = max(1, round(mesh_config.road_buffer_m / edge_m))
+    buffer_rings = grid_provider.radius_m_to_ring(
+        mesh_config.road_buffer_m,
+        mesh_config.h3_resolution,
+        minimum_one=True,
+    )
 
     road_cell_set = set(road_cells)
     new_main_cells: set = set()
     for road_cell in road_cells:
-        for neighbor in h3.grid_disk(road_cell, buffer_rings):
+        for neighbor in grid_provider.expand_disk(road_cell, buffer_rings):
             if neighbor not in road_cell_set and neighbor not in existing_cells:
                 new_main_cells.add(neighbor)
 
@@ -119,16 +119,13 @@ def _expand_cells_with_buffer(
     for h3_idx in new_main_cells:
         if h3_idx in existing_cells:
             continue
-        lat, lon = h3_to_lat_lon(h3_idx)
-        elevation = _cell_elevation(elevation_provider, h3_idx, lat, lon)
-        new_cells[h3_idx] = H3Cell(
-            h3_index=h3_idx,
-            lat=lat,
-            lon=lon,
-            elevation=elevation,
+        cell = grid_provider.get_or_create_cell(
+            h3_idx,
+            mesh_config,
             has_road=False,
             is_in_boundary=True,
         )
+        new_cells[h3_idx] = cell
 
     logger.info(
         "Buffer expansion: added %d new cells (buffer_m=%.0f, rings=%d, edge_m=%.0f)",
@@ -204,66 +201,10 @@ def _mark_city_cells(
         )
 
 
-def _boundary_polygon_from_geojson(boundary_geojson: Optional[dict]):
-    """Extract a polygon geometry from boundary GeoJSON payload."""
-    if not boundary_geojson:
-        return None
-    try:
-        if boundary_geojson.get('type') == 'FeatureCollection':
-            features = boundary_geojson.get('features', [])
-            if not features:
-                return None
-            geoms = [shapely_shape(f['geometry']) for f in features if f.get('geometry')]
-            if not geoms:
-                return None
-            poly = geoms[0]
-            for g in geoms[1:]:
-                poly = poly.union(g)
-            return poly
-        if boundary_geojson.get('type') == 'Feature':
-            geom = boundary_geojson.get('geometry')
-            if not geom:
-                return None
-            return shapely_shape(geom)
-        if boundary_geojson.get('type'):
-            return shapely_shape(boundary_geojson)
-    except Exception:
-        logger.exception("Failed to parse boundary_geojson")
-    return None
-
-
-def _collect_route_gradient_samples(
-    routes: List[RouteSpec],
-    resolution: int,
-    elevation_provider: ElevationProvider,
-) -> list[float]:
-    """Collect per-hop terrain gradient samples (m/km) over all routes."""
-    slopes: list[float] = []
-    for route in routes:
-        corridor = road_geojson_to_h3_corridor(
-            route.features,
-            resolution,
-            site1=route.site1,
-            site2=route.site2,
-        )
-        if len(corridor) < 2:
-            continue
-        for h3_a, h3_b in zip(corridor, corridor[1:]):
-            lat_a, lon_a = h3.cell_to_latlng(h3_a)
-            lat_b, lon_b = h3.cell_to_latlng(h3_b)
-            dist_m = great_circle_distance(lat_a, lon_a, lat_b, lon_b)
-            if dist_m <= 1.0:
-                continue
-            elev_a = _cell_elevation(elevation_provider, h3_a, lat_a, lon_a)
-            elev_b = _cell_elevation(elevation_provider, h3_b, lat_b, lon_b)
-            slopes.append(abs(elev_b - elev_a) / (dist_m / 1000.0))
-    return slopes
-
-
 def run_route_pipeline(
     routes: List[RouteSpec],
     mesh_config: MeshConfig,
-    elevation_path: str,
+    grid_provider: GridProvider,
     city_boundaries_geojson: Optional[dict] = None,
     boundary_geojson: Optional[dict] = None,
     output_dir: str = "output",
@@ -287,7 +228,7 @@ def run_route_pipeline(
         routes: List of RouteSpec objects to process in order.
         mesh_config: Physics and grid configuration. max_towers_per_route is
                      overridden per-route by RouteSpec.max_towers_per_route.
-        elevation_path: Path to GeoTIFF elevation file.
+        grid_provider: Ready grid provider with elevation + multi-resolution grid access.
         city_boundaries_geojson: Optional GeoJSON FeatureCollection with city
                                  boundary polygons for city link tagging.
         boundary_geojson: Optional boundary geometry used for full-grid export.
@@ -347,55 +288,41 @@ def run_route_pipeline(
     )
     _emit_progress('route', 'Starting route pipeline', 0.0)
 
-    elevation_provider = ElevationProvider(elevation_path)
+    if grid_provider is None:
+        raise ValueError("run_route_pipeline requires grid_provider")
 
     base_h3_resolution = mesh_config.h3_resolution
     effective_h3_resolution = base_h3_resolution
     h3_auto_refined = False
     h3_auto_refine_reason = None
-    if (
-        mesh_config.auto_refine_h3_on_gradient
-        and mesh_config.h3_resolution < mesh_config.auto_refine_h3_max_resolution
-    ):
-        gradients = _collect_route_gradient_samples(
-            routes, mesh_config.h3_resolution, elevation_provider
+    if mesh_config.auto_refine_h3_on_gradient:
+        resolved_res, refined, reason, pctl = grid_provider.resolve_effective_resolution(
+            routes, mesh_config.h3_resolution, mesh_config
         )
-        if gradients:
-            pctl = float(np.percentile(
-                np.asarray(gradients, dtype=np.float64),
-                mesh_config.gradient_refine_percentile,
-            ))
-            threshold = float(mesh_config.gradient_refine_threshold_m_per_km)
-            if pctl >= threshold:
-                effective_h3_resolution = min(
-                    mesh_config.h3_resolution + 1,
-                    mesh_config.auto_refine_h3_max_resolution,
-                )
-                if effective_h3_resolution > mesh_config.h3_resolution:
-                    h3_auto_refined = True
-                    h3_auto_refine_reason = (
-                        f"terrain_gradient_p{mesh_config.gradient_refine_percentile:.0f}"
-                        f"={pctl:.1f}m_per_km>=threshold_{threshold:.1f}"
-                    )
-                    mesh_config.h3_resolution = effective_h3_resolution
-                    logger.info(
-                        "Auto-refined H3 resolution %d -> %d due to terrain gradient "
-                        "(p%.0f=%.1f m/km, threshold=%.1f)",
-                        base_h3_resolution,
-                        effective_h3_resolution,
-                        mesh_config.gradient_refine_percentile,
-                        pctl,
-                        threshold,
-                    )
-            else:
+        effective_h3_resolution = resolved_res
+        h3_auto_refined = refined
+        h3_auto_refine_reason = reason
+        mesh_config.h3_resolution = effective_h3_resolution
+        if pctl is not None:
+            if refined:
                 logger.info(
-                    "H3 auto-refine not triggered (p%.0f=%.1f m/km, threshold=%.1f)",
+                    "Auto-refined H3 resolution %d -> %d via provider ladder "
+                    "(p%.0f=%.1f m/km)",
+                    base_h3_resolution,
+                    effective_h3_resolution,
                     mesh_config.gradient_refine_percentile,
                     pctl,
-                    threshold,
+                )
+            else:
+                logger.info(
+                    "H3 auto-refine not triggered by provider ladder "
+                    "(p%.0f=%.1f m/km, base_res=%d)",
+                    mesh_config.gradient_refine_percentile,
+                    pctl,
+                    base_h3_resolution,
                 )
 
-    surface = MeshSurface({}, mesh_config, elevation_provider)
+    surface = MeshSurface({}, mesh_config, grid_provider)
     los_cache = LOSCache()
 
     route_summaries = []
@@ -418,7 +345,7 @@ def run_route_pipeline(
         )
 
         # Convert GeoJSON features to ordered H3 corridor (site1→site2)
-        corridor = road_geojson_to_h3_corridor(
+        corridor = grid_provider.corridor_from_features(
             route.features,
             mesh_config.h3_resolution,
             site1=route.site1,
@@ -470,12 +397,14 @@ def run_route_pipeline(
             # that creates off-road straight-line paths through cities.
 
         # Build cells for this corridor and add to shared surface
-        new_cells = _build_corridor_cells(corridor, elevation_provider, surface.cells)
+        new_cells = _build_corridor_cells(
+            corridor, mesh_config, grid_provider, surface.cells
+        )
         surface.cells.update(new_cells)
 
         # Expand with road buffer: add nearby off-road cells for elevated terrain
         buffer_cells = _expand_cells_with_buffer(
-            corridor, mesh_config, elevation_provider, surface.cells
+            corridor, mesh_config, grid_provider, surface.cells
         )
         surface.cells.update(buffer_cells)
         _emit_progress(
@@ -621,10 +550,17 @@ def run_route_pipeline(
                     continue
                 if site_h3 not in surface.cells:
                     lat, lon = h3.cell_to_latlng(site_h3)
-                    elev = _cell_elevation(elevation_provider, site_h3, lat, lon)
+                    elev, los_lat, los_lon = _cell_profile(
+                        mesh_config,
+                        grid_provider,
+                        site_h3,
+                        lat,
+                        lon,
+                    )
                     surface.cells[site_h3] = H3Cell(
                         h3_index=site_h3, lat=lat, lon=lon,
                         elevation=elev, has_road=False, is_in_boundary=False,
+                        los_lat=los_lat, los_lon=los_lon,
                     )
                 _apply_site_offset(
                     site_h3,
@@ -727,23 +663,22 @@ def run_route_pipeline(
         effective_h3_resolution=effective_h3_resolution,
     )
     if mesh_config.export_full_grid_cells and boundary_geojson:
-        boundary_poly = _boundary_polygon_from_geojson(boundary_geojson)
-        if boundary_poly is not None:
-            full_grid_cells = generate_full_grid(boundary_poly, elevation_provider, mesh_config)
+        try:
+            full_grid_cells = grid_provider.build_full_boundary_grid(mesh_config)
             export_grid_cells_geojson(
                 full_grid_cells,
                 grid_cells_full_path,
                 effective_h3_resolution=effective_h3_resolution,
             )
-        else:
-            logger.warning("Skipping full-grid export: boundary polygon not available")
+        except Exception:
+            logger.warning("Skipping full-grid export: provider full-grid build failed", exc_info=True)
     if surface.gap_repair_debug:
         export_gap_repair_hexes_geojson(surface.gap_repair_debug, gap_repair_hexes_path)
     generate_report(surface, report_path)
     _emit_progress('export', 'Outputs exported', 100.0)
 
     cache_stats = los_cache.stats()
-    elev_stats = elevation_provider.cache_stats()
+    elev_stats = grid_provider.cache_stats()
 
     summary = {
         'routes_processed': len(routes),

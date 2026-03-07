@@ -12,6 +12,7 @@ from ..core.config import MeshConfig
 from ..data.exporters import (
     export_gap_repair_hexes_geojson,
     export_grid_cells_geojson,
+    export_towers_geojson,
     export_visibility_edges_geojson,
 )
 
@@ -204,6 +205,71 @@ class TestExportVisibilityEdges(unittest.TestCase):
             with open(path) as f:
                 data = json.load(f)
             self.assertEqual(len(data["features"]), 0)
+        finally:
+            os.unlink(path)
+
+    def test_visibility_export_includes_anchor_and_centroid_coordinates(self):
+        config = MeshConfig()
+        cells = {
+            "a": H3Cell("a", 40.0, 44.0, 500.0, has_road=True, los_lat=40.0005, los_lon=44.0005),
+            "b": H3Cell("b", 40.1, 44.1, 510.0, has_road=True, los_lat=40.1005, los_lon=44.1005),
+        }
+        surface = MeshSurface(cells, config)
+        t1 = surface.place_tower("a", source="site")
+        t2 = surface.place_tower("b", source="route_0")
+        surface.visibility_graph.add_visibility_edge(
+            t1.tower_id, t2.tower_id,
+            distance_m=1000.0,
+            clearance_m=5.0,
+            path_loss_db=100.0,
+        )
+        with tempfile.NamedTemporaryFile(suffix=".geojson", delete=False) as f:
+            path = f.name
+        try:
+            export_visibility_edges_geojson(surface, path)
+            with open(path) as f:
+                data = json.load(f)
+            props = data["features"][0]["properties"]
+            self.assertAlmostEqual(props["source_lat"], 40.0005, places=6)
+            self.assertAlmostEqual(props["source_lon"], 44.0005, places=6)
+            self.assertAlmostEqual(props["source_centroid_lat"], 40.0, places=6)
+            self.assertAlmostEqual(props["source_centroid_lon"], 44.0, places=6)
+            self.assertAlmostEqual(props["target_lat"], 40.1005, places=6)
+            self.assertAlmostEqual(props["target_lon"], 44.1005, places=6)
+            self.assertAlmostEqual(props["target_centroid_lat"], 40.1, places=6)
+            self.assertAlmostEqual(props["target_centroid_lon"], 44.1, places=6)
+        finally:
+            os.unlink(path)
+
+
+class TestExportTowers(unittest.TestCase):
+    def test_tower_coordinates_use_anchor_with_centroid_debug_fields(self):
+        config = MeshConfig()
+        cells = {
+            "a": H3Cell(
+                "a", 40.0, 44.0, 500.0,
+                has_road=True,
+                los_lat=40.0005,
+                los_lon=44.0005,
+            ),
+        }
+        surface = MeshSurface(cells, config)
+        surface.place_tower("a", source="site")
+        with tempfile.NamedTemporaryFile(suffix=".geojson", delete=False) as f:
+            path = f.name
+        try:
+            export_towers_geojson(surface, path)
+            with open(path) as f:
+                data = json.load(f)
+            feat = data["features"][0]
+            props = feat["properties"]
+            coords = feat["geometry"]["coordinates"]
+            self.assertAlmostEqual(coords[0], 44.0005, places=6)
+            self.assertAlmostEqual(coords[1], 40.0005, places=6)
+            self.assertAlmostEqual(props["lat"], 40.0005, places=6)
+            self.assertAlmostEqual(props["lon"], 44.0005, places=6)
+            self.assertAlmostEqual(props["centroid_lat"], 40.0, places=6)
+            self.assertAlmostEqual(props["centroid_lon"], 44.0, places=6)
         finally:
             os.unlink(path)
 

@@ -6,9 +6,14 @@ import math
 from unittest.mock import patch
 from ..physics.path_loss import compute_path_loss, fspl_only
 from ..physics.los import compute_los
-from ..physics.fresnel import FresnelProfileSummary
+from ..physics.fresnel import (
+    FresnelProfileSummary,
+    compute_fresnel_profile_summary,
+    compute_fresnel_profile_summary_dense,
+)
 from ..core.config import MeshConfig
 from ..core.grid import H3Cell
+from ..core.geometry import great_circle_distance
 
 
 class TestPathLoss(unittest.TestCase):
@@ -273,6 +278,34 @@ class TestLOSVisibilityRule(unittest.TestCase):
 
         self.assertTrue(result.is_visible)
         self.assertAlmostEqual(result.fresnel_obstruction_ratio, 0.4)
+
+    def test_fresnel_profiles_use_anchor_coordinates_for_distance(self):
+        config = MeshConfig(mast_height_m=5.0)
+        cells = {
+            "a": H3Cell("a", 40.0, 44.0, 100.0, has_road=True, los_lat=40.0, los_lon=44.0),
+            "b": H3Cell("b", 40.0, 44.1, 100.0, has_road=True, los_lat=40.0, los_lon=44.0005),
+        }
+        expected_m = great_circle_distance(40.0, 44.0, 40.0, 44.0005)
+
+        coarse = compute_fresnel_profile_summary("a", "b", cells, config)
+        dense = compute_fresnel_profile_summary_dense(
+            "a", "b", cells, config, elevation_provider=object()
+        )
+
+        self.assertAlmostEqual(coarse.distance_m, expected_m, delta=2.0)
+        self.assertAlmostEqual(dense.distance_m, expected_m, delta=2.0)
+
+    def test_compute_los_uses_anchor_coordinates_for_distance_gate(self):
+        config = MeshConfig(mast_height_m=10.0)
+        cells = {
+            "a": H3Cell("a", 40.0, 44.0, 0.0, has_road=True, los_lat=40.0, los_lon=44.0),
+            "b": H3Cell("b", 41.0, 44.0, 0.0, has_road=True, los_lat=40.0, los_lon=44.0005),
+        }
+
+        result = compute_los("a", "b", cells, config)
+
+        self.assertTrue(result.is_visible)
+        self.assertLess(result.distance_m, 100.0)
 
 
 if __name__ == '__main__':
