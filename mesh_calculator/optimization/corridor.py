@@ -10,7 +10,7 @@ from ..core.grid import H3Cell, resolve_cell_profile
 from ..core.config import MeshConfig
 from ..data.cache import LOSCache
 from ..physics.los import has_los, compute_los
-from ..parallel.los_compute import compute_los_batch
+from ..parallel.los_compute import compute_los_batch, compute_los_batch_progress
 from ..network.graph import MeshSurface, _los_decision_debug
 
 logger = structlog.get_logger(__name__)
@@ -138,6 +138,7 @@ def _dp_place_towers_with_meta(
     cache: LOSCache,
     k: int,
     los_max_workers: Optional[int] = None,
+    los_progress_callback=None,
 ) -> Optional[tuple]:
     """
     Optimal tower placement using MaxMin Bottleneck Path DP.
@@ -206,16 +207,29 @@ def _dp_place_towers_with_meta(
             continue
 
         los_diag: dict = {}
-        los_results = compute_los_batch(
-            pair_sequence,
-            cells,
-            config,
-            cache=cache,
-            max_workers=los_max_workers,
-            elevation_provider=elevation_provider,
-            compute_fn=compute_los,
-            diagnostics=los_diag,
-        )
+        if los_progress_callback is None:
+            los_results = compute_los_batch(
+                pair_sequence,
+                cells,
+                config,
+                cache=cache,
+                max_workers=los_max_workers,
+                elevation_provider=elevation_provider,
+                compute_fn=compute_los,
+                diagnostics=los_diag,
+            )
+        else:
+            los_results = compute_los_batch_progress(
+                pair_sequence,
+                cells,
+                config,
+                cache=cache,
+                max_workers=los_max_workers,
+                elevation_provider=elevation_provider,
+                compute_fn=compute_los,
+                progress_callback=los_progress_callback,
+                diagnostics=los_diag,
+            )
         _record_los_diag(surface, los_diag)
         # Preserve deterministic DP tie behavior by applying transitions in the
         # exact same order as the original nested i/j loops.
@@ -503,6 +517,7 @@ def _find_broken_gaps(
     surface: MeshSurface,
     cache: LOSCache,
     los_max_workers: Optional[int] = None,
+    los_progress_callback=None,
 ) -> List[int]:
     """
     Return list of chain indices i where chain[i]↔chain[i+1] has no LOS.
@@ -520,16 +535,29 @@ def _find_broken_gaps(
         return broken
     pairs = [(chain[i], chain[i + 1]) for i in range(len(chain) - 1)]
     los_diag: dict = {}
-    los_results = compute_los_batch(
-        pairs,
-        surface.cells,
-        surface.config,
-        cache=cache,
-        max_workers=los_max_workers,
-        elevation_provider=surface.elevation_provider,
-        compute_fn=compute_los,
-        diagnostics=los_diag,
-    )
+    if los_progress_callback is None:
+        los_results = compute_los_batch(
+            pairs,
+            surface.cells,
+            surface.config,
+            cache=cache,
+            max_workers=los_max_workers,
+            elevation_provider=surface.elevation_provider,
+            compute_fn=compute_los,
+            diagnostics=los_diag,
+        )
+    else:
+        los_results = compute_los_batch_progress(
+            pairs,
+            surface.cells,
+            surface.config,
+            cache=cache,
+            max_workers=los_max_workers,
+            elevation_provider=surface.elevation_provider,
+            compute_fn=compute_los,
+            progress_callback=los_progress_callback,
+            diagnostics=los_diag,
+        )
     _record_los_diag(surface, los_diag)
     for i, pair in enumerate(pairs):
         los = los_results.get(pair)
@@ -699,6 +727,7 @@ def place_nodes_along_corridor(
     cache: LOSCache = None,
     out_meta: Optional[Dict[str, dict]] = None,
     los_max_workers: Optional[int] = None,
+    progress_callback=None,
 ) -> List[str]:
     """
     Place nodes along a corridor ensuring LOS connectivity.
@@ -737,6 +766,34 @@ def place_nodes_along_corridor(
         if los_max_workers is None
         else los_max_workers
     )
+    placement_progress = 0.0
+
+    def _emit_progress(step: str) -> None:
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(max(0.0, min(1.0, placement_progress)), step)
+        except Exception:
+            logger.debug("Placement progress callback failed", exc_info=True)
+
+    def _make_los_progress(step: str):
+        state = {'completed': 0}
+
+        def _callback(completed: int, total: int) -> None:
+            nonlocal placement_progress
+            total_safe = max(int(total), 1)
+            completed_i = max(0, min(int(completed), total_safe))
+            delta = max(0, completed_i - state['completed'])
+            state['completed'] = completed_i
+            if delta > 0:
+                # Allocate up to ~60% of placement progress to LOS batch advances.
+                placement_progress = min(
+                    0.98,
+                    placement_progress + 0.60 * (float(delta) / float(total_safe)),
+                )
+                _emit_progress(step)
+
+        return _callback
 
     def _normalize_radii(values: Optional[List[float]], default_value: float) -> List[float]:
         radii = []
@@ -895,6 +952,7 @@ def place_nodes_along_corridor(
                 cache,
                 seg_k,
                 los_max_workers=effective_los_workers,
+                los_progress_callback=_make_los_progress('Evaluating LOS chain candidates'),
             )
             seg_nodes = seg_result[0] if seg_result is not None else None
             seg_best_t = seg_result[1] if seg_result is not None else None
@@ -947,7 +1005,11 @@ def place_nodes_along_corridor(
             repair_base_radius = max(0.0, repair_base_radius)
             for repair_round in range(1, config.gap_repair_rounds + 1):
                 broken = _find_broken_gaps(
-                    all_nodes, surface, cache, los_max_workers=effective_los_workers
+                    all_nodes,
+                    surface,
+                    cache,
+                    los_max_workers=effective_los_workers,
+                    los_progress_callback=_make_los_progress('Checking/repairing broken LOS gaps'),
                 )
                 if not broken:
                     break
@@ -977,7 +1039,11 @@ def place_nodes_along_corridor(
 
         broken_after = len(
             _find_broken_gaps(
-                all_nodes, surface, cache, los_max_workers=effective_los_workers
+                all_nodes,
+                surface,
+                cache,
+                los_max_workers=effective_los_workers,
+                los_progress_callback=_make_los_progress('Final LOS connectivity check'),
             )
         )
         return all_nodes, node_meta, working_corridor, corridor_pos, broken_after, effective_budget
