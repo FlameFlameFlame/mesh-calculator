@@ -11,6 +11,7 @@ import os
 import hashlib
 import threading
 import math
+from functools import lru_cache
 from typing import Dict, Iterable, Optional
 
 import geopandas as gpd
@@ -38,6 +39,12 @@ _DEFAULT_BUNDLE_RESOLUTIONS = (8, 9)
 _GRID_BUNDLE_VERSION = 3
 _SUPPORTED_BUNDLE_VERSIONS = {3}
 _EARTH_R = 6_371_000.0
+
+
+@lru_cache(maxsize=32)
+def _cell_edge_length_m(resolution: int) -> float:
+    """Cached average H3 edge length for a resolution."""
+    return float(h3.average_hexagon_edge_length(int(resolution), unit="m"))
 
 
 def _boundary_polygon_from_geojson(boundary_geojson: Optional[dict]) -> Optional[Polygon]:
@@ -503,6 +510,7 @@ class GridProvider:
         cell_lats: list[float] = []
         cell_lons: list[float] = []
         cell_ids: list[str] = []
+        cell_radii: list[float] = []
 
         if not bool(getattr(config, "auto_refine_h3_on_gradient", False)):
             for h3_idx in base_full:
@@ -564,12 +572,17 @@ class GridProvider:
             cell_lats.append(lat)
             cell_lons.append(lon)
             cell_ids.append(h3_idx)
+            cell_radii.append(_cell_edge_length_m(res))
 
         kdtree = None
         xyz = None
+        cell_radii_arr = None
+        max_cell_radius_m = 0.0
         if cell_ids:
             xyz = _to_xyz(np.asarray(cell_lats), np.asarray(cell_lons))
             kdtree = cKDTree(xyz)
+            cell_radii_arr = np.asarray(cell_radii, dtype=float)
+            max_cell_radius_m = float(np.max(cell_radii_arr))
 
         counts: dict[int, int] = {}
         for h3_idx in full_cells_out:
@@ -589,6 +602,8 @@ class GridProvider:
             "cell_ids": cell_ids,
             "xyz": xyz,
             "kdtree": kdtree,
+            "cell_radii": cell_radii_arr,
+            "max_cell_radius_m": max_cell_radius_m,
         }
         self._adaptive_mesh_cache[key] = mesh
         return mesh
@@ -659,14 +674,30 @@ class GridProvider:
             return {center_h3}
         mesh = self._build_adaptive_mesh(base_resolution, config)
         lat, lon = h3.cell_to_latlng(center_h3)
+        center_radius = _cell_edge_length_m(h3.get_resolution(center_h3))
+        max_cell_radius_m = float(mesh.get("max_cell_radius_m", 0.0))
+        xyz = mesh.get("xyz")
+        cell_ids = mesh.get("cell_ids") or []
+        cell_radii = mesh.get("cell_radii")
 
         if candidate_cells is None:
             kdtree = mesh.get("kdtree")
             if kdtree is None:
                 return set()
             q = _to_xyz(np.asarray([lat]), np.asarray([lon]))[0]
-            idxs = kdtree.query_ball_point(q, r=float(radius_m))
-            return {mesh["cell_ids"][i] for i in idxs}
+            idxs = kdtree.query_ball_point(
+                q, r=float(radius_m + center_radius + max_cell_radius_m)
+            )
+            out: set[str] = set()
+            for i in idxs:
+                cand_r = (
+                    float(cell_radii[i])
+                    if cell_radii is not None
+                    else _cell_edge_length_m(h3.get_resolution(cell_ids[i]))
+                )
+                if float(np.linalg.norm(xyz[i] - q)) <= float(radius_m + center_radius + cand_r):
+                    out.add(cell_ids[i])
+            return out
 
         candidate_count = len(candidate_cells)
         full_count = len(mesh.get("full_cells", []))
@@ -677,17 +708,30 @@ class GridProvider:
             and candidate_count >= int(full_count * 0.5)
         ):
             q = _to_xyz(np.asarray([lat]), np.asarray([lon]))[0]
-            idxs = kdtree.query_ball_point(q, r=float(radius_m))
-            return {
-                mesh["cell_ids"][i]
-                for i in idxs
-                if mesh["cell_ids"][i] in candidate_cells
-            }
+            idxs = kdtree.query_ball_point(
+                q, r=float(radius_m + center_radius + max_cell_radius_m)
+            )
+            out: set[str] = set()
+            for i in idxs:
+                h3_idx = cell_ids[i]
+                if h3_idx not in candidate_cells:
+                    continue
+                cand_r = (
+                    float(cell_radii[i])
+                    if cell_radii is not None
+                    else _cell_edge_length_m(h3.get_resolution(h3_idx))
+                )
+                if float(np.linalg.norm(xyz[i] - q)) <= float(radius_m + center_radius + cand_r):
+                    out.add(h3_idx)
+            return out
 
         out: set[str] = set()
         for h3_idx in candidate_cells:
             lat_b, lon_b = h3.cell_to_latlng(h3_idx)
-            if great_circle_distance(lat, lon, lat_b, lon_b) <= float(radius_m):
+            cand_radius = _cell_edge_length_m(h3.get_resolution(h3_idx))
+            if great_circle_distance(lat, lon, lat_b, lon_b) <= float(
+                radius_m + center_radius + cand_radius
+            ):
                 out.add(h3_idx)
         return out
 
@@ -709,20 +753,35 @@ class GridProvider:
         mesh = self._build_adaptive_mesh(base_resolution, config)
         kdtree = mesh.get("kdtree")
         if kdtree is not None:
-            center_lats = []
-            center_lons = []
+            union_ids: set[str] = set()
+            xyz = mesh.get("xyz")
+            cell_ids = mesh.get("cell_ids") or []
+            cell_radii = mesh.get("cell_radii")
+            max_cell_radius_m = float(mesh.get("max_cell_radius_m", 0.0))
             for h3_idx in centers:
                 lat, lon = h3.cell_to_latlng(h3_idx)
-                center_lats.append(lat)
-                center_lons.append(lon)
-            queries = _to_xyz(np.asarray(center_lats), np.asarray(center_lons))
-            idxs = kdtree.query_ball_point(queries, r=float(radius_m))
-            union_ids: set[str] = set()
-            for group in idxs:
-                for i in group:
-                    h3_idx = mesh["cell_ids"][i]
-                    if candidate_cells is None or h3_idx in candidate_cells:
-                        union_ids.add(h3_idx)
+                q = _to_xyz(np.asarray([lat]), np.asarray([lon]))[0]
+                center_radius = _cell_edge_length_m(h3.get_resolution(h3_idx))
+                query_r = float(radius_m + center_radius + max_cell_radius_m)
+                idxs = kdtree.query_ball_point(q, r=query_r)
+                if not idxs:
+                    continue
+                for i in idxs:
+                    cid = cell_ids[i]
+                    if candidate_cells is not None and cid not in candidate_cells:
+                        continue
+                    cand_r = (
+                        float(cell_radii[i])
+                        if cell_radii is not None
+                        else _cell_edge_length_m(h3.get_resolution(cid))
+                    )
+                    if float(np.linalg.norm(xyz[i] - q)) <= float(radius_m + center_radius + cand_r):
+                        union_ids.add(cid)
+            # Ensure query centers are preserved when they are part of candidate domain.
+            if candidate_cells is None:
+                union_ids.update(centers)
+            else:
+                union_ids.update(c for c in centers if c in candidate_cells)
             return union_ids
 
         out: set[str] = set()

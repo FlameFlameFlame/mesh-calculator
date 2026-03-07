@@ -1,5 +1,7 @@
 # Change Summary
 
+- 2026-03-07: Fixed adaptive buffer under-expansion in `GridProvider` radius queries by switching from pure center-distance checks to cell-footprint-aware distance (`center_distance <= radius + center_cell_radius + candidate_cell_radius`), so small positive buffers (e.g. 100m) include adjacent/touching cells.
+- 2026-03-07: Added regression test `test_adaptive_small_buffer_includes_touching_neighbors` in `tests/test_grid_provider.py` and verified full suite (`162 passed`).
 - 2026-03-07: Restored and completed parallelization diagnostics hardening: `compute_los_batch(...)` / `compute_los_batch_progress(...)` now collect per-pair failures, support optional strict-failure mode, and emit deterministic diagnostics payloads (`pairs_failed`, `chunk_failures`, timing/chunk stats) for reproducibility debugging.
 - 2026-03-07: Added route-level debug observability for parallel investigations: `run_route_pipeline(...)` now supports `debug_snapshot_dir` per-route JSON snapshots and summary-level `los_batch` counters; added `mesh_calculator/utils/parallel_probe.py` to compare worker-count runs (`1,2,4,8`) with artifact/fingerprint diffs.
 - 2026-03-07: Standardized batch-parallel LOS execution in `parallel/los_compute.py` with config-aware worker selection (`MeshConfig.los_parallel_workers`), `min_pairs_for_parallel` serial fallback threshold, deterministic chunk merge order, and per-batch timing/progress logging.

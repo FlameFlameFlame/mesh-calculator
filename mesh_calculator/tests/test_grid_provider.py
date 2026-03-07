@@ -5,6 +5,7 @@ import json
 import tempfile
 from pathlib import Path
 
+import h3
 import numpy as np
 import rasterio
 from rasterio.transform import from_origin
@@ -149,5 +150,42 @@ def test_lazy_road_cells_lookup_for_unbundled_resolution():
             roads_at_10 = provider.get_road_cells(10)
             assert isinstance(roads_at_10, set)
             assert roads_at_10
+        finally:
+            provider.close()
+
+
+def test_adaptive_small_buffer_includes_touching_neighbors():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        tif = tmp / "elevation.tif"
+        _make_dem(tif, width=500, height=500, west=43.7, north=40.3, pixel_deg=0.001)
+
+        provider = GridProvider.from_inputs(
+            elevation_path=str(tif),
+            boundary_geojson=_boundary_geojson(),
+            roads_geojson=_roads_geojson(),
+            resolutions=(8, 9),
+        )
+        try:
+            cfg = MeshConfig(h3_resolution=8, auto_refine_h3_on_gradient=False)
+            full = provider.get_adaptive_full_cells(8, cfg)
+            center = None
+            for h3_idx in full:
+                ring1 = set(h3.grid_disk(h3_idx, 1))
+                if ring1.issubset(full):
+                    center = h3_idx
+                    break
+            assert center is not None
+
+            nearby = provider.adaptive_cells_within_radius(
+                center,
+                100.0,
+                8,
+                cfg,
+                candidate_cells=full,
+            )
+            ring1_in_full = set(h3.grid_disk(center, 1)) & full
+            assert center in nearby
+            assert len((ring1_in_full - {center}) & nearby) >= 1
         finally:
             provider.close()
