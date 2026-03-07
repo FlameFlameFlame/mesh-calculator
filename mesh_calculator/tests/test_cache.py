@@ -313,6 +313,81 @@ class TestLOSBatchExecution(unittest.TestCase):
         self.assertEqual(results[("a", "b")].distance_m, 1000.0)
         self.assertEqual(results[("b", "c")].distance_m, 2000.0)
 
+    @patch('mesh_calculator.parallel.los_compute.ThreadPoolExecutor')
+    @patch('mesh_calculator.parallel.los_compute.compute_los')
+    def test_batch_can_force_serial_mode_via_threshold(
+        self,
+        mock_compute_los,
+        mock_pool,
+    ):
+        mock_compute_los.return_value = LOSResult(
+            clearance_m=5.0,
+            path_loss_db=95.0,
+            distance_m=1000.0,
+            is_visible=True,
+        )
+        pairs = [("a", "b"), ("b", "a"), ("a", "b")]
+
+        results = compute_los_batch(
+            pairs,
+            self.cells,
+            self.config,
+            min_pairs_for_parallel=999,
+        )
+
+        self.assertEqual(set(results.keys()), set(pairs))
+        self.assertEqual(mock_compute_los.call_count, 1)
+        mock_pool.assert_not_called()
+
+    @patch('mesh_calculator.parallel.los_compute.compute_los')
+    def test_batch_parallel_matches_serial_exactly(self, mock_compute_los):
+        def _fake(src, dst, *_args, **_kwargs):
+            pair_key = ''.join(sorted([src, dst]))
+            distance = 1000.0 + (100.0 * len(pair_key))
+            return LOSResult(
+                clearance_m=1.0 + len(pair_key),
+                path_loss_db=80.0 + len(pair_key),
+                distance_m=distance,
+                is_visible=True,
+            )
+
+        mock_compute_los.side_effect = _fake
+        pairs = [("a", "b"), ("b", "c"), ("a", "c"), ("c", "b"), ("a", "b")]
+
+        serial_results = compute_los_batch(
+            pairs,
+            self.cells,
+            self.config,
+            max_workers=1,
+            min_pairs_for_parallel=1,
+        )
+        parallel_results = compute_los_batch(
+            pairs,
+            self.cells,
+            self.config,
+            max_workers=3,
+            min_pairs_for_parallel=1,
+        )
+
+        self.assertEqual(set(serial_results.keys()), set(parallel_results.keys()))
+        for key in serial_results:
+            self.assertEqual(
+                serial_results[key].clearance_m,
+                parallel_results[key].clearance_m,
+            )
+            self.assertEqual(
+                serial_results[key].path_loss_db,
+                parallel_results[key].path_loss_db,
+            )
+            self.assertEqual(
+                serial_results[key].distance_m,
+                parallel_results[key].distance_m,
+            )
+            self.assertEqual(
+                serial_results[key].is_visible,
+                parallel_results[key].is_visible,
+            )
+
 
 if __name__ == '__main__':
     unittest.main()

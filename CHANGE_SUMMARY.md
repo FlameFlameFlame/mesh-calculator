@@ -1,5 +1,9 @@
 # Change Summary
 
+- 2026-03-07: Standardized batch-parallel LOS execution in `parallel/los_compute.py` with config-aware worker selection (`MeshConfig.los_parallel_workers`), `min_pairs_for_parallel` serial fallback threshold, deterministic chunk merge order, and per-batch timing/progress logging.
+- 2026-03-07: Refactored corridor planner hot paths to batch LOS checks: DP transitions per layer, broken-gap scans, gap-repair furthest-reachable scans, and corridor edge wiring now route through `compute_los_batch(...)` while preserving deterministic DP transition order.
+- 2026-03-07: Added nested parallel protection by threading `los_max_workers` through corridor APIs and forcing `los_max_workers=1` inside hierarchical outer threadpool flows (`connect_sites_by_priority`, `connect_priority1_mesh`) to avoid oversubscription.
+- 2026-03-07: Added regression coverage for parallel/serial DP equivalence, corridor batch API adoption, hierarchical nested-worker behavior, batch serial-threshold behavior, and new config parsing; verified targeted and full suites are green (`157 passed`).
 - 2026-03-07: Removed greedy tower-placement strategy from corridor planning; corridor node placement and route pipeline are now DP-only, greedy-specific tests/scripts were removed, and DP search-debug/export metadata remains (`dp`, `dp_repair`, `endpoint_fallback`).
 - 2026-03-05: Added working-rule memory file under `.claude/agent-memory/git-commit-writer/MEMORY.md`.
 - 2026-03-05: Fixed LOS visibility rule in `mesh_calculator/physics/los.py` to use link-budget feasibility (`path_loss_db <= link_budget_db`) instead of strict `clearance > 0`.

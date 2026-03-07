@@ -45,6 +45,14 @@ class TestMeshConfigDefaults(unittest.TestCase):
         config = MeshConfig(min_fresnel_clearance_m=0.0)
         self.assertEqual(config.min_fresnel_clearance_m, 0.0)
 
+    def test_los_parallel_workers_default_is_none(self):
+        config = MeshConfig()
+        self.assertIsNone(config.los_parallel_workers)
+
+    def test_los_parallel_workers_can_be_set(self):
+        config = MeshConfig(los_parallel_workers=4)
+        self.assertEqual(config.los_parallel_workers, 4)
+
 
 class TestMeshCalculatorConfigFromDict(unittest.TestCase):
     """MeshCalculatorConfig.from_dict() correctly handles new params."""
@@ -103,6 +111,7 @@ class TestMeshCalculatorConfigFromDict(unittest.TestCase):
                 'min_fresnel_clearance_m': -1.5,
                 'mast_height_m': 35.0,
                 'routing_k_ring': 3,
+                'los_parallel_workers': 6,
             }
         }
         cfg = MeshCalculatorConfig.from_dict(d)
@@ -111,6 +120,7 @@ class TestMeshCalculatorConfigFromDict(unittest.TestCase):
         self.assertEqual(cfg.parameters.min_fresnel_clearance_m, -1.5)
         self.assertEqual(cfg.parameters.mast_height_m, 35.0)
         self.assertEqual(cfg.parameters.routing_k_ring, 3)
+        self.assertEqual(cfg.parameters.los_parallel_workers, 6)
 
     def test_legacy_output_tower_coverage_key_is_ignored(self):
         d = {

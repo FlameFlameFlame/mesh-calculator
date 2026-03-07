@@ -10,6 +10,7 @@ from ..core.grid import H3Cell, resolve_cell_profile
 from ..core.config import MeshConfig
 from ..data.cache import LOSCache
 from ..physics.los import has_los, compute_los
+from ..parallel.los_compute import compute_los_batch
 from ..network.graph import MeshSurface, _los_decision_debug
 
 logger = structlog.get_logger(__name__)
@@ -128,6 +129,7 @@ def _dp_place_towers_with_meta(
     surface: MeshSurface,
     cache: LOSCache,
     k: int,
+    los_max_workers: Optional[int] = None,
 ) -> Optional[tuple]:
     """
     Optimal tower placement using MaxMin Bottleneck Path DP.
@@ -171,6 +173,8 @@ def _dp_place_towers_with_meta(
     dp[1][0] = float('inf')
 
     for t in range(1, k):
+        transitions: list[tuple[int, int]] = []
+        pair_sequence: list[tuple[str, str]] = []
         for i in range(n - 1):
             if dp[t][i] == NEG_INF:
                 continue
@@ -187,17 +191,31 @@ def _dp_place_towers_with_meta(
                     cell_j = cells.get(corridor[j])
                     if cell_j and getattr(cell_j, 'is_in_unfit_area', False):
                         continue
+                transitions.append((i, j))
+                pair_sequence.append((corridor[i], corridor[j]))
 
-                los = compute_los(
-                    corridor[i], corridor[j],
-                    cells, config, cache,
-                    elevation_provider=elevation_provider,
-                )
-                if los.is_visible:
-                    link_quality = min(dp[t][i], los.clearance_m)
-                    if link_quality > dp[t + 1][j]:
-                        dp[t + 1][j] = link_quality
-                        parent[t + 1][j] = i
+        if not pair_sequence:
+            continue
+
+        los_results = compute_los_batch(
+            pair_sequence,
+            cells,
+            config,
+            cache=cache,
+            max_workers=los_max_workers,
+            elevation_provider=elevation_provider,
+            compute_fn=compute_los,
+        )
+        # Preserve deterministic DP tie behavior by applying transitions in the
+        # exact same order as the original nested i/j loops.
+        for (i, j), pair in zip(transitions, pair_sequence):
+            los = los_results.get(pair)
+            if los is None or not los.is_visible:
+                continue
+            link_quality = min(dp[t][i], los.clearance_m)
+            if link_quality > dp[t + 1][j]:
+                dp[t + 1][j] = link_quality
+                parent[t + 1][j] = i
 
     # Find the best feasible chain that reaches the last position.
     # Prefer fewer towers: pick the smallest t that reaches the endpoint
@@ -237,6 +255,7 @@ def _dp_place_towers(
     surface: MeshSurface,
     cache: LOSCache,
     k: int,
+    los_max_workers: Optional[int] = None,
 ) -> Optional[List[str]]:
     """
     Thin wrapper around _dp_place_towers_with_meta that discards best_t.
@@ -245,7 +264,13 @@ def _dp_place_towers(
         List of H3 indices (corridor order) forming the optimal chain, or
         None if no feasible connected chain exists within k towers.
     """
-    result = _dp_place_towers_with_meta(corridor, surface, cache, k)
+    result = _dp_place_towers_with_meta(
+        corridor,
+        surface,
+        cache,
+        k,
+        los_max_workers=los_max_workers,
+    )
     if result is None:
         return None
     return result[0]
@@ -466,6 +491,7 @@ def _find_broken_gaps(
     chain: List[str],
     surface: MeshSurface,
     cache: LOSCache,
+    los_max_workers: Optional[int] = None,
 ) -> List[int]:
     """
     Return list of chain indices i where chain[i]↔chain[i+1] has no LOS.
@@ -479,14 +505,21 @@ def _find_broken_gaps(
         List of indices i (into chain) where the pair (chain[i], chain[i+1]) is broken.
     """
     broken = []
-    for i in range(len(chain) - 1):
-        h3_a, h3_b = chain[i], chain[i + 1]
-        los = compute_los(
-            h3_a, h3_b,
-            surface.cells, surface.config, cache,
-            elevation_provider=surface.elevation_provider,
-        )
-        if not los.is_visible:
+    if len(chain) < 2:
+        return broken
+    pairs = [(chain[i], chain[i + 1]) for i in range(len(chain) - 1)]
+    los_results = compute_los_batch(
+        pairs,
+        surface.cells,
+        surface.config,
+        cache=cache,
+        max_workers=los_max_workers,
+        elevation_provider=surface.elevation_provider,
+        compute_fn=compute_los,
+    )
+    for i, pair in enumerate(pairs):
+        los = los_results.get(pair)
+        if los is None or not los.is_visible:
             broken.append(i)
     return broken
 
@@ -502,6 +535,7 @@ def _repair_broken_gaps(
     cache: LOSCache,
     user_budget: int,
     node_meta: Optional[Dict[str, dict]] = None,
+    los_max_workers: Optional[int] = None,
 ) -> List[str]:
     """
     For each broken gap in chain, expand the sub-corridor between the two
@@ -526,7 +560,9 @@ def _repair_broken_gaps(
     Returns:
         Updated chain (same list object).
     """
-    broken = _find_broken_gaps(chain, surface, cache)
+    broken = _find_broken_gaps(
+        chain, surface, cache, los_max_workers=los_max_workers
+    )
     if not broken:
         return chain
 
@@ -566,7 +602,13 @@ def _repair_broken_gaps(
         # chain includes both endpoints, so interior count = len(chain) - 2.
         already_interior = len(chain) - 2
         gap_k = max(2, user_budget - already_interior)
-        result = _dp_place_towers_with_meta(sub_corridor, surface, cache, gap_k)
+        result = _dp_place_towers_with_meta(
+            sub_corridor,
+            surface,
+            cache,
+            gap_k,
+            los_max_workers=los_max_workers,
+        )
         if result is None:
             logger.warning(
                 "Gap repair DP failed",
@@ -605,13 +647,23 @@ def _repair_broken_gaps(
         if new_anchor_b_idx + 2 <= len(chain) - 1:
             new_anchor_b = chain[new_anchor_b_idx]
             furthest_reachable = new_anchor_b_idx + 1  # default: no pruning
+            pairs = [
+                (new_anchor_b, chain[j])
+                for j in range(len(chain) - 1, new_anchor_b_idx + 1, -1)
+            ]
+            los_results = compute_los_batch(
+                pairs,
+                surface.cells,
+                surface.config,
+                cache=cache,
+                max_workers=los_max_workers,
+                elevation_provider=surface.elevation_provider,
+                compute_fn=compute_los,
+            )
             for j in range(len(chain) - 1, new_anchor_b_idx + 1, -1):
-                los = compute_los(
-                    new_anchor_b, chain[j],
-                    surface.cells, surface.config, cache,
-                    elevation_provider=surface.elevation_provider,
-                )
-                if los.is_visible:
+                pair = (new_anchor_b, chain[j])
+                los = los_results.get(pair)
+                if los is not None and los.is_visible:
                     furthest_reachable = j
                     break
             if furthest_reachable > new_anchor_b_idx + 1:
@@ -629,6 +681,7 @@ def place_nodes_along_corridor(
     surface: MeshSurface,
     cache: LOSCache = None,
     out_meta: Optional[Dict[str, dict]] = None,
+    los_max_workers: Optional[int] = None,
 ) -> List[str]:
     """
     Place nodes along a corridor ensuring LOS connectivity.
@@ -662,6 +715,11 @@ def place_nodes_along_corridor(
     config = surface.config
     cells = surface.cells
     from ..core.geometry import h3_distance
+    effective_los_workers = (
+        config.los_parallel_workers
+        if los_max_workers is None
+        else los_max_workers
+    )
 
     def _normalize_radii(values: Optional[List[float]], default_value: float) -> List[float]:
         radii = []
@@ -814,7 +872,13 @@ def place_nodes_along_corridor(
                 effective_budget * seg_len / max(total_corridor_len, 1)
             ))
 
-            seg_result = _dp_place_towers_with_meta(segment, surface, cache, seg_k)
+            seg_result = _dp_place_towers_with_meta(
+                segment,
+                surface,
+                cache,
+                seg_k,
+                los_max_workers=effective_los_workers,
+            )
             seg_nodes = seg_result[0] if seg_result is not None else None
             seg_best_t = seg_result[1] if seg_result is not None else None
 
@@ -865,7 +929,9 @@ def place_nodes_along_corridor(
             )
             repair_base_radius = max(0.0, repair_base_radius)
             for repair_round in range(1, config.gap_repair_rounds + 1):
-                broken = _find_broken_gaps(all_nodes, surface, cache)
+                broken = _find_broken_gaps(
+                    all_nodes, surface, cache, los_max_workers=effective_los_workers
+                )
                 if not broken:
                     break
                 repair_delta = repair_ladder[min(repair_round - 1, len(repair_ladder) - 1)]
@@ -885,13 +951,18 @@ def place_nodes_along_corridor(
                     cache=cache,
                     user_budget=effective_budget - 2,
                     node_meta=node_meta,
+                    los_max_workers=effective_los_workers,
                 )
         pre_fill_count = len(all_nodes)
         all_nodes = _fill_visibility_gaps(all_nodes, working_corridor, config.max_visibility_m)
         if len(all_nodes) > pre_fill_count:
             logger.debug("After gap-fill", count=len(all_nodes))
 
-        broken_after = len(_find_broken_gaps(all_nodes, surface, cache))
+        broken_after = len(
+            _find_broken_gaps(
+                all_nodes, surface, cache, los_max_workers=effective_los_workers
+            )
+        )
         return all_nodes, node_meta, working_corridor, corridor_pos, broken_after, effective_budget
 
     def _prune_unreachable_endpoint_fallback_nodes(
@@ -906,7 +977,9 @@ def place_nodes_along_corridor(
         """
         pruned_total = 0
         while True:
-            broken = _find_broken_gaps(nodes, surface, cache)
+            broken = _find_broken_gaps(
+                nodes, surface, cache, los_max_workers=effective_los_workers
+            )
             if not broken:
                 if pruned_total > 0:
                     logger.info(
@@ -946,7 +1019,11 @@ def place_nodes_along_corridor(
                 logger.warning(
                     "DP chain reduced below 2 nodes after endpoint fallback pruning"
                 )
-                return nodes, meta, max(len(_find_broken_gaps(nodes, surface, cache)), 0)
+                return nodes, meta, max(len(
+                    _find_broken_gaps(
+                        nodes, surface, cache, los_max_workers=effective_los_workers
+                    )
+                ), 0)
 
     initial_search_radius_m = _effective_initial_search_radius_m(config)
     selected_nodes, selected_meta, selected_working_corridor, selected_corridor_pos, broken_count, selected_budget = _run_attempt(
@@ -1010,7 +1087,9 @@ def place_nodes_along_corridor(
         )
 
         if broken_count > 0:
-            for i in _find_broken_gaps(selected_nodes, surface, cache):
+            for i in _find_broken_gaps(
+                selected_nodes, surface, cache, los_max_workers=effective_los_workers
+            ):
                 logger.error(
                     "No LOS after fallback attempts",
                     h3_a=selected_nodes[i], h3_b=selected_nodes[i + 1],
@@ -1153,6 +1232,7 @@ def wire_corridor_edges(
     corridor: List[str],
     surface: MeshSurface,
     cache: LOSCache,
+    los_max_workers: Optional[int] = None,
 ) -> None:
     """
     Add visibility edges between consecutive towers in the placed chain,
@@ -1175,6 +1255,7 @@ def wire_corridor_edges(
         return
 
     edges_added = 0
+    pending_edges = []
     for i in range(len(placed) - 1):
         h3_a = placed[i]
         h3_b = placed[i + 1]
@@ -1188,11 +1269,25 @@ def wire_corridor_edges(
         if surface.visibility_graph.has_edge(tower_a.tower_id, tower_b.tower_id):
             continue
 
-        los = compute_los(
-            h3_a, h3_b,
-            surface.cells, surface.config, cache,
-            elevation_provider=surface.elevation_provider,
-        )
+        pending_edges.append((h3_a, h3_b, tower_a, tower_b))
+
+    if not pending_edges:
+        return
+
+    pairs = [(h3_a, h3_b) for h3_a, h3_b, _tower_a, _tower_b in pending_edges]
+    los_results = compute_los_batch(
+        pairs,
+        surface.cells,
+        surface.config,
+        cache=cache,
+        max_workers=los_max_workers,
+        elevation_provider=surface.elevation_provider,
+        compute_fn=compute_los,
+    )
+    for h3_a, h3_b, tower_a, tower_b in pending_edges:
+        los = los_results.get((h3_a, h3_b))
+        if los is None:
+            continue
         if los.is_visible:
             surface.visibility_graph.add_visibility_edge(
                 tower_a.tower_id, tower_b.tower_id,

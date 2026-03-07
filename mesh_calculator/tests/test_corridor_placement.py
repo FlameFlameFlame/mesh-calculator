@@ -19,6 +19,7 @@ from ..core.grid import H3Cell
 from ..data.cache import LOSResult
 from ..network.graph import MeshSurface
 from ..optimization.corridor import place_nodes_along_corridor
+from ..optimization import corridor as corridor_mod
 
 
 def make_cells(n, elevation=100.0):
@@ -344,7 +345,7 @@ class TestDPFallbackBeforeGapRepair(unittest.TestCase):
         def _repair_passthrough(
             chain, _corridor, _corridor_pos, *,
             search_radius_m, repair_round, attempt_id,
-            surface, cache, user_budget, node_meta=None,
+            surface, cache, user_budget, node_meta=None, los_max_workers=None,
         ):
             used_radii.append(float(search_radius_m))
             return chain
@@ -398,6 +399,144 @@ class TestDPFallbackBeforeGapRepair(unittest.TestCase):
 
         self.assertEqual(nodes, ["cell_0", "cell_1", "cell_2"])
         self.assertEqual(mock_repair.call_count, 0, "Gap repair should be last resort only")
+
+
+class TestDPParallelDeterminism(unittest.TestCase):
+    """Parallel and serial DP runs should produce identical chains."""
+
+    def setUp(self):
+        self.config = MeshConfig(
+            mast_height_m=10.0,
+            max_towers_per_route=100,
+        )
+
+    @patch('mesh_calculator.optimization.corridor.compute_los')
+    @patch('mesh_calculator.core.geometry.h3_distance')
+    def test_parallel_and_serial_dp_match(self, mock_distance, mock_compute_los):
+        corridor = make_corridor(6)
+        los_pairs = {
+            ("cell_0", "cell_2"): True,
+            ("cell_0", "cell_4"): True,
+            ("cell_2", "cell_5"): True,
+            ("cell_4", "cell_5"): True,
+        }
+        mock_distance.return_value = 1000.0
+        mock_compute_los.side_effect = make_compute_los_func(
+            los_pairs, default_visible=False, clearance=8.0
+        )
+
+        serial_surface = MeshSurface(make_cells(6), self.config)
+        parallel_surface = MeshSurface(make_cells(6), self.config)
+
+        serial_nodes = place_nodes_along_corridor(
+            corridor, serial_surface, los_max_workers=1
+        )
+        parallel_nodes = place_nodes_along_corridor(
+            corridor, parallel_surface, los_max_workers=4
+        )
+
+        self.assertEqual(serial_nodes, parallel_nodes)
+
+
+class TestCorridorBatchAdoption(unittest.TestCase):
+    """Corridor internals should route LOS work through compute_los_batch."""
+
+    def setUp(self):
+        self.config = MeshConfig(
+            mast_height_m=10.0,
+            max_towers_per_route=100,
+        )
+
+    @patch('mesh_calculator.optimization.corridor.compute_los')
+    @patch('mesh_calculator.optimization.corridor.compute_los_batch')
+    @patch('mesh_calculator.core.geometry.h3_distance')
+    def test_dp_uses_batch_api(self, mock_distance, mock_batch, mock_compute_los):
+        cells = make_cells(4)
+        surface = MeshSurface(cells, self.config)
+        corridor = make_corridor(4)
+
+        mock_distance.return_value = 1000.0
+
+        def _batch_side_effect(pairs, *_args, **_kwargs):
+            out = {}
+            for src, dst in pairs:
+                visible = (src, dst) in {("cell_0", "cell_2"), ("cell_2", "cell_3")}
+                out[(src, dst)] = LOSResult(
+                    clearance_m=10.0 if visible else -1.0,
+                    path_loss_db=100.0,
+                    distance_m=1000.0,
+                    is_visible=visible,
+                )
+            return out
+
+        mock_batch.side_effect = _batch_side_effect
+        result = corridor_mod._dp_place_towers_with_meta(
+            corridor, surface, None, 4, los_max_workers=2
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], ["cell_0", "cell_2", "cell_3"])
+        self.assertGreater(mock_batch.call_count, 0)
+        mock_compute_los.assert_not_called()
+
+    @patch('mesh_calculator.optimization.corridor.compute_los')
+    @patch('mesh_calculator.optimization.corridor.compute_los_batch')
+    def test_find_broken_gaps_uses_batch_api(self, mock_batch, mock_compute_los):
+        cells = make_cells(4)
+        surface = MeshSurface(cells, self.config)
+        chain = make_corridor(4)
+
+        def _batch_side_effect(pairs, *_args, **_kwargs):
+            out = {}
+            for src, dst in pairs:
+                visible = (src, dst) != ("cell_1", "cell_2")
+                out[(src, dst)] = LOSResult(
+                    clearance_m=5.0 if visible else -5.0,
+                    path_loss_db=90.0,
+                    distance_m=1000.0,
+                    is_visible=visible,
+                )
+            return out
+
+        mock_batch.side_effect = _batch_side_effect
+        broken = corridor_mod._find_broken_gaps(
+            chain, surface, None, los_max_workers=3
+        )
+
+        self.assertEqual(broken, [1])
+        mock_batch.assert_called_once()
+        mock_compute_los.assert_not_called()
+
+    @patch('mesh_calculator.optimization.corridor.compute_los_batch')
+    def test_wire_corridor_edges_uses_batch_api(self, mock_batch):
+        cells = make_cells(3)
+        surface = MeshSurface(cells, self.config)
+        surface.place_tower("cell_0", source="test")
+        surface.place_tower("cell_1", source="test")
+        surface.place_tower("cell_2", source="test")
+
+        def _batch_side_effect(pairs, *_args, **_kwargs):
+            return {
+                pair: LOSResult(
+                    clearance_m=7.0,
+                    path_loss_db=80.0,
+                    distance_m=500.0,
+                    is_visible=True,
+                )
+                for pair in pairs
+            }
+
+        mock_batch.side_effect = _batch_side_effect
+        corridor_mod.wire_corridor_edges(
+            ["cell_0", "cell_1", "cell_2"],
+            make_corridor(3),
+            surface,
+            cache=None,
+            los_max_workers=2,
+        )
+
+        self.assertEqual(mock_batch.call_count, 1)
+        self.assertEqual(surface.visibility_graph.edge_count(), 2)
 
 
 if __name__ == '__main__':

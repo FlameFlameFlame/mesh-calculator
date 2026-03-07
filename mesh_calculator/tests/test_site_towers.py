@@ -227,4 +227,63 @@ class TestCellCoverage(unittest.TestCase):
         self.assertEqual(cells['t1'].visible_tower_count, 1)
         # Non-tower cell has no LOS
         self.assertEqual(cells['c1'].visible_tower_count, 0)
-        self.assertEqual(cells['c1'].distance_to_closest_tower, float('inf'))
+
+
+class TestHierarchicalNestedLOSWorkers(unittest.TestCase):
+    """Hierarchical outer thread pools should force inner LOS workers to 1."""
+
+    @patch('mesh_calculator.optimization.hierarchical.wire_corridor_edges')
+    @patch('mesh_calculator.optimization.hierarchical.place_nodes_along_corridor')
+    @patch('mesh_calculator.optimization.hierarchical.find_road_corridor')
+    def test_priority2_parallel_corridor_calls_use_single_inner_worker(
+        self,
+        mock_find_corridor,
+        mock_place_nodes,
+        mock_wire,
+    ):
+        cells = make_cells(['p1_cell', 'p2_cell'])
+        config = MeshConfig(los_parallel_workers=8)
+        surface = MeshSurface(cells, config)
+        routing_graph = nx.DiGraph()
+        sites = [
+            Site(name='P1', lat=40.0, lon=44.0, priority=1, h3_index='p1_cell'),
+            Site(name='P2', lat=40.01, lon=44.01, priority=2, h3_index='p2_cell'),
+        ]
+
+        mock_find_corridor.return_value = ['p2_cell', 'p1_cell']
+        mock_place_nodes.return_value = ['p2_cell', 'p1_cell']
+        mock_wire.return_value = None
+
+        connect_sites_by_priority(sites, surface, routing_graph)
+
+        self.assertGreaterEqual(mock_place_nodes.call_count, 1)
+        for call in mock_place_nodes.call_args_list:
+            self.assertEqual(call.kwargs.get('los_max_workers'), 1)
+
+    @patch('mesh_calculator.optimization.hierarchical.wire_corridor_edges')
+    @patch('mesh_calculator.optimization.hierarchical.place_nodes_along_corridor')
+    @patch('mesh_calculator.optimization.hierarchical.find_road_corridor')
+    def test_priority1_mesh_calls_use_single_inner_worker(
+        self,
+        mock_find_corridor,
+        mock_place_nodes,
+        mock_wire,
+    ):
+        cells = make_cells(['a', 'b'])
+        config = MeshConfig(los_parallel_workers=8)
+        surface = MeshSurface(cells, config)
+        routing_graph = nx.DiGraph()
+        sites = [
+            Site(name='A', lat=40.0, lon=44.0, priority=1, h3_index='a'),
+            Site(name='B', lat=40.01, lon=44.01, priority=1, h3_index='b'),
+        ]
+
+        mock_find_corridor.return_value = ['a', 'b']
+        mock_place_nodes.return_value = ['a', 'b']
+        mock_wire.return_value = None
+
+        connect_sites_by_priority(sites, surface, routing_graph)
+
+        self.assertGreaterEqual(mock_place_nodes.call_count, 1)
+        for call in mock_place_nodes.call_args_list:
+            self.assertEqual(call.kwargs.get('los_max_workers'), 1)

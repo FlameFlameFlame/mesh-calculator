@@ -111,7 +111,7 @@ def connect_sites_by_priority(
                 return None, None, None, site.name, nearest_site.name, 0
             meta: dict = {}
             nodes = place_nodes_along_corridor(
-                corridor, surface, cache, out_meta=meta,
+                corridor, surface, cache, out_meta=meta, los_max_workers=1,
             )
             return nodes, corridor, meta, site.name, nearest_site.name, len(corridor)
 
@@ -170,7 +170,7 @@ def connect_priority1_mesh(
             return None, None, None, site1.name, site2.name, 0
         meta: dict = {}
         nodes = place_nodes_along_corridor(
-            corridor, surface, cache, out_meta=meta,
+            corridor, surface, cache, out_meta=meta, los_max_workers=1,
         )
         return nodes, corridor, meta, site1.name, site2.name, len(corridor)
 

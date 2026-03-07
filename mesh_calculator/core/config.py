@@ -45,6 +45,7 @@ class MeshConfig:
     min_fresnel_clearance_m: Optional[float] = None
     los_dense_sample_step_m: float = 50.0
     los_dense_max_samples: int = 400
+    los_parallel_workers: Optional[int] = None
     cell_anchor_margin_m: float = 10.0
 
     # Physical constants
