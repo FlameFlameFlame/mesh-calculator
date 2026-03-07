@@ -98,3 +98,20 @@ def fspl_only(distance_m: float, frequency_hz: float) -> float:
     distance_km = distance_m / 1000.0
     freq_mhz = frequency_hz / 1000000.0
     return 20 * math.log10(distance_km) + 20 * math.log10(freq_mhz) + 32.44
+
+
+def max_fspl_distance_m(frequency_hz: float, max_path_loss_db: float) -> float:
+    """
+    Compute max LOS distance where free-space path loss stays within budget.
+
+    This is an optimistic upper bound (no diffraction/obstruction).
+    Any link longer than this cannot satisfy the link budget.
+    """
+    if frequency_hz <= 0:
+        raise ValueError(f"frequency_hz must be positive (got {frequency_hz})")
+    if max_path_loss_db <= 0:
+        return 0.0
+    freq_mhz = frequency_hz / 1000000.0
+    exponent = (max_path_loss_db - 20.0 * math.log10(freq_mhz) - 32.44) / 20.0
+    distance_km = 10.0 ** exponent
+    return max(0.0, distance_km * 1000.0)

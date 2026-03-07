@@ -3,8 +3,8 @@ Unit tests for physics calculations.
 """
 import unittest
 import math
-from unittest.mock import patch
-from ..physics.path_loss import compute_path_loss, fspl_only
+from unittest.mock import patch, PropertyMock
+from ..physics.path_loss import compute_path_loss, fspl_only, max_fspl_distance_m
 from ..physics.los import compute_los
 from ..physics.fresnel import (
     FresnelProfileSummary,
@@ -76,6 +76,14 @@ class TestPathLoss(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             compute_path_loss(1000, -868e6, 10.0)
+
+    def test_max_fspl_distance_inverse_of_fspl(self):
+        """max_fspl_distance_m should invert fspl_only for a given budget."""
+        frequency_hz = 868e6
+        budget_db = 120.0
+        d_m = max_fspl_distance_m(frequency_hz, budget_db)
+        self.assertGreater(d_m, 0.0)
+        self.assertAlmostEqual(fspl_only(d_m, frequency_hz), budget_db, places=6)
 
 
 class TestFresnelClearance(unittest.TestCase):
@@ -169,6 +177,31 @@ class TestLOSVisibilityRule(unittest.TestCase):
         result = compute_los("a", "b", cells, config)
 
         self.assertFalse(result.is_visible)
+
+    @patch('mesh_calculator.physics.los.compute_fresnel_profile_summary')
+    @patch('mesh_calculator.physics.los.great_circle_distance')
+    def test_fspl_prefilter_rejects_before_fresnel_sampling(
+        self, mock_distance, mock_summary
+    ):
+        config = MeshConfig(
+            frequency_hz=868e6,
+            tx_power_mw=1.0,
+            antenna_gain_dbi=0.0,
+            receiver_sensitivity_dbm=-90.0,
+        )
+        cells = {
+            "a": H3Cell("a", 40.0, 44.0, 100.0, has_road=True),
+            "b": H3Cell("b", 40.0, 44.01, 100.0, has_road=True),
+        }
+        # 1 km => FSPL above this tight budget, but force distance gate open so
+        # the explicit FSPL prefilter path is exercised.
+        mock_distance.return_value = 1000.0
+        with patch.object(MeshConfig, "max_visibility_m", new_callable=PropertyMock, return_value=200000.0):
+            result = compute_los("a", "b", cells, config)
+
+        self.assertFalse(result.is_visible)
+        self.assertGreater(result.path_loss_db, config.link_budget_db)
+        self.assertFalse(mock_summary.called)
 
     @patch('mesh_calculator.physics.los.compute_path_loss')
     @patch('mesh_calculator.physics.los.compute_fresnel_profile_summary')

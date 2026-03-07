@@ -14,6 +14,7 @@ from ..core.grid import H3Cell
 from ..core.config import MeshConfig
 from ..data.cache import LOSCache
 from ..physics.los import compute_los
+from ..physics.path_loss import max_fspl_distance_m
 from ..parallel.los_compute import compute_los_batch, compute_los_batch_progress
 from .tower_coverage import CoverageSource, compute_h3_tower_coverage
 
@@ -312,7 +313,17 @@ class MeshSurface:
         ]) * _EARTH_R
         tree = cKDTree(xyz)
 
-        max_dist = self.config.max_visibility_m
+        max_fspl_dist = max_fspl_distance_m(
+            self.config.frequency_hz,
+            self.config.link_budget_db,
+        )
+        max_dist = min(self.config.max_visibility_m, max_fspl_dist)
+        logger.info(
+            "Visibility radius cap: spatial=%.1f m fspl=%.1f m effective=%.1f m",
+            self.config.max_visibility_m,
+            max_fspl_dist,
+            max_dist,
+        )
         candidate_pairs = tree.query_pairs(r=max_dist, output_type='ndarray')
         logger.info(
             "Visibility candidates after spatial filter: %d/%d",

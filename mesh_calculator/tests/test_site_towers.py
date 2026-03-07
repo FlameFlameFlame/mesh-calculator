@@ -7,7 +7,7 @@ even if the site is a lone P1 site or all corridor searches fail.
 After tower placement, update_visibility_edges must compute LOS edges.
 """
 import unittest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, PropertyMock
 import networkx as nx
 
 from mesh_calculator.core.config import MeshConfig
@@ -170,6 +170,33 @@ class TestVisibilityEdgesWiring(unittest.TestCase):
         self.assertAlmostEqual(data['clearance_m'], 22.5)
         self.assertAlmostEqual(data['path_loss_db'], 115.3)
         self.assertAlmostEqual(data['distance_m'], 8000.0)
+
+    @patch('mesh_calculator.network.graph.compute_los')
+    def test_fspl_radius_cap_prunes_impossible_pairs(self, mock_compute_los):
+        """KD-tree candidate radius is capped by FSPL budget bound."""
+        cells = {
+            'a': H3Cell('a', lat=40.0, lon=44.0, elevation=100.0, has_road=True, is_in_boundary=True),
+            # ~70 km away: outside FSPL cap for very low link budget.
+            'b': H3Cell('b', lat=40.63, lon=44.0, elevation=100.0, has_road=True, is_in_boundary=True),
+        }
+        config = MeshConfig(
+            tx_power_mw=1.0,
+            antenna_gain_dbi=0.0,
+            receiver_sensitivity_dbm=-90.0,
+        )
+        surface = MeshSurface(cells, config)
+        surface.place_tower('a', source='site')
+        surface.place_tower('b', source='site')
+
+        mock_compute_los.return_value = LOSResult(
+            clearance_m=10.0, path_loss_db=80.0, distance_m=1000.0, is_visible=True
+        )
+
+        with patch.object(MeshConfig, "max_visibility_m", new_callable=PropertyMock, return_value=200000.0):
+            surface.update_visibility_edges()
+
+        self.assertEqual(surface.visibility_graph.edge_count(), 0)
+        self.assertFalse(mock_compute_los.called)
 
 
 # ---------- Cell Coverage ----------

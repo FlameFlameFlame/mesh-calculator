@@ -14,6 +14,7 @@ from .fresnel import (
     max_allowed_fresnel_obstruction_ratio,
 )
 from .path_loss import compute_path_loss
+from .path_loss import fspl_only
 
 _LOS_VERIFICATION_MODE = "hybrid_accept_verify"
 
@@ -135,6 +136,43 @@ def compute_los(
             path_loss_db=999.0,
             distance_m=distance,
             is_visible=False
+        )
+        if use_cache:
+            cache.put(
+                h3_src, h3_dst,
+                src_mast_height_m, dst_mast_height_m,
+                config.frequency_hz,
+                result,
+                tx_power_mw=config.tx_power_mw,
+                antenna_gain_dbi=config.antenna_gain_dbi,
+                receiver_sensitivity_dbm=config.receiver_sensitivity_dbm,
+                min_fresnel_clearance_m=config.min_fresnel_clearance_m,
+                los_dense_sample_step_m=config.los_dense_sample_step_m,
+                los_dense_max_samples=config.los_dense_max_samples,
+                los_verification_mode=_LOS_VERIFICATION_MODE,
+                src_lat=src_lat,
+                src_lon=src_lon,
+                dst_lat=dst_lat,
+                dst_lon=dst_lon,
+            )
+        return result
+
+    # Fast budget prefilter: if ideal free-space loss already exceeds budget,
+    # skip Fresnel/profile sampling entirely.
+    fspl_db = fspl_only(distance, config.frequency_hz)
+    if fspl_db > config.link_budget_db:
+        result = LOSResult(
+            clearance_m=-999.0,
+            path_loss_db=fspl_db,
+            distance_m=distance,
+            is_visible=False,
+        )
+        setattr(result, "fresnel_obstruction_ratio", 1.0)
+        setattr(result, "max_allowed_fresnel_obstruction_ratio", float(max_allowed_ratio))
+        setattr(
+            result,
+            "fresnel_obstruction_margin_ratio",
+            float(max_allowed_ratio - 1.0),
         )
         if use_cache:
             cache.put(
