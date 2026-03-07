@@ -581,6 +581,8 @@ def _repair_broken_gaps(
     user_budget: int,
     node_meta: Optional[Dict[str, dict]] = None,
     los_max_workers: Optional[int] = None,
+    progress_step_callback=None,
+    progress_prefix: str = "",
 ) -> List[str]:
     """
     For each broken gap in chain, locally wiggle the two endpoint towers
@@ -677,6 +679,13 @@ def _repair_broken_gaps(
             radius_m = float(max(search_radius_m, 0.0) * local_round)
             if radius_m <= 0.0:
                 break
+            if progress_step_callback is not None:
+                try:
+                    progress_step_callback(
+                        f"{progress_prefix} Gap repair {i + 1}/{len(broken)} round {local_round}/3 (radius {int(round(radius_m))} m)"
+                    )
+                except Exception:
+                    logger.debug("Gap-repair progress callback failed", exc_info=True)
             search_ring = _radius_to_ring_m(surface.config, radius_m, minimum=1)
             cand_a = _candidate_pool(anchor_a0, radius_m, not fixed_a)
             cand_b = _candidate_pool(anchor_b0, radius_m, not fixed_b)
@@ -804,6 +813,13 @@ def _repair_broken_gaps(
                 moved_a=(new_a != anchor_a0),
                 moved_b=(new_b != anchor_b0),
             )
+            if progress_step_callback is not None:
+                try:
+                    progress_step_callback(
+                        f"{progress_prefix} Gap repair {i + 1}/{len(broken)} succeeded on round {local_round}/3"
+                    )
+                except Exception:
+                    logger.debug("Gap-repair progress callback failed", exc_info=True)
             repaired = True
             break
 
@@ -815,6 +831,13 @@ def _repair_broken_gaps(
                 anchor_a=anchor_a0,
                 anchor_b=anchor_b0,
             )
+            if progress_step_callback is not None:
+                try:
+                    progress_step_callback(
+                        f"{progress_prefix} Gap repair {i + 1}/{len(broken)} failed after 3 rounds"
+                    )
+                except Exception:
+                    logger.debug("Gap-repair progress callback failed", exc_info=True)
     return chain
 
 
@@ -1060,6 +1083,7 @@ def place_nodes_along_corridor(
         seen: set = set()
         node_meta: Dict[str, dict] = {}
 
+        phase_text = "Initial" if phase_label == "initial" else f"Fallback #{attempt_id}"
         for bi in range(len(boundaries) - 1):
             seg_start = boundaries[bi]
             seg_end = boundaries[bi + 1]
@@ -1083,13 +1107,16 @@ def place_nodes_along_corridor(
                 effective_budget * seg_len / max(total_corridor_len, 1)
             ))
 
+            seg_label = f"{phase_text} segment {bi + 1}/{max(1, len(boundaries) - 1)}"
             seg_result = _dp_place_towers_with_meta(
                 segment,
                 surface,
                 cache,
                 seg_k,
                 los_max_workers=effective_los_workers,
-                los_progress_callback=_make_los_progress('Evaluating LOS chain candidates'),
+                los_progress_callback=_make_los_progress(
+                    f'{seg_label} • Evaluating LOS chain candidates'
+                ),
             )
             seg_nodes = seg_result[0] if seg_result is not None else None
             seg_best_t = seg_result[1] if seg_result is not None else None
@@ -1135,7 +1162,9 @@ def place_nodes_along_corridor(
                 surface,
                 cache,
                 los_max_workers=effective_los_workers,
-                los_progress_callback=_make_los_progress('Checking/repairing broken LOS gaps'),
+                los_progress_callback=_make_los_progress(
+                    f'{phase_text} • Checking broken LOS gaps'
+                ),
             )
             if broken:
                 base_buffer_radius_m = max(0.0, float(config.road_buffer_m))
@@ -1146,16 +1175,24 @@ def place_nodes_along_corridor(
                     len(broken),
                     base_buffer_radius_m,
                 )
+                repair_kwargs = {
+                    'search_radius_m': base_buffer_radius_m,
+                    'repair_round': 1,
+                    'attempt_id': attempt_id,
+                    'surface': surface,
+                    'cache': cache,
+                    'user_budget': effective_budget - 2,
+                    'node_meta': node_meta,
+                    'los_max_workers': effective_los_workers,
+                }
+                if progress_callback is not None:
+                    repair_kwargs['progress_step_callback'] = _emit_progress
+                    repair_kwargs['progress_prefix'] = f'{phase_text} •'
                 all_nodes = _repair_broken_gaps(
-                    all_nodes, working_corridor, corridor_pos,
-                    search_radius_m=base_buffer_radius_m,
-                    repair_round=1,
-                    attempt_id=attempt_id,
-                    surface=surface,
-                    cache=cache,
-                    user_budget=effective_budget - 2,
-                    node_meta=node_meta,
-                    los_max_workers=effective_los_workers,
+                    all_nodes,
+                    working_corridor,
+                    corridor_pos,
+                    **repair_kwargs,
                 )
         pre_fill_count = len(all_nodes)
         all_nodes = _fill_visibility_gaps(all_nodes, working_corridor, config.max_visibility_m)
@@ -1168,7 +1205,9 @@ def place_nodes_along_corridor(
                 surface,
                 cache,
                 los_max_workers=effective_los_workers,
-                los_progress_callback=_make_los_progress('Final LOS connectivity check'),
+                los_progress_callback=_make_los_progress(
+                    f'{phase_text} • Final LOS connectivity check'
+                ),
             )
         )
         return all_nodes, node_meta, working_corridor, corridor_pos, broken_after, effective_budget

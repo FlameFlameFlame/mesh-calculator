@@ -641,18 +641,25 @@ def run_route_pipeline(
         # Place towers along trimmed corridor (city interior already excluded)
         towers_before = len(surface.towers)
         placement_meta: dict = {}
-        route_place_progress = {'pct': route_base + route_weight * 0.35}
+        route_place_progress = {
+            'pct': route_base + route_weight * 0.35,
+            'step': '',
+        }
 
         def _emit_route_place_progress(local_frac: float, step: str) -> None:
             frac = max(0.0, min(1.0, float(local_frac)))
             pct = route_base + route_weight * (0.35 + 0.45 * frac)
+            step_text = step or 'Placing and installing towers'
             # Keep per-route progress monotonic during dense LOS batches.
-            if pct <= route_place_progress['pct']:
+            if pct < route_place_progress['pct']:
+                return
+            if pct == route_place_progress['pct'] and step_text == route_place_progress['step']:
                 return
             route_place_progress['pct'] = pct
+            route_place_progress['step'] = step_text
             _emit_progress(
                 stage='route',
-                step=step or 'Placing and installing towers',
+                step=step_text,
                 percent=pct,
                 route_index=route_idx,
                 route_id=route.route_id,
