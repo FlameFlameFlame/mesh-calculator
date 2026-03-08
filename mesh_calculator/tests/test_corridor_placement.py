@@ -447,6 +447,62 @@ class TestDPBufferCandidateMaterialization(unittest.TestCase):
         self.assertTrue(nodes, "Placement should return a non-empty chain")
         self.assertIn(pending_cell, surface.cells, "Pending buffer cell should be materialized")
 
+    @patch('mesh_calculator.optimization.corridor._adaptive_cells_within_radius')
+    @patch('mesh_calculator.optimization.corridor._cell_profile')
+    @patch('mesh_calculator.optimization.corridor._dp_place_towers_with_meta')
+    @patch('mesh_calculator.optimization.corridor.compute_los')
+    @patch('mesh_calculator.core.geometry.h3_distance')
+    def test_buffer_candidate_cap_limits_injected_cells(
+        self,
+        mock_distance,
+        mock_compute_los,
+        mock_dp,
+        mock_cell_profile,
+        mock_adaptive_cells,
+    ):
+        config = MeshConfig(
+            mast_height_m=10.0,
+            max_towers_per_route=6,
+            road_buffer_m=100.0,
+            gap_repair_rounds=0,
+            dp_buffer_candidates_max_per_segment=1,
+        )
+        corridor = make_corridor(3)
+        cells = make_cells(3)
+        surface = MeshSurface(cells, config, elevation_provider=object())
+        candidate_a = "892c0547577ffff"
+        candidate_b = "892c05474d3ffff"
+
+        mock_distance.return_value = 1000.0
+        mock_adaptive_cells.return_value = {candidate_a, candidate_b}
+
+        def _cell_profile_side_effect(_config, _provider, h3_idx, lat, lon):
+            elev = 120.0 if h3_idx == candidate_a else 250.0
+            return (elev, lat, lon)
+
+        mock_cell_profile.side_effect = _cell_profile_side_effect
+
+        captured_segment = {}
+
+        def _dp_side_effect(segment, *_args, **_kwargs):
+            captured_segment["segment"] = list(segment)
+            return ([segment[0], segment[-1]], 2)
+
+        mock_dp.side_effect = _dp_side_effect
+        mock_compute_los.return_value = LOSResult(
+            clearance_m=10.0,
+            path_loss_db=50.0,
+            distance_m=1000.0,
+            is_visible=True,
+        )
+
+        place_nodes_along_corridor(corridor, surface)
+
+        segment = captured_segment.get("segment", [])
+        injected_candidates = [idx for idx in segment if idx in {candidate_a, candidate_b}]
+        self.assertEqual(len(injected_candidates), 1)
+        self.assertEqual(injected_candidates[0], candidate_b)
+
 
 class TestDPParallelDeterminism(unittest.TestCase):
     """Parallel and serial DP runs should produce identical chains."""
@@ -523,7 +579,76 @@ class TestCorridorBatchAdoption(unittest.TestCase):
 
         self.assertIsNotNone(result)
         self.assertEqual(result[0], ["cell_0", "cell_2", "cell_3"])
-        self.assertGreater(mock_batch.call_count, 0)
+        self.assertEqual(mock_batch.call_count, 1)
+        mock_compute_los.assert_not_called()
+
+    @patch('mesh_calculator.optimization.corridor.compute_los')
+    @patch('mesh_calculator.optimization.corridor.compute_los_batch')
+    @patch('mesh_calculator.core.geometry.h3_distance')
+    def test_dp_precompute_batch_runs_once_across_layers(
+        self, mock_distance, mock_batch, mock_compute_los
+    ):
+        cells = make_cells(5)
+        surface = MeshSurface(cells, self.config)
+        corridor = make_corridor(5)
+        mock_distance.return_value = 1000.0
+
+        def _batch_side_effect(pairs, *_args, **_kwargs):
+            return {
+                pair: LOSResult(
+                    clearance_m=10.0,
+                    path_loss_db=80.0,
+                    distance_m=1000.0,
+                    is_visible=True,
+                )
+                for pair in pairs
+            }
+
+        mock_batch.side_effect = _batch_side_effect
+
+        result = corridor_mod._dp_place_towers_with_meta(
+            corridor, surface, None, 5, los_max_workers=2
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], ["cell_0", "cell_4"])
+        self.assertEqual(mock_batch.call_count, 1, "DP should precompute LOS once")
+        mock_compute_los.assert_not_called()
+
+    @patch('mesh_calculator.optimization.corridor.compute_los')
+    @patch('mesh_calculator.optimization.corridor.compute_los_batch')
+    @patch('mesh_calculator.optimization.corridor.fspl_only')
+    @patch('mesh_calculator.core.geometry.h3_distance')
+    def test_dp_prefilter_removes_guaranteed_budget_fail_pairs(
+        self, mock_distance, mock_fspl_only, mock_batch, mock_compute_los
+    ):
+        cells = make_cells(4)
+        surface = MeshSurface(cells, self.config)
+        corridor = make_corridor(4)
+        mock_distance.return_value = 1000.0
+        mock_fspl_only.side_effect = [10.0, 9999.0, 10.0, 10.0, 10.0, 10.0]
+
+        captured_pairs = []
+
+        def _batch_side_effect(pairs, *_args, **_kwargs):
+            captured_pairs.extend(list(pairs))
+            return {
+                pair: LOSResult(
+                    clearance_m=10.0,
+                    path_loss_db=80.0,
+                    distance_m=1000.0,
+                    is_visible=True,
+                )
+                for pair in pairs
+            }
+
+        mock_batch.side_effect = _batch_side_effect
+
+        result = corridor_mod._dp_place_towers_with_meta(
+            corridor, surface, None, 4, los_max_workers=1
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(mock_batch.call_count, 1)
+        self.assertNotIn(("cell_0", "cell_2"), captured_pairs)
         mock_compute_los.assert_not_called()
 
     @patch('mesh_calculator.optimization.corridor.compute_los')

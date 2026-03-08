@@ -22,6 +22,7 @@ class MeshConfig:
     routing_k_ring: int = 2  # k-ring radius for routing graph neighbor search
     road_buffer_m: float = 100.0  # Buffer around road cells in meters (0 = road-only)
     optimizer_search_radius_m: Optional[float] = None  # Optional planner-only search radius override
+    dp_buffer_candidates_max_per_segment: Optional[int] = None  # Optional cap for injected DP buffer candidates
     gap_repair_search_radius_ladder_m: list[float] = field(
         default_factory=lambda: [0.0, 300.0, 600.0, 900.0]
     )

@@ -53,6 +53,14 @@ class TestMeshConfigDefaults(unittest.TestCase):
         config = MeshConfig(los_parallel_workers=4)
         self.assertEqual(config.los_parallel_workers, 4)
 
+    def test_dp_buffer_candidates_max_per_segment_default_is_none(self):
+        config = MeshConfig()
+        self.assertIsNone(config.dp_buffer_candidates_max_per_segment)
+
+    def test_dp_buffer_candidates_max_per_segment_can_be_set(self):
+        config = MeshConfig(dp_buffer_candidates_max_per_segment=7)
+        self.assertEqual(config.dp_buffer_candidates_max_per_segment, 7)
+
 
 class TestMeshCalculatorConfigFromDict(unittest.TestCase):
     """MeshCalculatorConfig.from_dict() correctly handles new params."""
@@ -108,6 +116,7 @@ class TestMeshCalculatorConfigFromDict(unittest.TestCase):
             'parameters': {
                 'road_buffer_m': 150.0,
                 'max_coverage_radius_m': 10000.0,
+                'dp_buffer_candidates_max_per_segment': 5,
                 'min_fresnel_clearance_m': -1.5,
                 'mast_height_m': 35.0,
                 'routing_k_ring': 3,
@@ -117,6 +126,7 @@ class TestMeshCalculatorConfigFromDict(unittest.TestCase):
         cfg = MeshCalculatorConfig.from_dict(d)
         self.assertEqual(cfg.parameters.road_buffer_m, 150.0)
         self.assertEqual(cfg.parameters.max_coverage_radius_m, 10000.0)
+        self.assertEqual(cfg.parameters.dp_buffer_candidates_max_per_segment, 5)
         self.assertEqual(cfg.parameters.min_fresnel_clearance_m, -1.5)
         self.assertEqual(cfg.parameters.mast_height_m, 35.0)
         self.assertEqual(cfg.parameters.routing_k_ring, 3)

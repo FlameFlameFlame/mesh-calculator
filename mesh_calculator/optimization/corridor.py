@@ -8,8 +8,9 @@ import structlog
 
 from ..core.grid import H3Cell, resolve_cell_profile
 from ..core.config import MeshConfig
-from ..data.cache import LOSCache
+from ..data.cache import LOSCache, LOSResult
 from ..physics.los import has_los, compute_los
+from ..physics.path_loss import fspl_only
 from ..parallel.los_compute import compute_los_batch, compute_los_batch_progress
 from ..network.graph import MeshSurface, _los_decision_debug
 
@@ -181,68 +182,143 @@ def _dp_place_towers_with_meta(
     # Tower 1 placed at start (position 0); no links yet → infinite clearance
     dp[1][0] = float('inf')
 
-    for t in range(1, k):
-        transitions: list[tuple[int, int]] = []
-        pair_sequence: list[tuple[str, str]] = []
-        for i in range(n - 1):
-            if dp[t][i] == NEG_INF:
+    feasible_pairs_all: list[tuple[int, int, tuple[str, str]]] = []
+    feasible_pairs_by_i: dict[int, list[tuple[int, tuple[str, str]]]] = {}
+    for i in range(n - 1):
+        src_h3 = corridor[i]
+        for j in range(i + 1, n):
+            dst_h3 = corridor[j]
+            # Early exit: corridor positions are roughly ordered by distance;
+            # once we exceed max_visibility_m we can stop.
+            dist = h3_distance(src_h3, dst_h3)
+            if dist > config.max_visibility_m:
+                break
+
+            # Conservative prefilter: if ideal FSPL already fails budget,
+            # the full LOS policy cannot pass this pair.
+            if fspl_only(dist, config.frequency_hz) > config.link_budget_db:
                 continue
-            for j in range(i + 1, n):
-                # Early exit: corridor positions are roughly ordered by distance;
-                # once we exceed max_visibility_m we can stop.
-                dist = h3_distance(corridor[i], corridor[j])
-                if dist > config.max_visibility_m:
-                    break
 
-                # Skip non-endpoint cells that violate constraints
-                is_endpoint_j = (j == n - 1)
-                if not is_endpoint_j:
-                    cell_j = cells.get(corridor[j])
-                    if cell_j and getattr(cell_j, 'is_in_unfit_area', False):
-                        continue
-                transitions.append((i, j))
-                pair_sequence.append((corridor[i], corridor[j]))
+            # Skip non-endpoint cells that violate constraints
+            is_endpoint_j = (j == n - 1)
+            if not is_endpoint_j:
+                cell_j = cells.get(dst_h3)
+                if cell_j and getattr(cell_j, 'is_in_unfit_area', False):
+                    continue
 
-        if not pair_sequence:
+            pair = (src_h3, dst_h3)
+            feasible_pairs_all.append((i, j, pair))
+            feasible_pairs_by_i.setdefault(i, []).append((j, pair))
+
+    los_results_by_pair: dict[tuple[str, str], LOSResult] = {}
+    visible_next_by_i: dict[int, list[tuple[int, LOSResult]]] = {}
+    precomputed_edges = False
+    if feasible_pairs_all:
+        precompute_pairs = [pair for _i, _j, pair in feasible_pairs_all]
+        los_diag: dict = {}
+        try:
+            if los_progress_callback is None:
+                precomputed_results = compute_los_batch(
+                    precompute_pairs,
+                    cells,
+                    config,
+                    cache=cache,
+                    max_workers=los_max_workers,
+                    elevation_provider=elevation_provider,
+                    compute_fn=compute_los,
+                    diagnostics=los_diag,
+                    stage="dp_search",
+                )
+            else:
+                precomputed_results = compute_los_batch_progress(
+                    precompute_pairs,
+                    cells,
+                    config,
+                    cache=cache,
+                    max_workers=los_max_workers,
+                    elevation_provider=elevation_provider,
+                    compute_fn=compute_los,
+                    progress_callback=los_progress_callback,
+                    diagnostics=los_diag,
+                    stage="dp_search",
+                )
+            los_results_by_pair.update(precomputed_results)
+            _record_los_diag(surface, los_diag)
+
+            for i, j, pair in feasible_pairs_all:
+                los = los_results_by_pair.get(pair)
+                if los is None or not los.is_visible:
+                    continue
+                visible_next_by_i.setdefault(i, []).append((j, los))
+            precomputed_edges = True
+        except Exception:
+            logger.warning(
+                "DP LOS precompute failed; falling back to per-layer missing-only batches",
+                exc_info=True,
+            )
+
+    for t in range(1, k):
+        reachable_i = [i for i in range(n - 1) if dp[t][i] != NEG_INF]
+        if not reachable_i:
             continue
 
-        los_diag: dict = {}
-        if los_progress_callback is None:
-            los_results = compute_los_batch(
-                pair_sequence,
-                cells,
-                config,
-                cache=cache,
-                max_workers=los_max_workers,
-                elevation_provider=elevation_provider,
-                compute_fn=compute_los,
-                diagnostics=los_diag,
-                stage="dp_search",
-            )
-        else:
-            los_results = compute_los_batch_progress(
-                pair_sequence,
-                cells,
-                config,
-                cache=cache,
-                max_workers=los_max_workers,
-                elevation_provider=elevation_provider,
-                compute_fn=compute_los,
-                progress_callback=los_progress_callback,
-                diagnostics=los_diag,
-                stage="dp_search",
-            )
-        _record_los_diag(surface, los_diag)
-        # Preserve deterministic DP tie behavior by applying transitions in the
-        # exact same order as the original nested i/j loops.
-        for (i, j), pair in zip(transitions, pair_sequence):
-            los = los_results.get(pair)
-            if los is None or not los.is_visible:
-                continue
-            link_quality = min(dp[t][i], los.clearance_m)
-            if link_quality > dp[t + 1][j]:
-                dp[t + 1][j] = link_quality
-                parent[t + 1][j] = i
+        if precomputed_edges:
+            # Preserve deterministic DP tie behavior by applying transitions in
+            # the exact i/j order from feasible_pairs_by_i.
+            for i in reachable_i:
+                for j, los in visible_next_by_i.get(i, []):
+                    link_quality = min(dp[t][i], los.clearance_m)
+                    if link_quality > dp[t + 1][j]:
+                        dp[t + 1][j] = link_quality
+                        parent[t + 1][j] = i
+            continue
+
+        # Safety fallback: compute only unseen pairs per layer.
+        layer_pairs: list[tuple[str, str]] = []
+        for i in reachable_i:
+            for _j, pair in feasible_pairs_by_i.get(i, []):
+                layer_pairs.append(pair)
+        if not layer_pairs:
+            continue
+        missing_pairs = [pair for pair in layer_pairs if pair not in los_results_by_pair]
+        if missing_pairs:
+            los_diag: dict = {}
+            if los_progress_callback is None:
+                missing_results = compute_los_batch(
+                    missing_pairs,
+                    cells,
+                    config,
+                    cache=cache,
+                    max_workers=los_max_workers,
+                    elevation_provider=elevation_provider,
+                    compute_fn=compute_los,
+                    diagnostics=los_diag,
+                    stage="dp_search",
+                )
+            else:
+                missing_results = compute_los_batch_progress(
+                    missing_pairs,
+                    cells,
+                    config,
+                    cache=cache,
+                    max_workers=los_max_workers,
+                    elevation_provider=elevation_provider,
+                    compute_fn=compute_los,
+                    progress_callback=los_progress_callback,
+                    diagnostics=los_diag,
+                    stage="dp_search",
+                )
+            los_results_by_pair.update(missing_results)
+            _record_los_diag(surface, los_diag)
+        for i in reachable_i:
+            for j, pair in feasible_pairs_by_i.get(i, []):
+                los = los_results_by_pair.get(pair)
+                if los is None or not los.is_visible:
+                    continue
+                link_quality = min(dp[t][i], los.clearance_m)
+                if link_quality > dp[t + 1][j]:
+                    dp[t + 1][j] = link_quality
+                    parent[t + 1][j] = i
 
     # Find the best feasible chain that reaches the last position.
     # Prefer fewer towers: pick the smallest t that reaches the endpoint
@@ -980,6 +1056,23 @@ def place_nodes_along_corridor(
             closest = min(corridor_set, key=lambda r: h3_distance(nb, r))
             if closest not in best_by_road or elev > best_by_road[closest][1]:
                 best_by_road[closest] = (nb, elev)
+
+        max_candidates = getattr(config, "dp_buffer_candidates_max_per_segment", None)
+        if max_candidates is not None:
+            try:
+                cap = max(0, int(max_candidates))
+            except (TypeError, ValueError):
+                cap = 0
+            if cap > 0 and len(best_by_road) > cap:
+                top_entries = sorted(
+                    (
+                        (road_h3, nb, elev)
+                        for road_h3, (nb, elev) in best_by_road.items()
+                    ),
+                    key=lambda row: (-row[2], row[1], row[0]),
+                )[:cap]
+                best_by_road = {road_h3: (nb, elev) for road_h3, nb, elev in top_entries}
+
         injected = 0
         selected_buffer_cells: List[str] = []
         for road_h3, (nb, _elev) in best_by_road.items():
