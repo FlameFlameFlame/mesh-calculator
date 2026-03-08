@@ -1,5 +1,9 @@
 # Change Summary
 
+- 2026-03-08: Added DP terrain-shadow prefilter diagnostics (`filtered_by_shadow` and related counts) and a cached line-peak based terrain prefilter for DP pair generation to skip obviously blocked links before LOS batch execution.
+- 2026-03-08: Fixed DP prefilter crash on duplicate/zero-distance corridor pairs (`fspl_only(0)` guard) and added regression coverage to ensure repeated H3 entries do not raise during DP pair prefiltering.
+- 2026-03-08: Added cross-attempt DP LOS memo reuse in corridor placement so fallback attempts avoid rebatching pairs already resolved in earlier attempts of the same route placement run.
+- 2026-03-08: Updated gap-repair wiggle policy to exactly three rounds with diameter-based growth (`+road_buffer_m` per round) and added regression coverage for round/radius progression.
 - 2026-03-08: Optimized DP corridor LOS workload by precomputing feasible transition pairs once per segment attempt, running a single `dp_search` LOS batch, and reusing in-memory LOS adjacency/results across DP layers (with guarded missing-only per-layer fallback if precompute fails), reducing repeated LOS batch invocations without changing DP path selection semantics.
 - 2026-03-08: Added conservative DP pair prefilter (`fspl_only(distance) > link_budget_db`) to skip guaranteed-fail links before LOS terrain/profile evaluation, plus regression coverage asserting filtered pairs are not sent to DP LOS batches.
 - 2026-03-08: Added optional planner knob `MeshConfig.dp_buffer_candidates_max_per_segment` (default `None`) to cap injected non-road buffer candidates by elevation for large-corridor performance control; default behavior remains unchanged when unset.

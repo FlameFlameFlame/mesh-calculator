@@ -8,13 +8,16 @@ import structlog
 
 from ..core.grid import H3Cell, resolve_cell_profile
 from ..core.config import MeshConfig
+from ..core.geometry import great_circle_distance
 from ..data.cache import LOSCache, LOSResult
 from ..physics.los import has_los, compute_los
+from ..physics.fresnel import max_allowed_fresnel_obstruction_ratio
 from ..physics.path_loss import fspl_only
 from ..parallel.los_compute import compute_los_batch, compute_los_batch_progress
 from ..network.graph import MeshSurface, _los_decision_debug
 
 logger = structlog.get_logger(__name__)
+_GAP_REPAIR_WIGGLE_ROUNDS = 3
 
 
 def _record_los_diag(surface: MeshSurface, diagnostics: Optional[dict]) -> None:
@@ -52,6 +55,63 @@ def _cell_profile(
         lon,
         anchor_margin_m=config.cell_anchor_margin_m,
     )
+
+
+def _terrain_shadow_prefilter_rejects(
+    h3_src: str,
+    h3_dst: str,
+    cells: Dict[str, H3Cell],
+    config: MeshConfig,
+    elevation_provider,
+) -> bool:
+    """
+    Fast reject for obviously terrain-blocked links using line-peak elevation.
+
+    Returns True only when the peak terrain point along the line is guaranteed
+    to violate the current Fresnel obstruction policy at that exact point.
+    """
+    if elevation_provider is None or not callable(
+        getattr(type(elevation_provider), "get_line_peak_elevation", None)
+    ):
+        return False
+    src = cells.get(h3_src)
+    dst = cells.get(h3_dst)
+    if src is None or dst is None:
+        return False
+    src_lat = float(getattr(src, "los_lat", src.lat))
+    src_lon = float(getattr(src, "los_lon", src.lon))
+    dst_lat = float(getattr(dst, "los_lat", dst.lat))
+    dst_lon = float(getattr(dst, "los_lon", dst.lon))
+    try:
+        peak_elev_m, _peak_lat, _peak_lon, frac = elevation_provider.get_line_peak_elevation(
+            src_lat, src_lon, dst_lat, dst_lon
+        )
+    except Exception:
+        return False
+
+    frac = max(0.0, min(1.0, float(frac)))
+    distance_m = great_circle_distance(src_lat, src_lon, dst_lat, dst_lon)
+    if distance_m <= 0.0:
+        return False
+
+    src_asl = float(src.elevation) + float(config.mast_height_m) + float(
+        getattr(src, "antenna_height_offset_m", 0.0) or 0.0
+    )
+    dst_asl = float(dst.elevation) + float(config.mast_height_m) + float(
+        getattr(dst, "antenna_height_offset_m", 0.0) or 0.0
+    )
+    d1 = distance_m * frac
+    d2 = distance_m - d1
+    line_alt = src_asl + (dst_asl - src_asl) * frac
+    earth_curv = (d1 * d2) / (2.0 * float(config.effective_earth_radius_m))
+    fresnel_r = 0.0
+    if d1 > 0.0 and d2 > 0.0:
+        fresnel_r = (max(float(config.wavelength_m) * d1 * d2 / distance_m, 0.0)) ** 0.5
+    required_geometric_clearance = fresnel_r * (
+        1.0 - float(max_allowed_fresnel_obstruction_ratio())
+    )
+    geometric_clearance = float(line_alt) - (float(peak_elev_m) + float(earth_curv))
+    return geometric_clearance < required_geometric_clearance
 
 
 def _effective_initial_search_radius_m(config: MeshConfig) -> float:
@@ -140,6 +200,7 @@ def _dp_place_towers_with_meta(
     k: int,
     los_max_workers: Optional[int] = None,
     los_progress_callback=None,
+    los_pair_memo: Optional[Dict[tuple[str, str], LOSResult]] = None,
 ) -> Optional[tuple]:
     """
     Optimal tower placement using MaxMin Bottleneck Path DP.
@@ -182,21 +243,38 @@ def _dp_place_towers_with_meta(
     # Tower 1 placed at start (position 0); no links yet → infinite clearance
     dp[1][0] = float('inf')
 
+    los_results_by_pair = los_pair_memo if los_pair_memo is not None else {}
     feasible_pairs_all: list[tuple[int, int, tuple[str, str]]] = []
     feasible_pairs_by_i: dict[int, list[tuple[int, tuple[str, str]]]] = {}
+    total_forward_pairs = 0
+    filtered_by_distance = 0
+    filtered_by_fspl = 0
+    filtered_by_unfit = 0
+    filtered_by_shadow = 0
+    reused_from_memo = 0
     for i in range(n - 1):
         src_h3 = corridor[i]
         for j in range(i + 1, n):
             dst_h3 = corridor[j]
+            total_forward_pairs += 1
             # Early exit: corridor positions are roughly ordered by distance;
             # once we exceed max_visibility_m we can stop.
             dist = h3_distance(src_h3, dst_h3)
             if dist > config.max_visibility_m:
+                filtered_by_distance += (n - j)
                 break
+            if dist <= 0.0:
+                pair = (src_h3, dst_h3)
+                if pair in los_results_by_pair:
+                    reused_from_memo += 1
+                feasible_pairs_all.append((i, j, pair))
+                feasible_pairs_by_i.setdefault(i, []).append((j, pair))
+                continue
 
             # Conservative prefilter: if ideal FSPL already fails budget,
             # the full LOS policy cannot pass this pair.
             if fspl_only(dist, config.frequency_hz) > config.link_budget_db:
+                filtered_by_fspl += 1
                 continue
 
             # Skip non-endpoint cells that violate constraints
@@ -204,46 +282,71 @@ def _dp_place_towers_with_meta(
             if not is_endpoint_j:
                 cell_j = cells.get(dst_h3)
                 if cell_j and getattr(cell_j, 'is_in_unfit_area', False):
+                    filtered_by_unfit += 1
                     continue
 
             pair = (src_h3, dst_h3)
+            if pair in los_results_by_pair:
+                reused_from_memo += 1
+                feasible_pairs_all.append((i, j, pair))
+                feasible_pairs_by_i.setdefault(i, []).append((j, pair))
+                continue
+
+            if _terrain_shadow_prefilter_rejects(
+                src_h3, dst_h3, cells, config, elevation_provider
+            ):
+                filtered_by_shadow += 1
+                continue
+
             feasible_pairs_all.append((i, j, pair))
             feasible_pairs_by_i.setdefault(i, []).append((j, pair))
 
-    los_results_by_pair: dict[tuple[str, str], LOSResult] = {}
+    logger.debug(
+        "DP pair prefilter summary",
+        corridor_cells=n,
+        total_forward_pairs=total_forward_pairs,
+        feasible_pairs=len(feasible_pairs_all),
+        filtered_by_distance=filtered_by_distance,
+        filtered_by_fspl=filtered_by_fspl,
+        filtered_by_unfit=filtered_by_unfit,
+        filtered_by_shadow=filtered_by_shadow,
+        reused_from_memo=reused_from_memo,
+    )
     visible_next_by_i: dict[int, list[tuple[int, LOSResult]]] = {}
     precomputed_edges = False
     if feasible_pairs_all:
         precompute_pairs = [pair for _i, _j, pair in feasible_pairs_all]
+        missing_precompute_pairs = [pair for pair in precompute_pairs if pair not in los_results_by_pair]
         los_diag: dict = {}
         try:
-            if los_progress_callback is None:
-                precomputed_results = compute_los_batch(
-                    precompute_pairs,
-                    cells,
-                    config,
-                    cache=cache,
-                    max_workers=los_max_workers,
-                    elevation_provider=elevation_provider,
-                    compute_fn=compute_los,
-                    diagnostics=los_diag,
-                    stage="dp_search",
-                )
-            else:
-                precomputed_results = compute_los_batch_progress(
-                    precompute_pairs,
-                    cells,
-                    config,
-                    cache=cache,
-                    max_workers=los_max_workers,
-                    elevation_provider=elevation_provider,
-                    compute_fn=compute_los,
-                    progress_callback=los_progress_callback,
-                    diagnostics=los_diag,
-                    stage="dp_search",
-                )
-            los_results_by_pair.update(precomputed_results)
-            _record_los_diag(surface, los_diag)
+            if missing_precompute_pairs:
+                if los_progress_callback is None:
+                    precomputed_results = compute_los_batch(
+                        missing_precompute_pairs,
+                        cells,
+                        config,
+                        cache=cache,
+                        max_workers=los_max_workers,
+                        elevation_provider=elevation_provider,
+                        compute_fn=compute_los,
+                        diagnostics=los_diag,
+                        stage="dp_search",
+                    )
+                else:
+                    precomputed_results = compute_los_batch_progress(
+                        missing_precompute_pairs,
+                        cells,
+                        config,
+                        cache=cache,
+                        max_workers=los_max_workers,
+                        elevation_provider=elevation_provider,
+                        compute_fn=compute_los,
+                        progress_callback=los_progress_callback,
+                        diagnostics=los_diag,
+                        stage="dp_search",
+                    )
+                los_results_by_pair.update(precomputed_results)
+                _record_los_diag(surface, los_diag)
 
             for i, j, pair in feasible_pairs_all:
                 los = los_results_by_pair.get(pair)
@@ -668,8 +771,9 @@ def _repair_broken_gaps(
         chain:           Current tower chain (modified in-place and returned).
         corridor:        Full corridor (used to register any newly created cells).
         corridor_pos:    Position lookup {h3_idx: position_in_corridor}.
-        search_radius_m: Base wiggle radius (meters). Each local repair tries
-                         1x, 2x, and 3x of this radius.
+        search_radius_m: Base wiggle diameter step (meters). Local repairs run
+                         three rounds and increase diameter by this amount each
+                         round; search radius is diameter/2.
         repair_round:    Debug field for metadata compatibility.
         attempt_id:      Placement attempt id.
         surface:         MeshSurface.
@@ -751,14 +855,16 @@ def _repair_broken_gaps(
         fixed_b = ((i + 1) == (len(chain) - 1)) or (anchor_b0 in surface.tower_by_h3)
         repaired = False
 
-        for local_round in range(1, 4):
-            radius_m = float(max(search_radius_m, 0.0) * local_round)
+        base_diameter_m = float(max(search_radius_m, 0.0))
+        for local_round in range(1, _GAP_REPAIR_WIGGLE_ROUNDS + 1):
+            diameter_m = base_diameter_m * local_round
+            radius_m = diameter_m / 2.0
             if radius_m <= 0.0:
                 break
             if progress_step_callback is not None:
                 try:
                     progress_step_callback(
-                        f"{progress_prefix} Gap repair {i + 1}/{len(broken)} round {local_round}/3 (radius {int(round(radius_m))} m)"
+                        f"{progress_prefix} Gap repair {i + 1}/{len(broken)} round {local_round}/{_GAP_REPAIR_WIGGLE_ROUNDS} (diameter {int(round(diameter_m))} m)"
                     )
                 except Exception:
                     logger.debug("Gap-repair progress callback failed", exc_info=True)
@@ -892,7 +998,7 @@ def _repair_broken_gaps(
             if progress_step_callback is not None:
                 try:
                     progress_step_callback(
-                        f"{progress_prefix} Gap repair {i + 1}/{len(broken)} succeeded on round {local_round}/3"
+                        f"{progress_prefix} Gap repair {i + 1}/{len(broken)} succeeded on round {local_round}/{_GAP_REPAIR_WIGGLE_ROUNDS}"
                     )
                 except Exception:
                     logger.debug("Gap-repair progress callback failed", exc_info=True)
@@ -1210,6 +1316,7 @@ def place_nodes_along_corridor(
                 los_progress_callback=_make_los_progress(
                     f'{seg_label} • Evaluating LOS chain candidates'
                 ),
+                los_pair_memo=shared_dp_los_pairs,
             )
             seg_nodes = seg_result[0] if seg_result is not None else None
             seg_best_t = seg_result[1] if seg_result is not None else None
@@ -1366,6 +1473,7 @@ def place_nodes_along_corridor(
                 ), 0)
 
     initial_search_radius_m = _effective_initial_search_radius_m(config)
+    shared_dp_los_pairs: Dict[tuple[str, str], LOSResult] = {}
     selected_nodes, selected_meta, selected_working_corridor, selected_corridor_pos, broken_count, selected_budget = _run_attempt(
         search_radius_m=initial_search_radius_m,
         attempt_id=0,
