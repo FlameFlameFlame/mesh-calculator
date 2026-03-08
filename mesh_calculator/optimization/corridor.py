@@ -267,9 +267,10 @@ def _dp_place_towers_with_meta(
     filtered_by_unfit = 0
     filtered_by_shadow = 0
     reused_from_memo = 0
+    total_pairs_upper_bound = (n * (n - 1)) // 2
     memo_keys = set(los_results_by_pair.keys())
     total_sources = max(1, n - 1)
-    next_progress_pct = 10
+    next_progress_pct = 1
 
     def _scan_source_row(source_i: int) -> dict:
         src_h3 = corridor[source_i]
@@ -362,6 +363,11 @@ def _dp_place_towers_with_meta(
                     progress_pct=progress_pct,
                     source_cells_scanned=i + 1,
                     source_cells_total=total_sources,
+                    pairs_to_filter_total_upper_bound=total_pairs_upper_bound,
+                    pairs_processed=total_forward_pairs,
+                    pairs_remaining_to_filter=max(
+                        0, total_pairs_upper_bound - total_forward_pairs
+                    ),
                     feasible_pairs=len(feasible_pairs_all),
                     filtered_by_shadow=filtered_by_shadow,
                     filtered_by_fspl=filtered_by_fspl,
@@ -369,17 +375,29 @@ def _dp_place_towers_with_meta(
                     filtered_by_distance=filtered_by_distance,
                     reused_from_memo=reused_from_memo,
                 )
-                next_progress_pct += 10
+                next_progress_pct += 1
     else:
         try:
             rows_by_i: dict[int, dict] = {}
             completed = 0
+            progress_forward_pairs = 0
+            progress_filtered_distance = 0
+            progress_filtered_fspl = 0
+            progress_filtered_unfit = 0
+            progress_filtered_shadow = 0
+            progress_reused = 0
             with ThreadPoolExecutor(max_workers=prefilter_workers) as executor:
                 futures = {executor.submit(_scan_source_row, i): i for i in source_indices}
                 for future in as_completed(futures):
                     row = future.result()
                     rows_by_i[row["i"]] = row
                     completed += 1
+                    progress_forward_pairs += int(row["forward_pairs"])
+                    progress_filtered_distance += int(row["filtered_distance"])
+                    progress_filtered_fspl += int(row["filtered_fspl"])
+                    progress_filtered_unfit += int(row["filtered_unfit"])
+                    progress_filtered_shadow += int(row["filtered_shadow"])
+                    progress_reused += int(row["reused"])
                     progress_pct = int((completed * 100) / total_sources)
                     if progress_pct >= next_progress_pct:
                         logger.debug(
@@ -387,15 +405,20 @@ def _dp_place_towers_with_meta(
                             progress_pct=progress_pct,
                             source_cells_scanned=completed,
                             source_cells_total=total_sources,
+                            pairs_to_filter_total_upper_bound=total_pairs_upper_bound,
+                            pairs_processed=progress_forward_pairs,
+                            pairs_remaining_to_filter=max(
+                                0, total_pairs_upper_bound - progress_forward_pairs
+                            ),
                             feasible_pairs=len(feasible_pairs_all),
-                            filtered_by_shadow=filtered_by_shadow,
-                            filtered_by_fspl=filtered_by_fspl,
-                            filtered_by_unfit=filtered_by_unfit,
-                            filtered_by_distance=filtered_by_distance,
-                            reused_from_memo=reused_from_memo,
+                            filtered_by_shadow=progress_filtered_shadow,
+                            filtered_by_fspl=progress_filtered_fspl,
+                            filtered_by_unfit=progress_filtered_unfit,
+                            filtered_by_distance=progress_filtered_distance,
+                            reused_from_memo=progress_reused,
                             workers=prefilter_workers,
                         )
-                        next_progress_pct += 10
+                        next_progress_pct += 1
             for i in source_indices:
                 row = rows_by_i.get(i)
                 if row is not None:
@@ -413,7 +436,7 @@ def _dp_place_towers_with_meta(
             filtered_by_unfit = 0
             filtered_by_shadow = 0
             reused_from_memo = 0
-            next_progress_pct = 10
+            next_progress_pct = 1
             for i in source_indices:
                 _merge_row(_scan_source_row(i))
                 progress_pct = int(((i + 1) * 100) / total_sources)
@@ -423,6 +446,11 @@ def _dp_place_towers_with_meta(
                         progress_pct=progress_pct,
                         source_cells_scanned=i + 1,
                         source_cells_total=total_sources,
+                        pairs_to_filter_total_upper_bound=total_pairs_upper_bound,
+                        pairs_processed=total_forward_pairs,
+                        pairs_remaining_to_filter=max(
+                            0, total_pairs_upper_bound - total_forward_pairs
+                        ),
                         feasible_pairs=len(feasible_pairs_all),
                         filtered_by_shadow=filtered_by_shadow,
                         filtered_by_fspl=filtered_by_fspl,
@@ -430,11 +458,12 @@ def _dp_place_towers_with_meta(
                         filtered_by_distance=filtered_by_distance,
                         reused_from_memo=reused_from_memo,
                     )
-                    next_progress_pct += 10
+                    next_progress_pct += 1
 
     logger.debug(
         "DP pair prefilter summary",
         corridor_cells=n,
+        pairs_to_filter_total_upper_bound=total_pairs_upper_bound,
         total_forward_pairs=total_forward_pairs,
         feasible_pairs=len(feasible_pairs_all),
         filtered_by_distance=filtered_by_distance,
@@ -985,9 +1014,11 @@ def _repair_broken_gaps(
         fixed_a = (i == 0) or (anchor_a0 in surface.tower_by_h3)
         fixed_b = ((i + 1) == (len(chain) - 1)) or (anchor_b0 in surface.tower_by_h3)
         repaired = False
+        rounds_tried = 0
 
         base_diameter_m = float(max(search_radius_m, 0.0))
         for local_round in range(1, _GAP_REPAIR_WIGGLE_ROUNDS + 1):
+            rounds_tried += 1
             diameter_m = base_diameter_m * local_round
             radius_m = diameter_m / 2.0
             if radius_m <= 0.0:
@@ -1002,6 +1033,17 @@ def _repair_broken_gaps(
             search_ring = _radius_to_ring_m(surface.config, radius_m, minimum=1)
             cand_a = _candidate_pool(anchor_a0, radius_m, not fixed_a)
             cand_b = _candidate_pool(anchor_b0, radius_m, not fixed_b)
+            logger.debug(
+                "Gap repair wiggle round",
+                gap_idx=i,
+                local_round=local_round,
+                radius_m=radius_m,
+                search_ring=search_ring,
+                candidate_a=len(cand_a),
+                candidate_b=len(cand_b),
+                fixed_a=fixed_a,
+                fixed_b=fixed_b,
+            )
             if not cand_a or not cand_b:
                 continue
 
@@ -1141,6 +1183,7 @@ def _repair_broken_gaps(
                 "Gap repair wiggle failed",
                 gap_idx=i,
                 base_radius_m=search_radius_m,
+                rounds_tried=rounds_tried,
                 anchor_a=anchor_a0,
                 anchor_b=anchor_b0,
             )

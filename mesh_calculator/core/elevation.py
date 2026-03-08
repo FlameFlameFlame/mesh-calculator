@@ -2,9 +2,11 @@
 Elevation data handling with caching for mesh calculator.
 """
 import threading
+import warnings
 from typing import Optional, Tuple
 import h3
 import rasterio
+from rasterio.errors import NotGeoreferencedWarning
 from rasterio.transform import rowcol
 from rasterio.windows import Window
 from rasterio.windows import from_bounds as window_from_bounds
@@ -467,14 +469,19 @@ class ElevationProvider:
                         with self._lock:
                             band = self.dataset.read(1, window=win, masked=True)
                         w_transform = window_transform(win, self.transform)
-                        line_mask = rasterize(
-                            [(mapping(line), 1)],
-                            out_shape=band.shape,
-                            transform=w_transform,
-                            fill=0,
-                            all_touched=True,
-                            dtype=np.uint8,
-                        )
+                        with warnings.catch_warnings():
+                            warnings.filterwarnings(
+                                "ignore",
+                                category=NotGeoreferencedWarning,
+                            )
+                            line_mask = rasterize(
+                                [(mapping(line), 1)],
+                                out_shape=band.shape,
+                                transform=w_transform,
+                                fill=0,
+                                all_touched=True,
+                                dtype=np.uint8,
+                            )
                         valid = (line_mask == 1) & (~np.ma.getmaskarray(band))
                         max_elev = self._safe_max(band, valid)
                         if max_elev is None:
