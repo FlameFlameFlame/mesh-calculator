@@ -1,5 +1,8 @@
 Note: All of the code was written by LLMs: Claude Code and ChatGPT.
 
+[![Unit Tests](https://github.com/FlameFlameFlame/mesh-calculator/actions/workflows/unit-tests.yml/badge.svg?branch=main)](https://github.com/FlameFlameFlame/mesh-calculator/actions/workflows/unit-tests.yml)
+[![Smoke Tests](https://github.com/FlameFlameFlame/mesh-calculator/actions/workflows/smoke-tests.yml/badge.svg?branch=main)](https://github.com/FlameFlameFlame/mesh-calculator/actions/workflows/smoke-tests.yml)
+
 # Project Description
 mesh_calculator is a Python package that computes mesh-network tower placement and route planning using terrain, radio, and connectivity constraints.
 
