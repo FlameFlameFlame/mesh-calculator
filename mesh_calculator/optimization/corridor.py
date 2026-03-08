@@ -2,6 +2,8 @@
 Node placement along corridors with LOS constraints.
 """
 from typing import List, Dict, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import os
 import h3
 
 import structlog
@@ -119,6 +121,19 @@ def _effective_initial_search_radius_m(config: MeshConfig) -> float:
     if config.optimizer_search_radius_m is not None:
         return max(0.0, float(config.optimizer_search_radius_m))
     return max(0.0, float(config.road_buffer_m))
+
+
+def _resolve_prefilter_workers(
+    config: MeshConfig,
+    los_max_workers: Optional[int],
+) -> int:
+    """Resolve worker count for DP pair prefiltering."""
+    if los_max_workers is not None:
+        return max(1, int(los_max_workers))
+    configured = getattr(config, "los_parallel_workers", None)
+    if configured is not None:
+        return max(1, int(configured))
+    return os.cpu_count() or 4
 
 
 def _radius_to_ring_m(config: MeshConfig, radius_m: float, minimum: int = 0) -> int:
@@ -252,29 +267,39 @@ def _dp_place_towers_with_meta(
     filtered_by_unfit = 0
     filtered_by_shadow = 0
     reused_from_memo = 0
-    for i in range(n - 1):
-        src_h3 = corridor[i]
-        for j in range(i + 1, n):
+    memo_keys = set(los_results_by_pair.keys())
+    total_sources = max(1, n - 1)
+    next_progress_pct = 10
+
+    def _scan_source_row(source_i: int) -> dict:
+        src_h3 = corridor[source_i]
+        row_pairs: list[tuple[int, int, tuple[str, str]]] = []
+        row_forward_pairs = 0
+        row_filtered_distance = 0
+        row_filtered_fspl = 0
+        row_filtered_unfit = 0
+        row_filtered_shadow = 0
+        row_reused = 0
+        for j in range(source_i + 1, n):
             dst_h3 = corridor[j]
-            total_forward_pairs += 1
+            row_forward_pairs += 1
             # Early exit: corridor positions are roughly ordered by distance;
             # once we exceed max_visibility_m we can stop.
             dist = h3_distance(src_h3, dst_h3)
             if dist > config.max_visibility_m:
-                filtered_by_distance += (n - j)
+                row_filtered_distance += (n - j)
                 break
+            pair = (src_h3, dst_h3)
             if dist <= 0.0:
-                pair = (src_h3, dst_h3)
-                if pair in los_results_by_pair:
-                    reused_from_memo += 1
-                feasible_pairs_all.append((i, j, pair))
-                feasible_pairs_by_i.setdefault(i, []).append((j, pair))
+                if pair in memo_keys:
+                    row_reused += 1
+                row_pairs.append((source_i, j, pair))
                 continue
 
             # Conservative prefilter: if ideal FSPL already fails budget,
             # the full LOS policy cannot pass this pair.
             if fspl_only(dist, config.frequency_hz) > config.link_budget_db:
-                filtered_by_fspl += 1
+                row_filtered_fspl += 1
                 continue
 
             # Skip non-endpoint cells that violate constraints
@@ -282,24 +307,130 @@ def _dp_place_towers_with_meta(
             if not is_endpoint_j:
                 cell_j = cells.get(dst_h3)
                 if cell_j and getattr(cell_j, 'is_in_unfit_area', False):
-                    filtered_by_unfit += 1
+                    row_filtered_unfit += 1
                     continue
 
-            pair = (src_h3, dst_h3)
-            if pair in los_results_by_pair:
-                reused_from_memo += 1
-                feasible_pairs_all.append((i, j, pair))
-                feasible_pairs_by_i.setdefault(i, []).append((j, pair))
+            if pair in memo_keys:
+                row_reused += 1
+                row_pairs.append((source_i, j, pair))
                 continue
 
             if _terrain_shadow_prefilter_rejects(
                 src_h3, dst_h3, cells, config, elevation_provider
             ):
-                filtered_by_shadow += 1
+                row_filtered_shadow += 1
                 continue
 
+            row_pairs.append((source_i, j, pair))
+        return {
+            "i": source_i,
+            "pairs": row_pairs,
+            "forward_pairs": row_forward_pairs,
+            "filtered_distance": row_filtered_distance,
+            "filtered_fspl": row_filtered_fspl,
+            "filtered_unfit": row_filtered_unfit,
+            "filtered_shadow": row_filtered_shadow,
+            "reused": row_reused,
+        }
+
+    def _merge_row(row: dict) -> None:
+        nonlocal total_forward_pairs
+        nonlocal filtered_by_distance
+        nonlocal filtered_by_fspl
+        nonlocal filtered_by_unfit
+        nonlocal filtered_by_shadow
+        nonlocal reused_from_memo
+        total_forward_pairs += int(row["forward_pairs"])
+        filtered_by_distance += int(row["filtered_distance"])
+        filtered_by_fspl += int(row["filtered_fspl"])
+        filtered_by_unfit += int(row["filtered_unfit"])
+        filtered_by_shadow += int(row["filtered_shadow"])
+        reused_from_memo += int(row["reused"])
+        for i, j, pair in row["pairs"]:
             feasible_pairs_all.append((i, j, pair))
             feasible_pairs_by_i.setdefault(i, []).append((j, pair))
+
+    prefilter_workers = _resolve_prefilter_workers(config, los_max_workers)
+    source_indices = list(range(n - 1))
+    if prefilter_workers <= 1 or len(source_indices) < 16:
+        for i in source_indices:
+            _merge_row(_scan_source_row(i))
+            progress_pct = int(((i + 1) * 100) / total_sources)
+            if progress_pct >= next_progress_pct:
+                logger.debug(
+                    "DP prefilter progress",
+                    progress_pct=progress_pct,
+                    source_cells_scanned=i + 1,
+                    source_cells_total=total_sources,
+                    feasible_pairs=len(feasible_pairs_all),
+                    filtered_by_shadow=filtered_by_shadow,
+                    filtered_by_fspl=filtered_by_fspl,
+                    filtered_by_unfit=filtered_by_unfit,
+                    filtered_by_distance=filtered_by_distance,
+                    reused_from_memo=reused_from_memo,
+                )
+                next_progress_pct += 10
+    else:
+        try:
+            rows_by_i: dict[int, dict] = {}
+            completed = 0
+            with ThreadPoolExecutor(max_workers=prefilter_workers) as executor:
+                futures = {executor.submit(_scan_source_row, i): i for i in source_indices}
+                for future in as_completed(futures):
+                    row = future.result()
+                    rows_by_i[row["i"]] = row
+                    completed += 1
+                    progress_pct = int((completed * 100) / total_sources)
+                    if progress_pct >= next_progress_pct:
+                        logger.debug(
+                            "DP prefilter progress",
+                            progress_pct=progress_pct,
+                            source_cells_scanned=completed,
+                            source_cells_total=total_sources,
+                            feasible_pairs=len(feasible_pairs_all),
+                            filtered_by_shadow=filtered_by_shadow,
+                            filtered_by_fspl=filtered_by_fspl,
+                            filtered_by_unfit=filtered_by_unfit,
+                            filtered_by_distance=filtered_by_distance,
+                            reused_from_memo=reused_from_memo,
+                            workers=prefilter_workers,
+                        )
+                        next_progress_pct += 10
+            for i in source_indices:
+                row = rows_by_i.get(i)
+                if row is not None:
+                    _merge_row(row)
+        except Exception:
+            logger.warning(
+                "DP prefilter parallel execution failed; falling back to serial prefilter",
+                exc_info=True,
+            )
+            feasible_pairs_all.clear()
+            feasible_pairs_by_i.clear()
+            total_forward_pairs = 0
+            filtered_by_distance = 0
+            filtered_by_fspl = 0
+            filtered_by_unfit = 0
+            filtered_by_shadow = 0
+            reused_from_memo = 0
+            next_progress_pct = 10
+            for i in source_indices:
+                _merge_row(_scan_source_row(i))
+                progress_pct = int(((i + 1) * 100) / total_sources)
+                if progress_pct >= next_progress_pct:
+                    logger.debug(
+                        "DP prefilter progress",
+                        progress_pct=progress_pct,
+                        source_cells_scanned=i + 1,
+                        source_cells_total=total_sources,
+                        feasible_pairs=len(feasible_pairs_all),
+                        filtered_by_shadow=filtered_by_shadow,
+                        filtered_by_fspl=filtered_by_fspl,
+                        filtered_by_unfit=filtered_by_unfit,
+                        filtered_by_distance=filtered_by_distance,
+                        reused_from_memo=reused_from_memo,
+                    )
+                    next_progress_pct += 10
 
     logger.debug(
         "DP pair prefilter summary",
