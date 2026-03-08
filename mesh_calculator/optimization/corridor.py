@@ -4,6 +4,7 @@ Node placement along corridors with LOS constraints.
 from typing import List, Dict, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
+import time
 import h3
 
 import structlog
@@ -271,6 +272,16 @@ def _dp_place_towers_with_meta(
     memo_keys = set(los_results_by_pair.keys())
     total_sources = max(1, n - 1)
     next_progress_pct = 1
+    next_info_progress_pct = 10
+    prefilter_workers = _resolve_prefilter_workers(config, los_max_workers)
+    prefilter_started_at = time.perf_counter()
+
+    logger.info(
+        "DP cell-pair prefilter start",
+        corridor_cells=n,
+        pairs_to_filter_total_upper_bound=total_pairs_upper_bound,
+        workers=prefilter_workers,
+    )
 
     def _scan_source_row(source_i: int) -> dict:
         src_h3 = corridor[source_i]
@@ -351,7 +362,6 @@ def _dp_place_towers_with_meta(
             feasible_pairs_all.append((i, j, pair))
             feasible_pairs_by_i.setdefault(i, []).append((j, pair))
 
-    prefilter_workers = _resolve_prefilter_workers(config, los_max_workers)
     source_indices = list(range(n - 1))
     if prefilter_workers <= 1 or len(source_indices) < 16:
         for i in source_indices:
@@ -376,6 +386,21 @@ def _dp_place_towers_with_meta(
                     reused_from_memo=reused_from_memo,
                 )
                 next_progress_pct += 1
+            if progress_pct >= next_info_progress_pct:
+                logger.info(
+                    "DP cell-pair prefilter progress",
+                    progress_pct=progress_pct,
+                    source_cells_scanned=i + 1,
+                    source_cells_total=total_sources,
+                    pairs_processed=total_forward_pairs,
+                    feasible_pairs=len(feasible_pairs_all),
+                    filtered_by_shadow=filtered_by_shadow,
+                    filtered_by_fspl=filtered_by_fspl,
+                    filtered_by_unfit=filtered_by_unfit,
+                    filtered_by_distance=filtered_by_distance,
+                    reused_from_memo=reused_from_memo,
+                )
+                next_info_progress_pct += 10
     else:
         try:
             rows_by_i: dict[int, dict] = {}
@@ -419,6 +444,22 @@ def _dp_place_towers_with_meta(
                             workers=prefilter_workers,
                         )
                         next_progress_pct += 1
+                    if progress_pct >= next_info_progress_pct:
+                        logger.info(
+                            "DP cell-pair prefilter progress",
+                            progress_pct=progress_pct,
+                            source_cells_scanned=completed,
+                            source_cells_total=total_sources,
+                            pairs_processed=progress_forward_pairs,
+                            feasible_pairs=len(feasible_pairs_all),
+                            filtered_by_shadow=progress_filtered_shadow,
+                            filtered_by_fspl=progress_filtered_fspl,
+                            filtered_by_unfit=progress_filtered_unfit,
+                            filtered_by_distance=progress_filtered_distance,
+                            reused_from_memo=progress_reused,
+                            workers=prefilter_workers,
+                        )
+                        next_info_progress_pct += 10
             for i in source_indices:
                 row = rows_by_i.get(i)
                 if row is not None:
@@ -459,6 +500,21 @@ def _dp_place_towers_with_meta(
                         reused_from_memo=reused_from_memo,
                     )
                     next_progress_pct += 1
+                if progress_pct >= next_info_progress_pct:
+                    logger.info(
+                        "DP cell-pair prefilter progress",
+                        progress_pct=progress_pct,
+                        source_cells_scanned=i + 1,
+                        source_cells_total=total_sources,
+                        pairs_processed=total_forward_pairs,
+                        feasible_pairs=len(feasible_pairs_all),
+                        filtered_by_shadow=filtered_by_shadow,
+                        filtered_by_fspl=filtered_by_fspl,
+                        filtered_by_unfit=filtered_by_unfit,
+                        filtered_by_distance=filtered_by_distance,
+                        reused_from_memo=reused_from_memo,
+                    )
+                    next_info_progress_pct += 10
 
     logger.debug(
         "DP pair prefilter summary",
@@ -471,6 +527,22 @@ def _dp_place_towers_with_meta(
         filtered_by_unfit=filtered_by_unfit,
         filtered_by_shadow=filtered_by_shadow,
         reused_from_memo=reused_from_memo,
+    )
+    prefilter_elapsed_s = round(time.perf_counter() - prefilter_started_at, 3)
+    logger.info(
+        "DP cell-pair prefilter complete",
+        corridor_cells=n,
+        pairs_to_filter_total_upper_bound=total_pairs_upper_bound,
+        pairs_processed=total_forward_pairs,
+        feasible_pairs=len(feasible_pairs_all),
+        feasible_pair_ratio=round(len(feasible_pairs_all) / max(total_forward_pairs, 1), 4),
+        filtered_by_shadow=filtered_by_shadow,
+        filtered_by_fspl=filtered_by_fspl,
+        filtered_by_unfit=filtered_by_unfit,
+        filtered_by_distance=filtered_by_distance,
+        reused_from_memo=reused_from_memo,
+        elapsed_s=prefilter_elapsed_s,
+        workers=prefilter_workers,
     )
     visible_next_by_i: dict[int, list[tuple[int, LOSResult]]] = {}
     precomputed_edges = False

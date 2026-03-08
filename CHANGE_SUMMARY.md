@@ -1,5 +1,6 @@
 # Change Summary
 
+- 2026-03-08: Promoted DP cell-pair prefilter observability in `optimization/corridor.py` from debug-only to operator-visible INFO logs: added explicit prefilter start/progress (10% increments)/completion summary with filtered-by-reason counters, feasible-pair ratio, worker count, and elapsed time.
 - 2026-03-08: Added DP terrain-shadow prefilter diagnostics (`filtered_by_shadow` and related counts) and a cached line-peak based terrain prefilter for DP pair generation to skip obviously blocked links before LOS batch execution.
 - 2026-03-08: Fixed DP prefilter crash on duplicate/zero-distance corridor pairs (`fspl_only(0)` guard) and added regression coverage to ensure repeated H3 entries do not raise during DP pair prefiltering.
 - 2026-03-08: Added cross-attempt DP LOS memo reuse in corridor placement so fallback attempts avoid rebatching pairs already resolved in earlier attempts of the same route placement run.
