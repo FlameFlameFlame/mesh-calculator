@@ -3,6 +3,7 @@ Network graph representation for towers and visibility.
 """
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Optional, Set
+from statistics import median
 
 import networkx as nx
 import numpy as np
@@ -217,6 +218,8 @@ class MeshSurface:
             "pairs_computed": 0,
             "pairs_failed": 0,
             "chunk_failures": 0,
+            "elapsed_s_total": 0.0,
+            "_per_pair_s_samples": [],
             "by_stage": {},
         }
 
@@ -231,6 +234,11 @@ class MeshSurface:
         self.los_batch_metrics["pairs_computed"] += int(diagnostics.get("pairs_computed", 0))
         self.los_batch_metrics["pairs_failed"] += int(diagnostics.get("pairs_failed", 0))
         self.los_batch_metrics["chunk_failures"] += int(diagnostics.get("chunk_failures", 0))
+        elapsed_s = float(diagnostics.get("elapsed_s", 0.0) or 0.0)
+        pairs_computed = int(diagnostics.get("pairs_computed", 0))
+        self.los_batch_metrics["elapsed_s_total"] += elapsed_s
+        if pairs_computed > 0:
+            self.los_batch_metrics["_per_pair_s_samples"].append(elapsed_s / pairs_computed)
         by_stage = self.los_batch_metrics.setdefault("by_stage", {})
         stage_row = by_stage.setdefault(stage, {
             "calls": 0,
@@ -239,6 +247,8 @@ class MeshSurface:
             "pairs_computed": 0,
             "pairs_failed": 0,
             "chunk_failures": 0,
+            "elapsed_s_total": 0.0,
+            "_per_pair_s_samples": [],
         })
         stage_row["calls"] += 1
         stage_row["pairs_requested"] += int(diagnostics.get("pairs_requested", 0))
@@ -246,6 +256,65 @@ class MeshSurface:
         stage_row["pairs_computed"] += int(diagnostics.get("pairs_computed", 0))
         stage_row["pairs_failed"] += int(diagnostics.get("pairs_failed", 0))
         stage_row["chunk_failures"] += int(diagnostics.get("chunk_failures", 0))
+        stage_row["elapsed_s_total"] += elapsed_s
+        if pairs_computed > 0:
+            stage_row["_per_pair_s_samples"].append(elapsed_s / pairs_computed)
+
+    @staticmethod
+    def _per_pair_timing_summary(
+        elapsed_s_total: float,
+        pairs_computed: int,
+        samples: list[float],
+    ) -> dict:
+        avg_s = (float(elapsed_s_total) / pairs_computed) if pairs_computed > 0 else None
+        min_s = min(samples) if samples else None
+        max_s = max(samples) if samples else None
+        median_s = median(samples) if samples else None
+        return {
+            "avg_s": round(avg_s, 8) if avg_s is not None else None,
+            "min_s": round(min_s, 8) if min_s is not None else None,
+            "max_s": round(max_s, 8) if max_s is not None else None,
+            "median_s": round(median_s, 8) if median_s is not None else None,
+            "total_time_s": round(float(elapsed_s_total), 4),
+        }
+
+    def build_los_batch_report(self) -> dict:
+        """Return LOS batch metrics with per-pair timing stats, overall and by stage."""
+        metrics = self.los_batch_metrics
+        report = {
+            "calls": int(metrics.get("calls", 0)),
+            "pairs_requested": int(metrics.get("pairs_requested", 0)),
+            "unique_pairs": int(metrics.get("unique_pairs", 0)),
+            "pairs_computed": int(metrics.get("pairs_computed", 0)),
+            "pairs_failed": int(metrics.get("pairs_failed", 0)),
+            "chunk_failures": int(metrics.get("chunk_failures", 0)),
+            "elapsed_s_total": round(float(metrics.get("elapsed_s_total", 0.0) or 0.0), 4),
+            "per_pair_timing_s": self._per_pair_timing_summary(
+                float(metrics.get("elapsed_s_total", 0.0) or 0.0),
+                int(metrics.get("pairs_computed", 0)),
+                list(metrics.get("_per_pair_s_samples", [])),
+            ),
+            "by_stage": {},
+        }
+        by_stage = metrics.get("by_stage", {})
+        for stage, row in by_stage.items():
+            elapsed_s_total = float(row.get("elapsed_s_total", 0.0) or 0.0)
+            pairs_computed = int(row.get("pairs_computed", 0))
+            report["by_stage"][stage] = {
+                "calls": int(row.get("calls", 0)),
+                "pairs_requested": int(row.get("pairs_requested", 0)),
+                "unique_pairs": int(row.get("unique_pairs", 0)),
+                "pairs_computed": int(row.get("pairs_computed", 0)),
+                "pairs_failed": int(row.get("pairs_failed", 0)),
+                "chunk_failures": int(row.get("chunk_failures", 0)),
+                "elapsed_s_total": round(elapsed_s_total, 4),
+                "per_pair_timing_s": self._per_pair_timing_summary(
+                    elapsed_s_total,
+                    pairs_computed,
+                    list(row.get("_per_pair_s_samples", [])),
+                ),
+            }
+        return report
 
     def place_tower(
         self,

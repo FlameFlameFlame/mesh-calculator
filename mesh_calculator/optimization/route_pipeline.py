@@ -257,6 +257,13 @@ def run_route_pipeline(
             logger.debug("Progress callback failed", exc_info=True)
 
     os.makedirs(output_dir, exist_ok=True)
+    pipeline_started_at = time.perf_counter()
+    stage_timings_s = {
+        "route": 0.0,
+        "visibility": 0.0,
+        "city_links": 0.0,
+        "export": 0.0,
+    }
     if debug_snapshot_dir:
         os.makedirs(debug_snapshot_dir, exist_ok=True)
 
@@ -307,6 +314,7 @@ def run_route_pipeline(
         "materialized_from_dem": 0,
     }
 
+    route_stage_started_at = time.perf_counter()
     for route_idx, route in enumerate(routes, start=1):
         route_base = (route_idx - 1) * route_weight
         route_label = _route_label(route)
@@ -735,6 +743,7 @@ def run_route_pipeline(
             route_id=route.route_id,
             route_label=route_label,
         )
+    stage_timings_s["route"] = time.perf_counter() - route_stage_started_at
 
     # Compute visibility edges between all towers
     visibility_chunk_state = {'completed': 0, 'total': 0}
@@ -762,6 +771,7 @@ def run_route_pipeline(
 
     _emit_progress('visibility', 'Computing visibility links (0/0)', visibility_start_percent)
     logger.info("Computing visibility edges for %d tower(s)...", len(surface.towers))
+    visibility_started_at = time.perf_counter()
     try:
         surface.update_visibility_edges(
             los_cache,
@@ -775,15 +785,19 @@ def run_route_pipeline(
             los_cache,
             progress_callback=_emit_visibility_progress,
         )
+    stage_timings_s["visibility"] = time.perf_counter() - visibility_started_at
     _emit_progress('visibility', 'Visibility links computed', visibility_end_percent)
 
     # Tag city links
     if city_boundaries_geojson:
+        city_links_started_at = time.perf_counter()
         _emit_progress('city_links', 'Tagging city links', 96.0)
         tag_city_links(surface, city_boundaries_geojson, threshold=0.20)
         _emit_progress('city_links', 'City links tagged', 96.0 + city_weight)
+        stage_timings_s["city_links"] = time.perf_counter() - city_links_started_at
 
     # Export results
+    export_started_at = time.perf_counter()
     _emit_progress('export', 'Exporting outputs and report', export_start_percent)
     towers_path = os.path.join(output_dir, 'towers.geojson')
     edges_path = os.path.join(output_dir, 'visibility_edges.geojson')
@@ -814,10 +828,59 @@ def run_route_pipeline(
     if surface.gap_repair_debug:
         export_gap_repair_hexes_geojson(surface.gap_repair_debug, gap_repair_hexes_path)
     generate_report(surface, report_path)
+    stage_timings_s["export"] = time.perf_counter() - export_started_at
     _emit_progress('export', 'Outputs exported', 100.0)
 
     cache_stats = los_cache.stats()
     elev_stats = grid_provider.cache_stats()
+
+    los_batch_report = surface.build_los_batch_report()
+    total_elapsed_s = time.perf_counter() - pipeline_started_at
+    final_report = {
+        'stage_timings_s': {
+            'route': round(stage_timings_s["route"], 4),
+            'visibility': round(stage_timings_s["visibility"], 4),
+            'city_links': round(stage_timings_s["city_links"], 4),
+            'export': round(stage_timings_s["export"], 4),
+            'total': round(total_elapsed_s, 4),
+        },
+        'cells_calculated': {
+            'total_cells_final': len(surface.cells),
+            'prepared_cells_total': prep_metrics["prepared_cells_total"],
+            'corridor_cells_total': sum(
+                int(r.get('corridor_cells', 0) or 0)
+                for r in route_summaries
+            ),
+            'materialized_cache_hits': prep_metrics["materialized_cache_hits"],
+            'materialized_from_static': prep_metrics["materialized_from_static"],
+            'materialized_from_dem': prep_metrics["materialized_from_dem"],
+        },
+        'pairs_calculated': {
+            'calls': los_batch_report.get('calls', 0),
+            'pairs_requested': los_batch_report.get('pairs_requested', 0),
+            'unique_pairs': los_batch_report.get('unique_pairs', 0),
+            'pairs_computed': los_batch_report.get('pairs_computed', 0),
+            'pairs_failed': los_batch_report.get('pairs_failed', 0),
+            'by_stage': {
+                stage: {
+                    'calls': int(row.get('calls', 0)),
+                    'pairs_requested': int(row.get('pairs_requested', 0)),
+                    'unique_pairs': int(row.get('unique_pairs', 0)),
+                    'pairs_computed': int(row.get('pairs_computed', 0)),
+                    'pairs_failed': int(row.get('pairs_failed', 0)),
+                }
+                for stage, row in los_batch_report.get('by_stage', {}).items()
+            },
+        },
+        'time_per_pair_s': {
+            'overall': los_batch_report.get('per_pair_timing_s', {}),
+            'by_stage': {
+                stage: row.get('per_pair_timing_s', {})
+                for stage, row in los_batch_report.get('by_stage', {}).items()
+            },
+        },
+        'total_time_spent_s': round(total_elapsed_s, 4),
+    }
 
     summary = {
         'routes_processed': len(routes),
@@ -846,13 +909,22 @@ def run_route_pipeline(
         'materialized_from_static': prep_metrics["materialized_from_static"],
         'materialized_from_dem': prep_metrics["materialized_from_dem"],
         'los_cache': cache_stats,
-        'los_batch': dict(surface.los_batch_metrics),
+        'los_batch': los_batch_report,
         'elevation_cache': elev_stats,
+        'final_report': final_report,
     }
 
     logger.info(
         "Pipeline complete: %d towers, %d cells, %d visibility edges",
         summary['total_towers'], summary['total_cells'], summary['visibility_edges'],
+    )
+    logger.info(
+        "Final report: total_time_s=%.3f stage_times=%s cells=%s pairs=%s per_pair=%s",
+        final_report['total_time_spent_s'],
+        final_report['stage_timings_s'],
+        final_report['cells_calculated'],
+        final_report['pairs_calculated'],
+        final_report['time_per_pair_s']['overall'],
     )
     _emit_progress('done', 'Pipeline complete', 100.0)
     return summary
