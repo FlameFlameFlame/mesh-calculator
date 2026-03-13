@@ -26,7 +26,7 @@ class ElevationProvider:
     Attributes:
         dataset: Rasterio dataset handle
         transform: Affine transform for coordinate conversion
-        _cache: Dictionary cache for elevation lookups
+        _data: In-memory raster band array (lazy-loaded on first access)
     """
 
     def __init__(self, tif_path: str):
@@ -39,16 +39,30 @@ class ElevationProvider:
         self.dataset = None
         self.dataset = rasterio.open(tif_path)
         self.transform = self.dataset.transform
-        self._cache = {}
         self._cell_max_cache = {}
         self._cell_anchor_cache = {}
         self._line_peak_cache = {}
-        self._data = None  # Lazy-load full array if needed
+        self._data = None  # Lazy-loaded full band array
+        self._nodata = self.dataset.nodata
         self._lock = threading.Lock()
+
+    def _ensure_data(self):
+        """Load the full raster band into memory on first access."""
+        if self._data is None:
+            with self._lock:
+                if self._data is None:  # Double-check under lock
+                    data = self.dataset.read(1)
+                    # Replace nodata with 0.0 in-place so lookups don't need to check
+                    if self._nodata is not None:
+                        data = data.astype(np.float32, copy=False)
+                        data[data == self._nodata] = 0.0
+                    self._data = data
 
     def get_elevation(self, lat: float, lon: float) -> float:
         """
-        Get elevation at a specific latitude/longitude with caching.
+        Get elevation at a specific latitude/longitude.
+
+        Uses in-memory raster array for fast lookups (no per-pixel GDAL I/O).
 
         Args:
             lat: Latitude in degrees
@@ -57,48 +71,23 @@ class ElevationProvider:
         Returns:
             Elevation in meters
         """
-        # Round to 6 decimal places for cache key (~10cm precision)
-        cache_key = (round(lat, 6), round(lon, 6))
-
-        if cache_key not in self._cache:
-            # Convert lat/lon to row/col
-            try:
-                row, col = rowcol(self.transform, lon, lat)
-
-                # Check bounds
-                if (0 <= row < self.dataset.height and
-                    0 <= col < self.dataset.width):
-                    # Read single pixel value — rasterio datasets are not
-                    # thread-safe, so serialize reads with a lock.
-                    window = rasterio.windows.Window(col, row, 1, 1)
-                    with self._lock:
-                        elevation = self.dataset.read(1, window=window)[0, 0]
-
-                    # Handle nodata values
-                    if self.dataset.nodata is not None and elevation == self.dataset.nodata:
-                        elevation = 0.0
-                else:
-                    # Out of bounds - return 0
-                    elevation = 0.0
-
-                self._cache[cache_key] = float(elevation)
-
-            except Exception as e:
-                logger.warning("Failed to get elevation", lat=lat, lon=lon, error=str(e))
-                self._cache[cache_key] = 0.0
-
-        return self._cache[cache_key]
+        self._ensure_data()
+        try:
+            row, col = rowcol(self.transform, lon, lat)
+            if 0 <= row < self.dataset.height and 0 <= col < self.dataset.width:
+                return float(self._data[row, col])
+        except Exception as e:
+            logger.warning("Failed to get elevation", lat=lat, lon=lon, error=str(e))
+        return 0.0
 
     def get_elevation_bilinear(self, lat: float, lon: float) -> float:
         """
         Get elevation via bilinear interpolation at a specific latitude/longitude.
 
-        Falls back to nearest-pixel sampling near raster edges or on read errors.
+        Uses in-memory raster array. Falls back to nearest-pixel sampling near
+        raster edges or on read errors.
         """
-        cache_key = ("bilinear", round(lat, 6), round(lon, 6))
-        if cache_key in self._cache:
-            return self._cache[cache_key]
-
+        self._ensure_data()
         try:
             col_f, row_f = (~self.transform) * (lon, lat)
             row0 = int(np.floor(row_f))
@@ -111,41 +100,26 @@ class ElevationProvider:
                 or row1 >= self.dataset.height
                 or col1 >= self.dataset.width
             ):
-                value = self.get_elevation(lat, lon)
-                self._cache[cache_key] = float(value)
-                return float(value)
+                return self.get_elevation(lat, lon)
 
-            with self._lock:
-                window = rasterio.windows.Window(col0, row0, 2, 2)
-                band = self.dataset.read(1, window=window, masked=True)
-
-            mask = np.ma.getmaskarray(band)
-            if np.any(mask):
-                value = self.get_elevation(lat, lon)
-                self._cache[cache_key] = float(value)
-                return float(value)
+            v00 = float(self._data[row0, col0])
+            v01 = float(self._data[row0, col1])
+            v10 = float(self._data[row1, col0])
+            v11 = float(self._data[row1, col1])
 
             dx = float(col_f - col0)
             dy = float(row_f - row0)
-            v00 = float(band[0, 0])
-            v01 = float(band[0, 1])
-            v10 = float(band[1, 0])
-            v11 = float(band[1, 1])
-
             top = v00 * (1.0 - dx) + v01 * dx
             bottom = v10 * (1.0 - dx) + v11 * dx
-            value = top * (1.0 - dy) + bottom * dy
-            self._cache[cache_key] = float(value)
-            return float(value)
+            return float(top * (1.0 - dy) + bottom * dy)
         except Exception as e:
             logger.warning("Failed to get bilinear elevation", lat=lat, lon=lon, error=str(e))
-            value = self.get_elevation(lat, lon)
-            self._cache[cache_key] = float(value)
-            return float(value)
+            return self.get_elevation(lat, lon)
 
     def get_elevation_bulk(self, coords: list[Tuple[float, float]]) -> np.ndarray:
         """
-        Get elevations for multiple coordinates efficiently.
+        Get elevations for multiple coordinates efficiently via vectorized
+        numpy array indexing (no per-pixel GDAL I/O).
 
         Args:
             coords: List of (lat, lon) tuples
@@ -153,11 +127,23 @@ class ElevationProvider:
         Returns:
             NumPy array of elevations
         """
-        elevations = np.zeros(len(coords))
+        if not coords:
+            return np.array([], dtype=np.float64)
 
-        for i, (lat, lon) in enumerate(coords):
-            elevations[i] = self.get_elevation(lat, lon)
+        self._ensure_data()
 
+        lats, lons = zip(*coords)
+        rows, cols = rowcol(self.transform, lons, lats)
+        rows = np.asarray(rows)
+        cols = np.asarray(cols)
+
+        valid = (
+            (rows >= 0) & (rows < self.dataset.height) &
+            (cols >= 0) & (cols < self.dataset.width)
+        )
+
+        elevations = np.zeros(len(coords), dtype=np.float64)
+        elevations[valid] = self._data[rows[valid], cols[valid]]
         return elevations
 
     def _line_cache_key(
@@ -546,16 +532,17 @@ class ElevationProvider:
             Dictionary with cache size and other stats
         """
         return {
-            'cache_size': len(self._cache),
+            'raster_loaded': self._data is not None,
+            'raster_memory_mb': (
+                self._data.nbytes / (1024 * 1024) if self._data is not None else 0
+            ),
             'cell_max_cache_size': len(self._cell_max_cache),
             'cell_anchor_cache_size': len(self._cell_anchor_cache),
             'line_peak_cache_size': len(self._line_peak_cache),
-            'cache_memory_mb': len(self._cache) * 24 / (1024 * 1024),  # Approx
         }
 
     def clear_cache(self):
         """Clear the elevation cache."""
-        self._cache.clear()
         self._cell_max_cache.clear()
         self._cell_anchor_cache.clear()
         self._line_peak_cache.clear()
