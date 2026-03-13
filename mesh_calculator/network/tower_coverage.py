@@ -68,29 +68,46 @@ def _sample_shadow_profile(
     elevation_provider=None,
 ) -> list[tuple[float, float]]:
     """Sample terrain elevations along source->target for shadow-casting check."""
-    samples: list[tuple[float, float]] = [
+    endpoints: list[tuple[float, float]] = [
         (0.0, float(source_cell.elevation)),
         (1.0, float(target_cell.elevation)),
     ]
-    if elevation_provider is None:
-        return samples
-    get_elevation = getattr(elevation_provider, "get_elevation", None)
-    if not callable(get_elevation) or distance_m <= 0.0:
-        return samples
+    if elevation_provider is None or distance_m <= 0.0:
+        return endpoints
 
     step_m = max(float(config.los_dense_sample_step_m), 1.0)
     max_samples = max(int(config.los_dense_max_samples), 2)
     n_samples = max(2, int(distance_m / step_m))
     n_samples = min(n_samples, max_samples)
-    for i in range(1, n_samples):
-        frac = i / n_samples
-        lat = source_cell.lat + (target_cell.lat - source_cell.lat) * frac
-        lon = source_cell.lon + (target_cell.lon - source_cell.lon) * frac
+
+    fracs = np.arange(1, n_samples) / n_samples
+    lats = source_cell.lat + (target_cell.lat - source_cell.lat) * fracs
+    lons = source_cell.lon + (target_cell.lon - source_cell.lon) * fracs
+    coords = list(zip(lats, lons))
+
+    # Try bulk, fall back to scalar
+    bulk_fn = getattr(elevation_provider, "get_elevation_bulk", None)
+    elevs = None
+    if callable(bulk_fn):
         try:
-            elev = float(get_elevation(lat, lon))
+            elevs = bulk_fn(coords)
         except Exception:
-            continue
-        samples.append((frac, elev))
+            pass
+
+    if elevs is None:
+        get_elevation = getattr(elevation_provider, "get_elevation", None)
+        if not callable(get_elevation):
+            return endpoints
+        elevs = []
+        for lat, lon in coords:
+            try:
+                elevs.append(float(get_elevation(lat, lon)))
+            except Exception:
+                elevs.append(0.0)
+
+    samples = list(endpoints)
+    for frac, elev in zip(fracs, elevs):
+        samples.append((float(frac), float(elev)))
     return samples
 
 

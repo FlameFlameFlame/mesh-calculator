@@ -116,6 +116,75 @@ class ElevationProvider:
             logger.warning("Failed to get bilinear elevation", lat=lat, lon=lon, error=str(e))
             return self.get_elevation(lat, lon)
 
+    def get_elevation_bilinear_bulk(self, coords: list[Tuple[float, float]]) -> np.ndarray:
+        """
+        Get bilinear-interpolated elevations for multiple coordinates via
+        vectorized numpy operations.
+
+        Falls back to nearest-pixel for points near raster edges.
+
+        Args:
+            coords: List of (lat, lon) tuples
+
+        Returns:
+            NumPy array of elevations
+        """
+        if not coords:
+            return np.array([], dtype=np.float64)
+
+        self._ensure_data()
+
+        lats, lons = zip(*coords)
+        lats_arr = np.asarray(lats, dtype=np.float64)
+        lons_arr = np.asarray(lons, dtype=np.float64)
+
+        # Inverse transform to get fractional row/col
+        inv = ~self.transform
+        col_f = inv.a * lons_arr + inv.b * lats_arr + inv.c
+        row_f = inv.d * lons_arr + inv.e * lats_arr + inv.f
+
+        row0 = np.floor(row_f).astype(np.intp)
+        col0 = np.floor(col_f).astype(np.intp)
+        row1 = row0 + 1
+        col1 = col0 + 1
+
+        h, w = self.dataset.height, self.dataset.width
+
+        # Points where all 4 neighbors are in bounds
+        interior = (row0 >= 0) & (col0 >= 0) & (row1 < h) & (col1 < w)
+
+        elevations = np.zeros(len(coords), dtype=np.float64)
+
+        if np.any(interior):
+            r0 = row0[interior]
+            c0 = col0[interior]
+            r1 = row1[interior]
+            c1 = col1[interior]
+            dx = (col_f[interior] - c0).astype(np.float64)
+            dy = (row_f[interior] - r0).astype(np.float64)
+
+            v00 = self._data[r0, c0].astype(np.float64)
+            v01 = self._data[r0, c1].astype(np.float64)
+            v10 = self._data[r1, c0].astype(np.float64)
+            v11 = self._data[r1, c1].astype(np.float64)
+
+            top = v00 * (1.0 - dx) + v01 * dx
+            bottom = v10 * (1.0 - dx) + v11 * dx
+            elevations[interior] = top * (1.0 - dy) + bottom * dy
+
+        # Edge points: fall back to nearest-pixel
+        edge = ~interior
+        if np.any(edge):
+            rows_e, cols_e = rowcol(self.transform, lons_arr[edge], lats_arr[edge])
+            rows_e = np.asarray(rows_e)
+            cols_e = np.asarray(cols_e)
+            valid = (rows_e >= 0) & (rows_e < h) & (cols_e >= 0) & (cols_e < w)
+            edge_idx = np.where(edge)[0]
+            if np.any(valid):
+                elevations[edge_idx[valid]] = self._data[rows_e[valid], cols_e[valid]]
+
+        return elevations
+
     def get_elevation_bulk(self, coords: list[Tuple[float, float]]) -> np.ndarray:
         """
         Get elevations for multiple coordinates efficiently via vectorized

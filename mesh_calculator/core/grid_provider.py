@@ -379,6 +379,12 @@ class GridProvider:
     def get_elevation_bilinear(self, lat: float, lon: float) -> float:
         return self._elevation_provider.get_elevation_bilinear(lat, lon)
 
+    def get_elevation_bulk(self, coords):
+        return self._elevation_provider.get_elevation_bulk(coords)
+
+    def get_elevation_bilinear_bulk(self, coords):
+        return self._elevation_provider.get_elevation_bilinear_bulk(coords)
+
     def get_h3_cell_max_elevation(self, h3_index: str) -> float:
         return self._elevation_provider.get_h3_cell_max_elevation(h3_index)
 
