@@ -8,6 +8,7 @@ import math
 from typing import Dict, Tuple
 import h3
 
+import numpy as np
 import structlog
 
 from ..core.grid import H3Cell
@@ -150,22 +151,43 @@ def _dense_profile_samples(
     max_samples: int,
 ) -> list[ProfilePoint]:
     """Build dense terrain samples over straight RF line using DEM interpolation."""
-    get_elevation = getattr(elevation_provider, "get_elevation_bilinear", None)
-    if not callable(get_elevation):
-        get_elevation = getattr(elevation_provider, "get_elevation", None)
-    if not callable(get_elevation) or total_distance_m <= 0.0:
-        return [
-            ProfilePoint(0.0, float(src_cell.elevation)),
-            ProfilePoint(1.0, float(dst_cell.elevation)),
-        ]
+    fallback = [
+        ProfilePoint(0.0, float(src_cell.elevation)),
+        ProfilePoint(1.0, float(dst_cell.elevation)),
+    ]
+    if total_distance_m <= 0.0:
+        return fallback
 
     n_samples = max(2, int(total_distance_m / max(sample_step_m, 1.0)))
     n_samples = min(n_samples, max(max_samples, 2))
 
-    samples: list[ProfilePoint] = [
-        ProfilePoint(0.0, float(src_cell.elevation)),
-        ProfilePoint(1.0, float(dst_cell.elevation)),
-    ]
+    # Try vectorized bulk path first
+    bulk_fn = getattr(elevation_provider, "get_elevation_bilinear_bulk", None)
+    if not callable(bulk_fn):
+        bulk_fn = getattr(elevation_provider, "get_elevation_bulk", None)
+
+    if callable(bulk_fn):
+        fracs = np.arange(1, n_samples) / n_samples
+        lats = src_lat + (dst_lat - src_lat) * fracs
+        lons = src_lon + (dst_lon - src_lon) * fracs
+        coords = list(zip(lats, lons))
+        try:
+            elevs = bulk_fn(coords)
+            samples = list(fallback)
+            for f, e in zip(fracs, elevs):
+                samples.append(ProfilePoint(float(f), float(e)))
+            return samples
+        except Exception:
+            pass  # Fall through to scalar path
+
+    # Scalar fallback
+    get_elevation = getattr(elevation_provider, "get_elevation_bilinear", None)
+    if not callable(get_elevation):
+        get_elevation = getattr(elevation_provider, "get_elevation", None)
+    if not callable(get_elevation):
+        return fallback
+
+    samples = list(fallback)
     for i in range(1, n_samples):
         frac = i / n_samples
         lat = src_lat + (dst_lat - src_lat) * frac
@@ -268,12 +290,6 @@ def _refine_dense_profile(
     if len(samples) < 3 or len(samples) >= max_samples:
         return samples
 
-    get_elevation = getattr(elevation_provider, "get_elevation_bilinear", None)
-    if not callable(get_elevation):
-        get_elevation = getattr(elevation_provider, "get_elevation", None)
-    if not callable(get_elevation):
-        return samples
-
     interior = [(idx, metric) for idx, metric in enumerate(metrics) if 0 < idx < len(metrics) - 1]
     if not interior:
         return samples
@@ -284,7 +300,8 @@ def _refine_dense_profile(
         reverse=True,
     )[:top_k]
 
-    refined: list[ProfilePoint] = list(samples)
+    # Collect all refinement points first, then batch-query elevations
+    all_fracs: list[float] = []
     for idx, _metric in ranked:
         start_frac = samples[max(0, idx - 1)].frac
         end_frac = samples[min(len(samples) - 1, idx + 1)].frac
@@ -292,19 +309,51 @@ def _refine_dense_profile(
             continue
         interval_m = total_distance_m * (end_frac - start_frac)
         n_steps = max(1, int(interval_m / max(local_step_m, 1.0)))
+        budget = max_samples - len(samples) - len(all_fracs)
         for step in range(1, n_steps):
-            if len(refined) >= max_samples:
+            if budget <= 0:
                 break
             frac = start_frac + (end_frac - start_frac) * (step / n_steps)
-            lat = src_lat + (dst_lat - src_lat) * frac
-            lon = src_lon + (dst_lon - src_lon) * frac
+            all_fracs.append(frac)
+            budget -= 1
+
+    if not all_fracs:
+        return samples
+
+    fracs_arr = np.asarray(all_fracs)
+    lats = src_lat + (dst_lat - src_lat) * fracs_arr
+    lons = src_lon + (dst_lon - src_lon) * fracs_arr
+    coords = list(zip(lats, lons))
+
+    # Try bulk, fall back to scalar
+    bulk_fn = getattr(elevation_provider, "get_elevation_bilinear_bulk", None)
+    if not callable(bulk_fn):
+        bulk_fn = getattr(elevation_provider, "get_elevation_bulk", None)
+
+    elevs = None
+    if callable(bulk_fn):
+        try:
+            elevs = bulk_fn(coords)
+        except Exception:
+            pass
+
+    if elevs is None:
+        get_elevation = getattr(elevation_provider, "get_elevation_bilinear", None)
+        if not callable(get_elevation):
+            get_elevation = getattr(elevation_provider, "get_elevation", None)
+        if not callable(get_elevation):
+            return samples
+        elevs = []
+        for lat, lon in coords:
             try:
-                elev = float(get_elevation(lat, lon))
+                elevs.append(float(get_elevation(lat, lon)))
             except Exception:
-                continue
-            refined.append(ProfilePoint(float(frac), elev))
-        if len(refined) >= max_samples:
-            break
+                elevs.append(0.0)
+
+    refined = list(samples)
+    for frac, elev in zip(all_fracs, elevs):
+        refined.append(ProfilePoint(float(frac), float(elev)))
+
     return _merge_profile_points(refined[:max_samples])
 
 

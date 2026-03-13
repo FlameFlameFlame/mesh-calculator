@@ -131,7 +131,7 @@ class TestIntegration(unittest.TestCase):
 
         # Print elevation cache stats
         elev_stats = elevation_provider.cache_stats()
-        print(f"    - Elevation cache: {elev_stats['cache_size']} entries")
+        print(f"    - Raster loaded: {elev_stats['raster_loaded']}")
 
         print("\n" + "="*60)
         print("Integration Test PASSED")
