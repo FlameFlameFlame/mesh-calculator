@@ -1,5 +1,10 @@
 # Change Summary
 
+- 2026-03-15: Removed runtime multithreading from `mesh_calculator` planning/LOS paths: LOS batching (`parallel/los_compute.py`), corridor prefilter/placement, hierarchical site connectivity, and tower-coverage LOS checks now execute deterministically in serial code paths (parallel worker hints are deprecated+ignored with warning for compatibility).
+- 2026-03-15: Removed `los_parallel_workers` from `MeshConfig` and added centralized deprecated-parameter sanitization (`sanitize_mesh_parameters`) for config/routes loading so legacy files still load with warning while key is stripped.
+- 2026-03-15: Converted in-memory LOS/elevation/grid caches to lock-free serial access (removed `threading.Lock` usage) and repurposed `utils/parallel_probe.py` into a serial repeatability probe (`--runs`) instead of worker-count comparison.
+- 2026-03-15: Updated regression coverage for de-threading/deprecation behavior (`tests/test_cache.py`, `tests/test_config_new_params.py`, `tests/test_site_towers.py`) and revalidated full suite (`174 passed`).
+
 - 2026-03-08: Promoted DP cell-pair prefilter observability in `optimization/corridor.py` from debug-only to operator-visible INFO logs: added explicit prefilter start/progress (10% increments)/completion summary with filtered-by-reason counters, feasible-pair ratio, worker count, and elapsed time.
 - 2026-03-08: Added DP terrain-shadow prefilter diagnostics (`filtered_by_shadow` and related counts) and a cached line-peak based terrain prefilter for DP pair generation to skip obviously blocked links before LOS batch execution.
 - 2026-03-08: Fixed DP prefilter crash on duplicate/zero-distance corridor pairs (`fspl_only(0)` guard) and added regression coverage to ensure repeated H3 entries do not raise during DP pair prefiltering.
