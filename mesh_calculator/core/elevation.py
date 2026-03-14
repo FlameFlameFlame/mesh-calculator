@@ -1,7 +1,6 @@
 """
 Elevation data handling with caching for mesh calculator.
 """
-import threading
 import warnings
 from typing import Optional, Tuple
 import h3
@@ -44,19 +43,16 @@ class ElevationProvider:
         self._line_peak_cache = {}
         self._data = None  # Lazy-loaded full band array
         self._nodata = self.dataset.nodata
-        self._lock = threading.Lock()
 
     def _ensure_data(self):
         """Load the full raster band into memory on first access."""
         if self._data is None:
-            with self._lock:
-                if self._data is None:  # Double-check under lock
-                    data = self.dataset.read(1)
-                    # Replace nodata with 0.0 in-place so lookups don't need to check
-                    if self._nodata is not None:
-                        data = data.astype(np.float32, copy=False)
-                        data[data == self._nodata] = 0.0
-                    self._data = data
+            data = self.dataset.read(1)
+            # Replace nodata with 0.0 in-place so lookups don't need to check
+            if self._nodata is not None:
+                data = data.astype(np.float32, copy=False)
+                data[data == self._nodata] = 0.0
+            self._data = data
 
     def get_elevation(self, lat: float, lon: float) -> float:
         """

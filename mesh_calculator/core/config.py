@@ -2,7 +2,35 @@
 Configuration dataclasses and constants for mesh calculator.
 """
 from dataclasses import dataclass, field
+import logging
 from typing import Optional
+
+logger = logging.getLogger(__name__)
+_DEPRECATED_MESH_PARAMETER_KEYS = {"los_parallel_workers"}
+
+
+def sanitize_mesh_parameters(raw_params: dict | None, *, source: str) -> dict:
+    """
+    Normalize incoming mesh parameters while preserving backward compatibility.
+
+    Deprecated keys are ignored with a warning so legacy project files keep
+    loading without behavior changes.
+    """
+    params = dict(raw_params or {})
+    removed = []
+    for key in sorted(_DEPRECATED_MESH_PARAMETER_KEYS):
+        if key in params:
+            params.pop(key, None)
+            removed.append(key)
+    if removed:
+        logger.warning(
+            "Ignoring deprecated mesh parameters from %s: %s",
+            source,
+            ", ".join(removed),
+        )
+    # Legacy key removed earlier in the project lifetime; keep stripping here.
+    params.pop('max_visibility_m', None)
+    return params
 
 
 @dataclass
@@ -46,7 +74,6 @@ class MeshConfig:
     min_fresnel_clearance_m: Optional[float] = None
     los_dense_sample_step_m: float = 50.0
     los_dense_max_samples: int = 400
-    los_parallel_workers: Optional[int] = None
     cell_anchor_margin_m: float = 10.0
 
     # Physical constants
@@ -137,8 +164,10 @@ class MeshCalculatorConfig:
     @classmethod
     def from_dict(cls, config_dict: dict) -> 'MeshCalculatorConfig':
         """Create config from dictionary (loaded from YAML)."""
-        raw_params = dict(config_dict.get('parameters', {}))
-        raw_params.pop('max_visibility_m', None)  # removed; now a computed property
+        raw_params = sanitize_mesh_parameters(
+            config_dict.get('parameters', {}),
+            source="config.yaml",
+        )
         params = MeshConfig(**raw_params)
 
         inputs_dict = config_dict.get('inputs', {})

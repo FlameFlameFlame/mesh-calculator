@@ -327,7 +327,6 @@ def run_route_pipeline(
                 "route_total": total_routes,
                 "route_label": route_label,
                 "max_towers_per_route": route.max_towers_per_route,
-                "los_parallel_workers": mesh_config.los_parallel_workers,
             }
         _emit_progress(
             stage='route',

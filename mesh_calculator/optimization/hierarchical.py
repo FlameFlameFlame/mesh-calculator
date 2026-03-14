@@ -7,7 +7,6 @@ Implements the core algorithm:
 """
 import itertools
 from typing import List
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import networkx as nx
 
 import structlog
@@ -104,19 +103,18 @@ def connect_sites_by_priority(
         if not planned:
             continue
 
-        # Step 2: Parallel — compute node placement along each corridor
+        # Step 2: Compute node placement along each corridor.
         def _compute_nodes(item):
             site, nearest_site, corridor = item
             if not corridor:
                 return None, None, None, site.name, nearest_site.name, 0
             meta: dict = {}
             nodes = place_nodes_along_corridor(
-                corridor, surface, cache, out_meta=meta, los_max_workers=1,
+                corridor, surface, cache, out_meta=meta,
             )
             return nodes, corridor, meta, site.name, nearest_site.name, len(corridor)
 
-        with ThreadPoolExecutor() as executor:
-            node_results = list(executor.map(_compute_nodes, planned))
+        node_results = [_compute_nodes(item) for item in planned]
 
         # Step 3: Serial — install towers and wire corridor-path edges
         for nodes, corridor, meta, site_name, target_name, corridor_len in node_results:
@@ -161,8 +159,7 @@ def connect_priority1_mesh(
     pairs = list(itertools.combinations(priority1_sites, 2))
     logger.info("Connections to establish", total=len(pairs))
 
-    # Parallel — find corridors and place nodes concurrently
-    # (surface reads are safe; install_nodes is deferred to serial phase)
+    # Find corridors and place nodes.
     def _process_pair(args):
         site1, site2 = args
         corridor = find_road_corridor(site1.h3_index, site2.h3_index, routing_graph)
@@ -170,15 +167,11 @@ def connect_priority1_mesh(
             return None, None, None, site1.name, site2.name, 0
         meta: dict = {}
         nodes = place_nodes_along_corridor(
-            corridor, surface, cache, out_meta=meta, los_max_workers=1,
+            corridor, surface, cache, out_meta=meta,
         )
         return nodes, corridor, meta, site1.name, site2.name, len(corridor)
 
-    results = []
-    with ThreadPoolExecutor() as executor:
-        futures = {executor.submit(_process_pair, (s1, s2)): (s1, s2) for s1, s2 in pairs}
-        for future in as_completed(futures):
-            results.append(future.result())
+    results = [_process_pair((s1, s2)) for s1, s2 in pairs]
 
     # Serial installation — fast, negligible time
     for nodes, corridor, meta, name1, name2, corridor_len in results:

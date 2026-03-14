@@ -1,5 +1,5 @@
 """
-Deterministic serial-vs-parallel regression probe for route pipeline outputs.
+Deterministic serial regression probe for route pipeline outputs.
 
 Usage:
     uv run python -m mesh_calculator.utils.parallel_probe \
@@ -11,9 +11,7 @@ import argparse
 import copy
 import hashlib
 import json
-import os
 from pathlib import Path
-from typing import Iterable
 
 import yaml
 
@@ -61,28 +59,6 @@ def _build_route_specs(routes_json: dict) -> list[RouteSpec]:
     return out
 
 
-def _parse_workers(values: str) -> list[int]:
-    workers = []
-    for part in values.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        workers.append(max(1, int(part)))
-    if not workers:
-        workers = [1, 2, 4, 8]
-    if 1 not in workers:
-        workers.insert(0, 1)
-    # preserve order but dedupe
-    seen = set()
-    ordered = []
-    for w in workers:
-        if w in seen:
-            continue
-        seen.add(w)
-        ordered.append(w)
-    return ordered
-
-
 def _summary_fingerprint(summary: dict) -> dict:
     return {
         "total_towers": summary.get("total_towers"),
@@ -95,7 +71,7 @@ def _summary_fingerprint(summary: dict) -> dict:
 
 def run_probe(
     project_dir: Path,
-    workers: Iterable[int],
+    runs: int,
     output_dir: Path | None = None,
 ) -> dict:
     config_path = project_dir / "config.yaml"
@@ -125,27 +101,26 @@ def run_probe(
     boundary_geojson = _read_json(boundary_path)
     city_geojson = _read_json(city_path) if city_path and city_path.exists() else None
 
-    probe_root = output_dir or (project_dir / "parallel_probe")
+    probe_root = output_dir or (project_dir / "serial_probe")
     probe_root.mkdir(parents=True, exist_ok=True)
 
     report: dict = {
         "project_dir": str(project_dir),
-        "workers": list(workers),
-        "runs": {},
-        "diffs_vs_w1": {},
+        "runs": int(runs),
+        "executions": {},
+        "diffs_vs_run1": {},
     }
 
     baseline_fp = None
     baseline_hashes = None
 
-    for worker in workers:
-        run_dir = probe_root / f"workers_{worker}"
+    for run_idx in range(1, int(runs) + 1):
+        run_dir = probe_root / f"run_{run_idx}"
         debug_dir = run_dir / "debug_snapshots"
         run_dir.mkdir(parents=True, exist_ok=True)
         debug_dir.mkdir(parents=True, exist_ok=True)
 
         run_cfg = copy.deepcopy(mesh_config)
-        run_cfg.los_parallel_workers = int(worker)
 
         provider = GridProvider.from_bundle(str(bundle_path), elevation_path=str(elev_path))
         try:
@@ -173,14 +148,14 @@ def run_probe(
             )
         }
         fingerprint = _summary_fingerprint(summary)
-        report["runs"][str(worker)] = {
+        report["executions"][str(run_idx)] = {
             "summary": summary,
             "fingerprint": fingerprint,
             "artifact_hashes": artifact_hashes,
             "run_dir": str(run_dir),
         }
 
-        if worker == 1:
+        if run_idx == 1:
             baseline_fp = fingerprint
             baseline_hashes = artifact_hashes
             continue
@@ -189,9 +164,9 @@ def run_probe(
             "summary_fingerprint_diff": fingerprint != baseline_fp,
             "artifact_hash_diff": artifact_hashes != baseline_hashes,
         }
-        report["diffs_vs_w1"][str(worker)] = diffs
+        report["diffs_vs_run1"][str(run_idx)] = diffs
 
-    report_path = probe_root / "parallel_probe_report.json"
+    report_path = probe_root / "serial_probe_report.json"
     with report_path.open("w") as f:
         json.dump(report, f, indent=2)
     report["report_path"] = str(report_path)
@@ -200,7 +175,7 @@ def run_probe(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run serial-vs-parallel reproducibility probe on a project",
+        description="Run serial reproducibility probe on a project",
     )
     parser.add_argument(
         "--project-dir",
@@ -208,9 +183,10 @@ def main() -> None:
         help="Project directory containing config.yaml/routes.json/grid_bundle.json",
     )
     parser.add_argument(
-        "--workers",
-        default="1,2,4,8",
-        help="Comma-separated worker counts (default: 1,2,4,8)",
+        "--runs",
+        default=3,
+        type=int,
+        help="Number of serial repetitions (default: 3)",
     )
     parser.add_argument(
         "--output-dir",
@@ -221,13 +197,13 @@ def main() -> None:
 
     project_dir = Path(args.project_dir).resolve()
     output_dir = Path(args.output_dir).resolve() if args.output_dir else None
-    workers = _parse_workers(args.workers)
-    report = run_probe(project_dir, workers=workers, output_dir=output_dir)
+    runs = max(1, int(args.runs))
+    report = run_probe(project_dir, runs=runs, output_dir=output_dir)
     print(json.dumps(
         {
             "report_path": report.get("report_path"),
-            "workers": report.get("workers"),
-            "diffs_vs_w1": report.get("diffs_vs_w1", {}),
+            "runs": report.get("runs"),
+            "diffs_vs_run1": report.get("diffs_vs_run1", {}),
         },
         indent=2,
     ))

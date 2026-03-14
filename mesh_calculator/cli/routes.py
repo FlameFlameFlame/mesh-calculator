@@ -9,7 +9,7 @@ import logging
 
 import click
 
-from ..core.config import MeshConfig, RouteSpec
+from ..core.config import MeshConfig, RouteSpec, sanitize_mesh_parameters
 from ..core.grid_provider import GridProvider
 from ..logging_config import setup_logging
 from ..optimization.route_pipeline import run_route_pipeline
@@ -78,7 +78,10 @@ def routes_cmd(
         data = json.load(f)
 
     # Build MeshConfig from parameters section (all fields optional)
-    params = data.get('parameters', {})
+    params = sanitize_mesh_parameters(
+        data.get('parameters', {}),
+        source=f"routes.json ({routes_path})",
+    )
     mesh_config = MeshConfig(**{
         k: v for k, v in params.items()
         if k in MeshConfig.__dataclass_fields__

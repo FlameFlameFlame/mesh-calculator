@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import os
 import math
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Dict, Iterable, Optional, Union
 
@@ -406,18 +405,12 @@ def compute_h3_tower_coverage(
             entry[6] = dist_m
 
     if los_pairs:
-        max_workers = min(os.cpu_count() or 4, 32)
-        # Avoid one-future-per-pair overhead on large high-resolution runs.
-        batch_size = max(64, len(los_pairs) // max(max_workers * 8, 1))
-        batches = [
-            los_pairs[i:i + batch_size]
-            for i in range(0, len(los_pairs), batch_size)
-        ]
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(_check_pair_batch, b) for b in batches]
-            for future in as_completed(futures):
-                for ci, si, dist_m, clear_m, ploss_db in future.result():
-                    _accumulate_visible_result(ci, si, dist_m, clear_m, ploss_db)
+        for pair in los_pairs:
+            out = _check_pair(pair)
+            if out is None:
+                continue
+            ci, si, dist_m, clear_m, ploss_db = out
+            _accumulate_visible_result(ci, si, dist_m, clear_m, ploss_db)
 
     nearest_any: Dict[int, tuple[float, Union[int, str, None]]] = {}
     for ci, src_ids in enumerate(nearby_sources):

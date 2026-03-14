@@ -2,8 +2,6 @@
 Node placement along corridors with LOS constraints.
 """
 from typing import List, Dict, Optional
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import os
 import time
 import h3
 
@@ -21,6 +19,26 @@ from ..network.graph import MeshSurface, _los_decision_debug
 
 logger = structlog.get_logger(__name__)
 _GAP_REPAIR_WIGGLE_ROUNDS = 3
+_PARALLEL_HINT_WARNED = False
+
+
+def _warn_if_parallel_hint_requested(value: Optional[int], *, context: str) -> None:
+    global _PARALLEL_HINT_WARNED
+    if _PARALLEL_HINT_WARNED:
+        return
+    if value is None:
+        return
+    try:
+        requested = int(value)
+    except Exception:
+        requested = 2
+    if requested <= 1:
+        return
+    logger.warning(
+        "Parallel worker hint is deprecated and ignored in %s; running serially",
+        context,
+    )
+    _PARALLEL_HINT_WARNED = True
 
 
 def _record_los_diag(surface: MeshSurface, diagnostics: Optional[dict]) -> None:
@@ -125,16 +143,12 @@ def _effective_initial_search_radius_m(config: MeshConfig) -> float:
 
 
 def _resolve_prefilter_workers(
-    config: MeshConfig,
+    _config: MeshConfig,
     los_max_workers: Optional[int],
 ) -> int:
-    """Resolve worker count for DP pair prefiltering."""
-    if los_max_workers is not None:
-        return max(1, int(los_max_workers))
-    configured = getattr(config, "los_parallel_workers", None)
-    if configured is not None:
-        return max(1, int(configured))
-    return os.cpu_count() or 4
+    """Resolve worker hint for compatibility; prefilter now always runs serially."""
+    _warn_if_parallel_hint_requested(los_max_workers, context="DP prefilter")
+    return 1
 
 
 def _radius_to_ring_m(config: MeshConfig, radius_m: float, minimum: int = 0) -> int:
@@ -363,158 +377,43 @@ def _dp_place_towers_with_meta(
             feasible_pairs_by_i.setdefault(i, []).append((j, pair))
 
     source_indices = list(range(n - 1))
-    if prefilter_workers <= 1 or len(source_indices) < 16:
-        for i in source_indices:
-            _merge_row(_scan_source_row(i))
-            progress_pct = int(((i + 1) * 100) / total_sources)
-            if progress_pct >= next_progress_pct:
-                logger.debug(
-                    "DP prefilter progress",
-                    progress_pct=progress_pct,
-                    source_cells_scanned=i + 1,
-                    source_cells_total=total_sources,
-                    pairs_to_filter_total_upper_bound=total_pairs_upper_bound,
-                    pairs_processed=total_forward_pairs,
-                    pairs_remaining_to_filter=max(
-                        0, total_pairs_upper_bound - total_forward_pairs
-                    ),
-                    feasible_pairs=len(feasible_pairs_all),
-                    filtered_by_shadow=filtered_by_shadow,
-                    filtered_by_fspl=filtered_by_fspl,
-                    filtered_by_unfit=filtered_by_unfit,
-                    filtered_by_distance=filtered_by_distance,
-                    reused_from_memo=reused_from_memo,
-                )
-                next_progress_pct += 1
-            if progress_pct >= next_info_progress_pct:
-                logger.info(
-                    "DP cell-pair prefilter progress",
-                    progress_pct=progress_pct,
-                    source_cells_scanned=i + 1,
-                    source_cells_total=total_sources,
-                    pairs_processed=total_forward_pairs,
-                    feasible_pairs=len(feasible_pairs_all),
-                    filtered_by_shadow=filtered_by_shadow,
-                    filtered_by_fspl=filtered_by_fspl,
-                    filtered_by_unfit=filtered_by_unfit,
-                    filtered_by_distance=filtered_by_distance,
-                    reused_from_memo=reused_from_memo,
-                )
-                next_info_progress_pct += 10
-    else:
-        try:
-            rows_by_i: dict[int, dict] = {}
-            completed = 0
-            progress_forward_pairs = 0
-            progress_filtered_distance = 0
-            progress_filtered_fspl = 0
-            progress_filtered_unfit = 0
-            progress_filtered_shadow = 0
-            progress_reused = 0
-            with ThreadPoolExecutor(max_workers=prefilter_workers) as executor:
-                futures = {executor.submit(_scan_source_row, i): i for i in source_indices}
-                for future in as_completed(futures):
-                    row = future.result()
-                    rows_by_i[row["i"]] = row
-                    completed += 1
-                    progress_forward_pairs += int(row["forward_pairs"])
-                    progress_filtered_distance += int(row["filtered_distance"])
-                    progress_filtered_fspl += int(row["filtered_fspl"])
-                    progress_filtered_unfit += int(row["filtered_unfit"])
-                    progress_filtered_shadow += int(row["filtered_shadow"])
-                    progress_reused += int(row["reused"])
-                    progress_pct = int((completed * 100) / total_sources)
-                    if progress_pct >= next_progress_pct:
-                        logger.debug(
-                            "DP prefilter progress",
-                            progress_pct=progress_pct,
-                            source_cells_scanned=completed,
-                            source_cells_total=total_sources,
-                            pairs_to_filter_total_upper_bound=total_pairs_upper_bound,
-                            pairs_processed=progress_forward_pairs,
-                            pairs_remaining_to_filter=max(
-                                0, total_pairs_upper_bound - progress_forward_pairs
-                            ),
-                            feasible_pairs=len(feasible_pairs_all),
-                            filtered_by_shadow=progress_filtered_shadow,
-                            filtered_by_fspl=progress_filtered_fspl,
-                            filtered_by_unfit=progress_filtered_unfit,
-                            filtered_by_distance=progress_filtered_distance,
-                            reused_from_memo=progress_reused,
-                            workers=prefilter_workers,
-                        )
-                        next_progress_pct += 1
-                    if progress_pct >= next_info_progress_pct:
-                        logger.info(
-                            "DP cell-pair prefilter progress",
-                            progress_pct=progress_pct,
-                            source_cells_scanned=completed,
-                            source_cells_total=total_sources,
-                            pairs_processed=progress_forward_pairs,
-                            feasible_pairs=len(feasible_pairs_all),
-                            filtered_by_shadow=progress_filtered_shadow,
-                            filtered_by_fspl=progress_filtered_fspl,
-                            filtered_by_unfit=progress_filtered_unfit,
-                            filtered_by_distance=progress_filtered_distance,
-                            reused_from_memo=progress_reused,
-                            workers=prefilter_workers,
-                        )
-                        next_info_progress_pct += 10
-            for i in source_indices:
-                row = rows_by_i.get(i)
-                if row is not None:
-                    _merge_row(row)
-        except Exception:
-            logger.warning(
-                "DP prefilter parallel execution failed; falling back to serial prefilter",
-                exc_info=True,
+    for i in source_indices:
+        _merge_row(_scan_source_row(i))
+        progress_pct = int(((i + 1) * 100) / total_sources)
+        if progress_pct >= next_progress_pct:
+            logger.debug(
+                "DP prefilter progress",
+                progress_pct=progress_pct,
+                source_cells_scanned=i + 1,
+                source_cells_total=total_sources,
+                pairs_to_filter_total_upper_bound=total_pairs_upper_bound,
+                pairs_processed=total_forward_pairs,
+                pairs_remaining_to_filter=max(
+                    0, total_pairs_upper_bound - total_forward_pairs
+                ),
+                feasible_pairs=len(feasible_pairs_all),
+                filtered_by_shadow=filtered_by_shadow,
+                filtered_by_fspl=filtered_by_fspl,
+                filtered_by_unfit=filtered_by_unfit,
+                filtered_by_distance=filtered_by_distance,
+                reused_from_memo=reused_from_memo,
             )
-            feasible_pairs_all.clear()
-            feasible_pairs_by_i.clear()
-            total_forward_pairs = 0
-            filtered_by_distance = 0
-            filtered_by_fspl = 0
-            filtered_by_unfit = 0
-            filtered_by_shadow = 0
-            reused_from_memo = 0
-            next_progress_pct = 1
-            for i in source_indices:
-                _merge_row(_scan_source_row(i))
-                progress_pct = int(((i + 1) * 100) / total_sources)
-                if progress_pct >= next_progress_pct:
-                    logger.debug(
-                        "DP prefilter progress",
-                        progress_pct=progress_pct,
-                        source_cells_scanned=i + 1,
-                        source_cells_total=total_sources,
-                        pairs_to_filter_total_upper_bound=total_pairs_upper_bound,
-                        pairs_processed=total_forward_pairs,
-                        pairs_remaining_to_filter=max(
-                            0, total_pairs_upper_bound - total_forward_pairs
-                        ),
-                        feasible_pairs=len(feasible_pairs_all),
-                        filtered_by_shadow=filtered_by_shadow,
-                        filtered_by_fspl=filtered_by_fspl,
-                        filtered_by_unfit=filtered_by_unfit,
-                        filtered_by_distance=filtered_by_distance,
-                        reused_from_memo=reused_from_memo,
-                    )
-                    next_progress_pct += 1
-                if progress_pct >= next_info_progress_pct:
-                    logger.info(
-                        "DP cell-pair prefilter progress",
-                        progress_pct=progress_pct,
-                        source_cells_scanned=i + 1,
-                        source_cells_total=total_sources,
-                        pairs_processed=total_forward_pairs,
-                        feasible_pairs=len(feasible_pairs_all),
-                        filtered_by_shadow=filtered_by_shadow,
-                        filtered_by_fspl=filtered_by_fspl,
-                        filtered_by_unfit=filtered_by_unfit,
-                        filtered_by_distance=filtered_by_distance,
-                        reused_from_memo=reused_from_memo,
-                    )
-                    next_info_progress_pct += 10
+            next_progress_pct += 1
+        if progress_pct >= next_info_progress_pct:
+            logger.info(
+                "DP cell-pair prefilter progress",
+                progress_pct=progress_pct,
+                source_cells_scanned=i + 1,
+                source_cells_total=total_sources,
+                pairs_processed=total_forward_pairs,
+                feasible_pairs=len(feasible_pairs_all),
+                filtered_by_shadow=filtered_by_shadow,
+                filtered_by_fspl=filtered_by_fspl,
+                filtered_by_unfit=filtered_by_unfit,
+                filtered_by_distance=filtered_by_distance,
+                reused_from_memo=reused_from_memo,
+            )
+            next_info_progress_pct += 10
 
     logger.debug(
         "DP pair prefilter summary",
@@ -1309,11 +1208,8 @@ def place_nodes_along_corridor(
     config = surface.config
     cells = surface.cells
     from ..core.geometry import h3_distance
-    effective_los_workers = (
-        config.los_parallel_workers
-        if los_max_workers is None
-        else los_max_workers
-    )
+    _warn_if_parallel_hint_requested(los_max_workers, context="corridor placement")
+    effective_los_workers = 1
     placement_progress = 0.0
 
     def _emit_progress(step: str) -> None:

@@ -314,12 +314,10 @@ class TestLOSBatchExecution(unittest.TestCase):
         self.assertEqual(results[("a", "b")].distance_m, 1000.0)
         self.assertEqual(results[("b", "c")].distance_m, 2000.0)
 
-    @patch('mesh_calculator.parallel.los_compute.ThreadPoolExecutor')
     @patch('mesh_calculator.parallel.los_compute.compute_los')
     def test_batch_can_force_serial_mode_via_threshold(
         self,
         mock_compute_los,
-        mock_pool,
     ):
         mock_compute_los.return_value = LOSResult(
             clearance_m=5.0,
@@ -338,7 +336,6 @@ class TestLOSBatchExecution(unittest.TestCase):
 
         self.assertEqual(set(results.keys()), set(pairs))
         self.assertEqual(mock_compute_los.call_count, 1)
-        mock_pool.assert_not_called()
 
     @patch('mesh_calculator.parallel.los_compute.compute_los')
     def test_batch_parallel_matches_serial_exactly(self, mock_compute_los):

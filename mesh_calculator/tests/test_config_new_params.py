@@ -45,14 +45,6 @@ class TestMeshConfigDefaults(unittest.TestCase):
         config = MeshConfig(min_fresnel_clearance_m=0.0)
         self.assertEqual(config.min_fresnel_clearance_m, 0.0)
 
-    def test_los_parallel_workers_default_is_none(self):
-        config = MeshConfig()
-        self.assertIsNone(config.los_parallel_workers)
-
-    def test_los_parallel_workers_can_be_set(self):
-        config = MeshConfig(los_parallel_workers=4)
-        self.assertEqual(config.los_parallel_workers, 4)
-
     def test_dp_buffer_candidates_max_per_segment_default_is_none(self):
         config = MeshConfig()
         self.assertIsNone(config.dp_buffer_candidates_max_per_segment)
@@ -120,7 +112,6 @@ class TestMeshCalculatorConfigFromDict(unittest.TestCase):
                 'min_fresnel_clearance_m': -1.5,
                 'mast_height_m': 35.0,
                 'routing_k_ring': 3,
-                'los_parallel_workers': 6,
             }
         }
         cfg = MeshCalculatorConfig.from_dict(d)
@@ -130,7 +121,14 @@ class TestMeshCalculatorConfigFromDict(unittest.TestCase):
         self.assertEqual(cfg.parameters.min_fresnel_clearance_m, -1.5)
         self.assertEqual(cfg.parameters.mast_height_m, 35.0)
         self.assertEqual(cfg.parameters.routing_k_ring, 3)
-        self.assertEqual(cfg.parameters.los_parallel_workers, 6)
+
+    def test_deprecated_los_parallel_workers_is_ignored_with_warning(self):
+        d = {'parameters': {'los_parallel_workers': 6, 'mast_height_m': 35.0}}
+        with self.assertLogs('mesh_calculator.core.config', level='WARNING') as logs:
+            cfg = MeshCalculatorConfig.from_dict(d)
+        self.assertEqual(cfg.parameters.mast_height_m, 35.0)
+        self.assertNotIn('los_parallel_workers', MeshConfig.__dataclass_fields__)
+        self.assertIn('los_parallel_workers', '\n'.join(logs.output))
 
     def test_legacy_output_tower_coverage_key_is_ignored(self):
         d = {

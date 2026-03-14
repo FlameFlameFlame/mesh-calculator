@@ -257,7 +257,7 @@ class TestCellCoverage(unittest.TestCase):
 
 
 class TestHierarchicalNestedLOSWorkers(unittest.TestCase):
-    """Hierarchical outer thread pools should force inner LOS workers to 1."""
+    """Hierarchical connectivity should pass serial LOS hints into placement."""
 
     @patch('mesh_calculator.optimization.hierarchical.wire_corridor_edges')
     @patch('mesh_calculator.optimization.hierarchical.place_nodes_along_corridor')
@@ -269,7 +269,7 @@ class TestHierarchicalNestedLOSWorkers(unittest.TestCase):
         mock_wire,
     ):
         cells = make_cells(['p1_cell', 'p2_cell'])
-        config = MeshConfig(los_parallel_workers=8)
+        config = MeshConfig()
         surface = MeshSurface(cells, config)
         routing_graph = nx.DiGraph()
         sites = [
@@ -285,7 +285,7 @@ class TestHierarchicalNestedLOSWorkers(unittest.TestCase):
 
         self.assertGreaterEqual(mock_place_nodes.call_count, 1)
         for call in mock_place_nodes.call_args_list:
-            self.assertEqual(call.kwargs.get('los_max_workers'), 1)
+            self.assertNotIn('los_max_workers', call.kwargs)
 
     @patch('mesh_calculator.optimization.hierarchical.wire_corridor_edges')
     @patch('mesh_calculator.optimization.hierarchical.place_nodes_along_corridor')
@@ -297,7 +297,7 @@ class TestHierarchicalNestedLOSWorkers(unittest.TestCase):
         mock_wire,
     ):
         cells = make_cells(['a', 'b'])
-        config = MeshConfig(los_parallel_workers=8)
+        config = MeshConfig()
         surface = MeshSurface(cells, config)
         routing_graph = nx.DiGraph()
         sites = [
@@ -313,4 +313,4 @@ class TestHierarchicalNestedLOSWorkers(unittest.TestCase):
 
         self.assertGreaterEqual(mock_place_nodes.call_count, 1)
         for call in mock_place_nodes.call_args_list:
-            self.assertEqual(call.kwargs.get('los_max_workers'), 1)
+            self.assertNotIn('los_max_workers', call.kwargs)

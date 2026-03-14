@@ -1,7 +1,6 @@
 """
 LOS calculation cache management.
 """
-import threading
 from dataclasses import dataclass
 from typing import Dict, Tuple, Optional
 
@@ -25,15 +24,14 @@ class LOSResult:
 
 class LOSCache:
     """
-    Thread-safe cache for LOS calculations.
+    Cache for LOS calculations.
 
     Caches results to avoid redundant expensive Fresnel clearance calculations.
     """
 
     def __init__(self):
-        """Initialize empty cache with thread lock."""
+        """Initialize empty cache."""
         self._cache: Dict[Tuple, LOSResult] = {}
-        self._lock = threading.Lock()
         self._hits = 0
         self._misses = 0
 
@@ -142,13 +140,12 @@ class LOSCache:
             src_lat, src_lon, dst_lat, dst_lon,
         )
 
-        with self._lock:
-            result = self._cache.get(key)
-            if result is not None:
-                self._hits += 1
-            else:
-                self._misses += 1
-            return result
+        result = self._cache.get(key)
+        if result is not None:
+            self._hits += 1
+        else:
+            self._misses += 1
+        return result
 
     def put(
         self,
@@ -194,8 +191,7 @@ class LOSCache:
             src_lat, src_lon, dst_lat, dst_lon,
         )
 
-        with self._lock:
-            self._cache[key] = result
+        self._cache[key] = result
 
     def stats(self) -> dict:
         """
@@ -204,22 +200,20 @@ class LOSCache:
         Returns:
             Dictionary with hits, misses, size, and hit rate
         """
-        with self._lock:
-            total = self._hits + self._misses
-            hit_rate = self._hits / total if total > 0 else 0.0
+        total = self._hits + self._misses
+        hit_rate = self._hits / total if total > 0 else 0.0
 
-            return {
-                'size': len(self._cache),
-                'hits': self._hits,
-                'misses': self._misses,
-                'total_queries': total,
-                'hit_rate': hit_rate,
-                'memory_mb': len(self._cache) * 64 / (1024 * 1024),  # Approx
-            }
+        return {
+            'size': len(self._cache),
+            'hits': self._hits,
+            'misses': self._misses,
+            'total_queries': total,
+            'hit_rate': hit_rate,
+            'memory_mb': len(self._cache) * 64 / (1024 * 1024),  # Approx
+        }
 
     def clear(self):
         """Clear the cache."""
-        with self._lock:
-            self._cache.clear()
-            self._hits = 0
-            self._misses = 0
+        self._cache.clear()
+        self._hits = 0
+        self._misses = 0

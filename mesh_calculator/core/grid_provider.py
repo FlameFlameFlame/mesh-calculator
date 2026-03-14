@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 import os
 import hashlib
-import threading
 import math
 from functools import lru_cache
 from typing import Dict, Iterable, Optional
@@ -155,7 +154,6 @@ class GridProvider:
         self._cell_static_by_res: Dict[int, dict[str, dict[str, float]]] = cell_static_by_res or {}
         self._cell_cache_by_res: Dict[int, Dict[str, H3Cell]] = {}
         self._adaptive_mesh_cache: Dict[tuple, dict] = {}
-        self._lock = threading.Lock()
         self._roads_gdf_cache = None
 
     @classmethod
@@ -876,18 +874,17 @@ class GridProvider:
             res = int(h3.get_resolution(h3_index))
         except Exception:
             res = int(config.h3_resolution)
-        with self._lock:
-            by_res = self._cell_cache_by_res.setdefault(res, {})
-            cell = by_res.get(h3_index)
-            if cell is not None:
-                cell.has_road = bool(cell.has_road or has_road)
-                cell.is_in_boundary = bool(cell.is_in_boundary or is_in_boundary)
-                meta = self.get_adaptive_cell_metadata(h3_index, config.h3_resolution, config)
-                setattr(cell, "base_h3_resolution", meta["base_h3_resolution"])
-                setattr(cell, "target_h3_resolution", meta["target_h3_resolution"])
-                setattr(cell, "gradient_m_per_km", meta["gradient_m_per_km"])
-                setattr(cell, "adaptive_refined", meta["adaptive_refined"])
-                return cell
+        by_res = self._cell_cache_by_res.setdefault(res, {})
+        cell = by_res.get(h3_index)
+        if cell is not None:
+            cell.has_road = bool(cell.has_road or has_road)
+            cell.is_in_boundary = bool(cell.is_in_boundary or is_in_boundary)
+            meta = self.get_adaptive_cell_metadata(h3_index, config.h3_resolution, config)
+            setattr(cell, "base_h3_resolution", meta["base_h3_resolution"])
+            setattr(cell, "target_h3_resolution", meta["target_h3_resolution"])
+            setattr(cell, "gradient_m_per_km", meta["gradient_m_per_km"])
+            setattr(cell, "adaptive_refined", meta["adaptive_refined"])
+            return cell
         lat, lon = h3.cell_to_latlng(h3_index)
         static = self._cell_static_by_res.get(res, {}).get(h3_index)
         if static is not None:
@@ -917,19 +914,18 @@ class GridProvider:
         setattr(cell, "target_h3_resolution", meta["target_h3_resolution"])
         setattr(cell, "gradient_m_per_km", meta["gradient_m_per_km"])
         setattr(cell, "adaptive_refined", meta["adaptive_refined"])
-        with self._lock:
-            by_res = self._cell_cache_by_res.setdefault(res, {})
-            prev = by_res.get(h3_index)
-            if prev is not None:
-                prev.has_road = bool(prev.has_road or has_road)
-                prev.is_in_boundary = bool(prev.is_in_boundary or is_in_boundary)
-                meta = self.get_adaptive_cell_metadata(h3_index, config.h3_resolution, config)
-                setattr(prev, "base_h3_resolution", meta["base_h3_resolution"])
-                setattr(prev, "target_h3_resolution", meta["target_h3_resolution"])
-                setattr(prev, "gradient_m_per_km", meta["gradient_m_per_km"])
-                setattr(prev, "adaptive_refined", meta["adaptive_refined"])
-                return prev
-            by_res[h3_index] = cell
+        by_res = self._cell_cache_by_res.setdefault(res, {})
+        prev = by_res.get(h3_index)
+        if prev is not None:
+            prev.has_road = bool(prev.has_road or has_road)
+            prev.is_in_boundary = bool(prev.is_in_boundary or is_in_boundary)
+            meta = self.get_adaptive_cell_metadata(h3_index, config.h3_resolution, config)
+            setattr(prev, "base_h3_resolution", meta["base_h3_resolution"])
+            setattr(prev, "target_h3_resolution", meta["target_h3_resolution"])
+            setattr(prev, "gradient_m_per_km", meta["gradient_m_per_km"])
+            setattr(prev, "adaptive_refined", meta["adaptive_refined"])
+            return prev
+        by_res[h3_index] = cell
         return cell
 
     def materialize_cells(
@@ -960,27 +956,26 @@ class GridProvider:
                 res = int(config.h3_resolution)
             has_road = h3_idx in road_set
 
-            with self._lock:
-                by_res = self._cell_cache_by_res.setdefault(res, {})
-                cell = by_res.get(h3_idx)
-                if cell is not None:
-                    cell.has_road = bool(cell.has_road or has_road)
-                    cell.is_in_boundary = bool(cell.is_in_boundary or is_in_boundary)
-                    meta = adaptive_meta.get(h3_idx)
-                    if meta is None:
-                        meta = {
-                            "base_h3_resolution": int(config.h3_resolution),
-                            "target_h3_resolution": int(h3.get_resolution(h3_idx)),
-                            "gradient_m_per_km": 0.0,
-                            "adaptive_refined": False,
-                        }
-                    setattr(cell, "base_h3_resolution", meta["base_h3_resolution"])
-                    setattr(cell, "target_h3_resolution", meta["target_h3_resolution"])
-                    setattr(cell, "gradient_m_per_km", meta["gradient_m_per_km"])
-                    setattr(cell, "adaptive_refined", meta["adaptive_refined"])
-                    out[h3_idx] = cell
-                    stats["cache_hits"] += 1
-                    continue
+            by_res = self._cell_cache_by_res.setdefault(res, {})
+            cell = by_res.get(h3_idx)
+            if cell is not None:
+                cell.has_road = bool(cell.has_road or has_road)
+                cell.is_in_boundary = bool(cell.is_in_boundary or is_in_boundary)
+                meta = adaptive_meta.get(h3_idx)
+                if meta is None:
+                    meta = {
+                        "base_h3_resolution": int(config.h3_resolution),
+                        "target_h3_resolution": int(h3.get_resolution(h3_idx)),
+                        "gradient_m_per_km": 0.0,
+                        "adaptive_refined": False,
+                    }
+                setattr(cell, "base_h3_resolution", meta["base_h3_resolution"])
+                setattr(cell, "target_h3_resolution", meta["target_h3_resolution"])
+                setattr(cell, "gradient_m_per_km", meta["gradient_m_per_km"])
+                setattr(cell, "adaptive_refined", meta["adaptive_refined"])
+                out[h3_idx] = cell
+                stats["cache_hits"] += 1
+                continue
 
             lat, lon = h3.cell_to_latlng(h3_idx)
             static = self._cell_static_by_res.get(res, {}).get(h3_idx)
@@ -1021,9 +1016,8 @@ class GridProvider:
             setattr(cell, "gradient_m_per_km", meta["gradient_m_per_km"])
             setattr(cell, "adaptive_refined", meta["adaptive_refined"])
 
-            with self._lock:
-                by_res = self._cell_cache_by_res.setdefault(res, {})
-                by_res[h3_idx] = cell
+            by_res = self._cell_cache_by_res.setdefault(res, {})
+            by_res[h3_idx] = cell
             out[h3_idx] = cell
 
         if include_stats:
