@@ -2,6 +2,7 @@
 Elevation data handling with caching for mesh calculator.
 """
 import warnings
+import threading
 from typing import Optional, Tuple
 import h3
 import rasterio
@@ -41,6 +42,7 @@ class ElevationProvider:
         self._cell_max_cache = {}
         self._cell_anchor_cache = {}
         self._line_peak_cache = {}
+        self._lock = threading.RLock()
         self._data = None  # Lazy-loaded full band array
         self._nodata = self.dataset.nodata
 
@@ -258,6 +260,17 @@ class ElevationProvider:
             return None
         return float(np.max(values))
 
+    def _read_band_window(self, window: Window) -> np.ma.MaskedArray:
+        """Read a masked raster window, guarding against missing lock state."""
+        lock = getattr(self, "_lock", None)
+        if lock is None:
+            return self.dataset.read(1, window=window, masked=True)
+        try:
+            with lock:
+                return self.dataset.read(1, window=window, masked=True)
+        except Exception:
+            return self.dataset.read(1, window=window, masked=True)
+
     @staticmethod
     def _line_fraction(
         src_lat: float,
@@ -298,8 +311,7 @@ class ElevationProvider:
                 self._cell_max_cache[h3_index] = 0.0
                 return 0.0
 
-            with self._lock:
-                band = self.dataset.read(1, window=win, masked=True)
+            band = self._read_band_window(win)
             w_transform = window_transform(win, self.transform)
             inside = geometry_mask(
                 [mapping(polygon)],
@@ -390,8 +402,7 @@ class ElevationProvider:
         win = self._clip_window(raw_window)
         if win is None:
             return None
-        with self._lock:
-            band = self.dataset.read(1, window=win, masked=True)
+        band = self._read_band_window(win)
         w_transform = window_transform(win, self.transform)
         inside = geometry_mask(
             [mapping(polygon)],
@@ -517,8 +528,7 @@ class ElevationProvider:
                         else:
                             cached = (float(elev_b), float(b_lat), float(b_lon), 1.0)
                     else:
-                        with self._lock:
-                            band = self.dataset.read(1, window=win, masked=True)
+                        band = self._read_band_window(win)
                         w_transform = window_transform(win, self.transform)
                         with warnings.catch_warnings():
                             warnings.filterwarnings(

@@ -604,14 +604,180 @@ class TestGapRepairWiggleRounds(unittest.TestCase):
         self.assertEqual(round_radii.count(150.0), 2)
 
 
-class TestCorridorBatchAdoption(unittest.TestCase):
-    """Corridor internals should route LOS work through compute_los_batch."""
+class TestDPPrefilterPolicy(unittest.TestCase):
+    """Corridor DP internals and prefilter policy behavior."""
 
     def setUp(self):
         self.config = MeshConfig(
             mast_height_m=10.0,
             max_towers_per_route=100,
         )
+
+    @patch('mesh_calculator.optimization.corridor.compute_los_batch')
+    @patch('mesh_calculator.optimization.corridor.fspl_only', return_value=0.0)
+    @patch('mesh_calculator.optimization.corridor._terrain_shadow_prefilter_rejects', return_value=False)
+    @patch('mesh_calculator.core.geometry.h3_distance', return_value=1000.0)
+    def test_large_corridor_skips_shadow_prefilter(
+        self,
+        _mock_distance,
+        mock_shadow,
+        _mock_fspl,
+        mock_batch,
+    ):
+        corridor = make_corridor(317)  # 50,086 pairs (>50,000 threshold)
+        cells = make_cells(317)
+        surface = MeshSurface(cells, self.config, elevation_provider=object())
+
+        def _batch_side_effect(pairs, *_args, **_kwargs):
+            return {
+                pair: LOSResult(
+                    clearance_m=10.0,
+                    path_loss_db=80.0,
+                    distance_m=1000.0,
+                    is_visible=True,
+                )
+                for pair in pairs
+            }
+
+        mock_batch.side_effect = _batch_side_effect
+        result = corridor_mod._dp_place_towers_with_meta(
+            corridor, surface, None, 4, attempt_id=0, los_max_workers=1
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(mock_shadow.call_count, 0)
+
+    @patch('mesh_calculator.optimization.corridor.compute_los_batch')
+    @patch('mesh_calculator.optimization.corridor.fspl_only', return_value=0.0)
+    @patch('mesh_calculator.optimization.corridor._terrain_shadow_prefilter_rejects', return_value=False)
+    @patch('mesh_calculator.core.geometry.h3_distance', return_value=1000.0)
+    def test_small_corridor_uses_shadow_prefilter(
+        self,
+        _mock_distance,
+        mock_shadow,
+        _mock_fspl,
+        mock_batch,
+    ):
+        corridor = make_corridor(10)
+        cells = make_cells(10)
+        surface = MeshSurface(cells, self.config, elevation_provider=object())
+
+        def _batch_side_effect(pairs, *_args, **_kwargs):
+            return {
+                pair: LOSResult(
+                    clearance_m=10.0,
+                    path_loss_db=80.0,
+                    distance_m=1000.0,
+                    is_visible=True,
+                )
+                for pair in pairs
+            }
+
+        mock_batch.side_effect = _batch_side_effect
+        result = corridor_mod._dp_place_towers_with_meta(
+            corridor, surface, None, 4, attempt_id=0, los_max_workers=1
+        )
+
+        self.assertIsNotNone(result)
+        self.assertGreater(mock_shadow.call_count, 0)
+
+    @patch('mesh_calculator.optimization.corridor.compute_los_batch')
+    @patch('mesh_calculator.optimization.corridor.fspl_only', return_value=0.0)
+    @patch('mesh_calculator.optimization.corridor._terrain_shadow_prefilter_rejects', return_value=False)
+    @patch('mesh_calculator.core.geometry.h3_distance', return_value=1000.0)
+    def test_fallback_attempt_skips_shadow_prefilter(
+        self,
+        _mock_distance,
+        mock_shadow,
+        _mock_fspl,
+        mock_batch,
+    ):
+        corridor = make_corridor(10)
+        cells = make_cells(10)
+        surface = MeshSurface(cells, self.config, elevation_provider=object())
+
+        def _batch_side_effect(pairs, *_args, **_kwargs):
+            return {
+                pair: LOSResult(
+                    clearance_m=10.0,
+                    path_loss_db=80.0,
+                    distance_m=1000.0,
+                    is_visible=True,
+                )
+                for pair in pairs
+            }
+
+        mock_batch.side_effect = _batch_side_effect
+        result = corridor_mod._dp_place_towers_with_meta(
+            corridor, surface, None, 4, attempt_id=1, los_max_workers=1
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(mock_shadow.call_count, 0)
+
+    @patch('mesh_calculator.optimization.corridor.compute_los_batch')
+    @patch('mesh_calculator.optimization.corridor.fspl_only', return_value=0.0)
+    @patch('mesh_calculator.optimization.corridor._terrain_shadow_prefilter_rejects', return_value=False)
+    @patch('mesh_calculator.core.geometry.h3_distance', return_value=1000.0)
+    def test_prefilter_memos_reused_across_reruns(
+        self,
+        mock_distance,
+        mock_shadow,
+        _mock_fspl,
+        mock_batch,
+    ):
+        corridor = make_corridor(6)
+        cells = make_cells(6)
+        surface = MeshSurface(cells, self.config, elevation_provider=object())
+
+        def _batch_side_effect(pairs, *_args, **_kwargs):
+            return {
+                pair: LOSResult(
+                    clearance_m=10.0,
+                    path_loss_db=80.0,
+                    distance_m=1000.0,
+                    is_visible=True,
+                )
+                for pair in pairs
+            }
+
+        mock_batch.side_effect = _batch_side_effect
+        shared_los_memo = {}
+        pair_distance_memo = {}
+        shadow_reject_memo = {}
+
+        first = corridor_mod._dp_place_towers_with_meta(
+            corridor,
+            surface,
+            None,
+            4,
+            attempt_id=0,
+            los_max_workers=1,
+            los_pair_memo=shared_los_memo,
+            pair_distance_memo=pair_distance_memo,
+            shadow_reject_memo=shadow_reject_memo,
+        )
+        first_distance_calls = mock_distance.call_count
+        first_shadow_calls = mock_shadow.call_count
+
+        second = corridor_mod._dp_place_towers_with_meta(
+            corridor,
+            surface,
+            None,
+            4,
+            attempt_id=0,
+            los_max_workers=1,
+            los_pair_memo=shared_los_memo,
+            pair_distance_memo=pair_distance_memo,
+            shadow_reject_memo=shadow_reject_memo,
+        )
+        second_distance_delta = mock_distance.call_count - first_distance_calls
+        second_shadow_delta = mock_shadow.call_count - first_shadow_calls
+
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        self.assertEqual(second_distance_delta, 0)
+        self.assertEqual(second_shadow_delta, 0)
 
     @patch('mesh_calculator.optimization.corridor.compute_los')
     @patch('mesh_calculator.optimization.corridor.compute_los_batch')
@@ -637,7 +803,7 @@ class TestCorridorBatchAdoption(unittest.TestCase):
 
         mock_batch.side_effect = _batch_side_effect
         result = corridor_mod._dp_place_towers_with_meta(
-            corridor, surface, None, 4, los_max_workers=2
+            corridor, surface, None, 4, attempt_id=0, los_max_workers=2
         )
 
         self.assertIsNotNone(result)
@@ -670,7 +836,7 @@ class TestCorridorBatchAdoption(unittest.TestCase):
         mock_batch.side_effect = _batch_side_effect
 
         result = corridor_mod._dp_place_towers_with_meta(
-            corridor, surface, None, 5, los_max_workers=2
+            corridor, surface, None, 5, attempt_id=0, los_max_workers=2
         )
         self.assertIsNotNone(result)
         self.assertEqual(result[0], ["cell_0", "cell_4"])
@@ -707,7 +873,7 @@ class TestCorridorBatchAdoption(unittest.TestCase):
         mock_batch.side_effect = _batch_side_effect
 
         result = corridor_mod._dp_place_towers_with_meta(
-            corridor, surface, None, 4, los_max_workers=1
+            corridor, surface, None, 4, attempt_id=0, los_max_workers=1
         )
         self.assertIsNotNone(result)
         self.assertEqual(mock_batch.call_count, 1)
@@ -747,7 +913,7 @@ class TestCorridorBatchAdoption(unittest.TestCase):
         mock_batch.side_effect = _batch_side_effect
 
         result = corridor_mod._dp_place_towers_with_meta(
-            corridor, surface, None, 4, los_max_workers=1
+            corridor, surface, None, 4, attempt_id=0, los_max_workers=1
         )
         self.assertIsNotNone(result)
         self.assertEqual(mock_batch.call_count, 1)
@@ -786,6 +952,7 @@ class TestCorridorBatchAdoption(unittest.TestCase):
             surface,
             None,
             4,
+            attempt_id=0,
             los_max_workers=2,
             los_pair_memo=shared_memo,
         )
@@ -794,6 +961,7 @@ class TestCorridorBatchAdoption(unittest.TestCase):
             surface,
             None,
             4,
+            attempt_id=0,
             los_max_workers=2,
             los_pair_memo=shared_memo,
         )
@@ -835,7 +1003,7 @@ class TestCorridorBatchAdoption(unittest.TestCase):
         mock_batch.side_effect = _batch_side_effect
 
         result = corridor_mod._dp_place_towers_with_meta(
-            corridor, surface, None, 3, los_max_workers=1
+            corridor, surface, None, 3, attempt_id=0, los_max_workers=1
         )
 
         self.assertIsNotNone(result)

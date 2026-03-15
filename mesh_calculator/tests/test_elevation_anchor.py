@@ -6,6 +6,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+import math
 
 import h3
 import numpy as np
@@ -147,6 +148,42 @@ class TestElevationAnchor(unittest.TestCase):
         provider.get_h3_cell_anchor_point(h3_idx, margin_m=10.0)
         provider.get_h3_cell_anchor_point(h3_idx, margin_m=10.0)
         self.assertEqual(calls["count"], 1)
+
+    def test_lockless_regression_paths_do_not_fail(self):
+        h3_idx = h3.latlng_to_cell(40.0, 44.0, 10)
+        lat_c, lon_c = h3.cell_to_latlng(h3_idx)
+        neighbor = next(nb for nb in h3.grid_disk(h3_idx, 1) if nb != h3_idx)
+        n_lat, n_lon = h3.cell_to_latlng(neighbor)
+
+        tif_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tif_dir.cleanup)
+        tif_path = Path(tif_dir.name) / "dem.tif"
+        _make_dem(
+            tif_path,
+            width=900,
+            height=900,
+            west=min(lon_c, n_lon) - 0.02,
+            north=max(lat_c, n_lat) + 0.02,
+            pixel_deg=0.00005,
+        )
+        _set_pixel(tif_path, lat_c, lon_c, 400.0)
+        _set_pixel(tif_path, n_lat, n_lon, 420.0)
+
+        provider = ElevationProvider(str(tif_path))
+        self.addCleanup(provider.close)
+
+        # Regression guard: methods must still work if lock attribute is absent.
+        delattr(provider, "_lock")
+
+        max_elev = provider.get_h3_cell_max_elevation(h3_idx)
+        anchor = provider.get_h3_cell_anchor_point(h3_idx, margin_m=10.0)
+        peak = provider.get_line_peak_elevation(lat_c, lon_c, n_lat, n_lon)
+
+        self.assertTrue(math.isfinite(max_elev))
+        self.assertEqual(len(anchor), 3)
+        self.assertTrue(all(math.isfinite(float(v)) for v in anchor))
+        self.assertEqual(len(peak), 4)
+        self.assertTrue(all(math.isfinite(float(v)) for v in peak))
 
 
 if __name__ == "__main__":

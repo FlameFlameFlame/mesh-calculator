@@ -228,9 +228,12 @@ def _dp_place_towers_with_meta(
     surface: MeshSurface,
     cache: LOSCache,
     k: int,
+    attempt_id: int,
     los_max_workers: Optional[int] = None,
     los_progress_callback=None,
     los_pair_memo: Optional[Dict[tuple[str, str], LOSResult]] = None,
+    pair_distance_memo: Optional[Dict[tuple[str, str], float]] = None,
+    shadow_reject_memo: Optional[Dict[tuple[str, str], bool]] = None,
 ) -> Optional[tuple]:
     """
     Optimal tower placement using MaxMin Bottleneck Path DP.
@@ -249,6 +252,7 @@ def _dp_place_towers_with_meta(
         surface:  MeshSurface (provides cells, config, elevation_provider).
         cache:    LOSCache (may be None).
         k:        Maximum number of towers allowed (including endpoints).
+        attempt_id: Placement attempt id (initial=0, fallback>0).
 
     Returns:
         (chain, best_t) — chain is a list of H3 indices forming the optimal
@@ -262,6 +266,9 @@ def _dp_place_towers_with_meta(
     cells = surface.cells
     elevation_provider = surface.elevation_provider
     from ..core.geometry import h3_distance
+    max_visibility_m = float(config.max_visibility_m)
+    frequency_hz = float(config.frequency_hz)
+    link_budget_db = float(config.link_budget_db)
 
     n = len(corridor)
     NEG_INF = float('-inf')
@@ -284,11 +291,31 @@ def _dp_place_towers_with_meta(
     reused_from_memo = 0
     total_pairs_upper_bound = (n * (n - 1)) // 2
     memo_keys = set(los_results_by_pair.keys())
+    shadow_prefilter_enabled = True
+    shadow_prefilter_reason = "enabled"
+    if total_pairs_upper_bound > 50_000:
+        shadow_prefilter_enabled = False
+        shadow_prefilter_reason = "pairs_upper_bound_exceeded"
+    elif attempt_id > 0:
+        shadow_prefilter_enabled = False
+        shadow_prefilter_reason = "fallback_attempt"
+    pair_distances = pair_distance_memo if pair_distance_memo is not None else {}
+    shadow_rejections = shadow_reject_memo if shadow_reject_memo is not None else {}
+    cells_get = cells.get
+    fspl_only_fn = fspl_only
+    terrain_shadow_prefilter = _terrain_shadow_prefilter_rejects
     total_sources = max(1, n - 1)
     next_progress_pct = 1
     next_info_progress_pct = 10
     prefilter_workers = _resolve_prefilter_workers(config, los_max_workers)
     prefilter_started_at = time.perf_counter()
+    logger.info(
+        "DP terrain-shadow prefilter mode",
+        shadow_prefilter="enabled" if shadow_prefilter_enabled else "skipped",
+        reason=shadow_prefilter_reason,
+        pairs_upper_bound=total_pairs_upper_bound,
+        attempt_id=attempt_id,
+    )
 
     logger.info(
         "DP cell-pair prefilter start",
@@ -308,14 +335,17 @@ def _dp_place_towers_with_meta(
         row_reused = 0
         for j in range(source_i + 1, n):
             dst_h3 = corridor[j]
+            pair = (src_h3, dst_h3)
             row_forward_pairs += 1
             # Early exit: corridor positions are roughly ordered by distance;
             # once we exceed max_visibility_m we can stop.
-            dist = h3_distance(src_h3, dst_h3)
-            if dist > config.max_visibility_m:
+            dist = pair_distances.get(pair)
+            if dist is None:
+                dist = h3_distance(src_h3, dst_h3)
+                pair_distances[pair] = dist
+            if dist > max_visibility_m:
                 row_filtered_distance += (n - j)
                 break
-            pair = (src_h3, dst_h3)
             if dist <= 0.0:
                 if pair in memo_keys:
                     row_reused += 1
@@ -324,14 +354,14 @@ def _dp_place_towers_with_meta(
 
             # Conservative prefilter: if ideal FSPL already fails budget,
             # the full LOS policy cannot pass this pair.
-            if fspl_only(dist, config.frequency_hz) > config.link_budget_db:
+            if fspl_only_fn(dist, frequency_hz) > link_budget_db:
                 row_filtered_fspl += 1
                 continue
 
             # Skip non-endpoint cells that violate constraints
             is_endpoint_j = (j == n - 1)
             if not is_endpoint_j:
-                cell_j = cells.get(dst_h3)
+                cell_j = cells_get(dst_h3)
                 if cell_j and getattr(cell_j, 'is_in_unfit_area', False):
                     row_filtered_unfit += 1
                     continue
@@ -341,11 +371,16 @@ def _dp_place_towers_with_meta(
                 row_pairs.append((source_i, j, pair))
                 continue
 
-            if _terrain_shadow_prefilter_rejects(
-                src_h3, dst_h3, cells, config, elevation_provider
-            ):
-                row_filtered_shadow += 1
-                continue
+            if shadow_prefilter_enabled:
+                shadow_rejected = shadow_rejections.get(pair)
+                if shadow_rejected is None:
+                    shadow_rejected = terrain_shadow_prefilter(
+                        src_h3, dst_h3, cells, config, elevation_provider
+                    )
+                    shadow_rejections[pair] = bool(shadow_rejected)
+                if shadow_rejected:
+                    row_filtered_shadow += 1
+                    continue
 
             row_pairs.append((source_i, j, pair))
         return {
@@ -606,6 +641,7 @@ def _dp_place_towers(
         surface,
         cache,
         k,
+        attempt_id=0,
         los_max_workers=los_max_workers,
     )
     if result is None:
@@ -1454,11 +1490,14 @@ def place_nodes_along_corridor(
                 surface,
                 cache,
                 seg_k,
+                attempt_id=attempt_id,
                 los_max_workers=effective_los_workers,
                 los_progress_callback=_make_los_progress(
                     f'{seg_label} • Evaluating LOS chain candidates'
                 ),
                 los_pair_memo=shared_dp_los_pairs,
+                pair_distance_memo=shared_prefilter_pair_distances,
+                shadow_reject_memo=shared_prefilter_shadow_rejections,
             )
             seg_nodes = seg_result[0] if seg_result is not None else None
             seg_best_t = seg_result[1] if seg_result is not None else None
@@ -1616,6 +1655,8 @@ def place_nodes_along_corridor(
 
     initial_search_radius_m = _effective_initial_search_radius_m(config)
     shared_dp_los_pairs: Dict[tuple[str, str], LOSResult] = {}
+    shared_prefilter_pair_distances: Dict[tuple[str, str], float] = {}
+    shared_prefilter_shadow_rejections: Dict[tuple[str, str], bool] = {}
     selected_nodes, selected_meta, selected_working_corridor, selected_corridor_pos, broken_count, selected_budget = _run_attempt(
         search_radius_m=initial_search_radius_m,
         attempt_id=0,
