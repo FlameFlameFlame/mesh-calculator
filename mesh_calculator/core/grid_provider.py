@@ -396,6 +396,12 @@ class GridProvider:
     ) -> tuple[float, float, float, float]:
         return self._elevation_provider.get_line_peak_elevation(src_lat, src_lon, dst_lat, dst_lon)
 
+    def get_line_peak_elevation_batch(
+        self,
+        lines: list[tuple[float, float, float, float]],
+    ) -> list[tuple[float, float, float, float]]:
+        return self._elevation_provider.get_line_peak_elevation_batch(lines)
+
     def cache_stats(self) -> dict:
         return self._elevation_provider.cache_stats()
 

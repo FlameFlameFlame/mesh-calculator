@@ -44,6 +44,20 @@ def _artifact_hash(path: Path) -> str | None:
     return h.hexdigest()
 
 
+def _artifact_hashes_for_dir(artifact_dir: Path) -> dict[str, str | None]:
+    return {
+        name: _artifact_hash(artifact_dir / name)
+        for name in (
+            "towers.geojson",
+            "visibility_edges.geojson",
+            "coverage.geojson",
+            "report.json",
+            "grid_cells.geojson",
+            "gap_repair_hexes.geojson",
+        )
+    }
+
+
 def _build_route_specs(routes_json: dict) -> list[RouteSpec]:
     out: list[RouteSpec] = []
     for route in routes_json.get("routes", []):
@@ -73,6 +87,7 @@ def run_probe(
     project_dir: Path,
     runs: int,
     output_dir: Path | None = None,
+    baseline_dir: Path | None = None,
 ) -> dict:
     config_path = project_dir / "config.yaml"
     routes_path = project_dir / "routes.json"
@@ -109,10 +124,20 @@ def run_probe(
         "runs": int(runs),
         "executions": {},
         "diffs_vs_run1": {},
+        "diffs_vs_baseline": {},
     }
+    if baseline_dir is not None:
+        report["baseline_dir"] = str(baseline_dir)
 
     baseline_fp = None
     baseline_hashes = None
+    baseline_artifact_hashes = (
+        _artifact_hashes_for_dir(baseline_dir)
+        if baseline_dir is not None
+        else None
+    )
+    if baseline_artifact_hashes is not None:
+        report["baseline_artifact_hashes"] = baseline_artifact_hashes
 
     for run_idx in range(1, int(runs) + 1):
         run_dir = probe_root / f"run_{run_idx}"
@@ -136,17 +161,7 @@ def run_probe(
         finally:
             provider.close()
 
-        artifact_hashes = {
-            name: _artifact_hash(run_dir / name)
-            for name in (
-                "towers.geojson",
-                "visibility_edges.geojson",
-                "coverage.geojson",
-                "report.json",
-                "grid_cells.geojson",
-                "gap_repair_hexes.geojson",
-            )
-        }
+        artifact_hashes = _artifact_hashes_for_dir(run_dir)
         fingerprint = _summary_fingerprint(summary)
         report["executions"][str(run_idx)] = {
             "summary": summary,
@@ -165,6 +180,26 @@ def run_probe(
             "artifact_hash_diff": artifact_hashes != baseline_hashes,
         }
         report["diffs_vs_run1"][str(run_idx)] = diffs
+        if baseline_artifact_hashes is not None:
+            report["diffs_vs_baseline"][str(run_idx)] = {
+                "artifact_hash_diff": artifact_hashes != baseline_artifact_hashes,
+                "differing_artifacts": sorted(
+                    name
+                    for name, digest in artifact_hashes.items()
+                    if digest != baseline_artifact_hashes.get(name)
+                ),
+            }
+
+    if baseline_artifact_hashes is not None and "1" not in report["diffs_vs_baseline"]:
+        first_hashes = report["executions"].get("1", {}).get("artifact_hashes", {})
+        report["diffs_vs_baseline"]["1"] = {
+            "artifact_hash_diff": first_hashes != baseline_artifact_hashes,
+            "differing_artifacts": sorted(
+                name
+                for name, digest in first_hashes.items()
+                if digest != baseline_artifact_hashes.get(name)
+            ),
+        }
 
     report_path = probe_root / "serial_probe_report.json"
     with report_path.open("w") as f:
@@ -193,17 +228,29 @@ def main() -> None:
         default=None,
         help="Optional output directory for probe artifacts",
     )
+    parser.add_argument(
+        "--baseline-dir",
+        default=None,
+        help="Optional directory of existing artifacts to compare each run against",
+    )
     args = parser.parse_args()
 
     project_dir = Path(args.project_dir).resolve()
     output_dir = Path(args.output_dir).resolve() if args.output_dir else None
+    baseline_dir = Path(args.baseline_dir).resolve() if args.baseline_dir else None
     runs = max(1, int(args.runs))
-    report = run_probe(project_dir, runs=runs, output_dir=output_dir)
+    report = run_probe(
+        project_dir,
+        runs=runs,
+        output_dir=output_dir,
+        baseline_dir=baseline_dir,
+    )
     print(json.dumps(
         {
             "report_path": report.get("report_path"),
             "runs": report.get("runs"),
             "diffs_vs_run1": report.get("diffs_vs_run1", {}),
+            "diffs_vs_baseline": report.get("diffs_vs_baseline", {}),
         },
         indent=2,
     ))

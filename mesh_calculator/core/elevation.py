@@ -6,14 +6,13 @@ import threading
 from typing import Optional, Tuple
 import h3
 import rasterio
-from rasterio.errors import NotGeoreferencedWarning
 from rasterio.transform import rowcol
 from rasterio.windows import Window
 from rasterio.windows import from_bounds as window_from_bounds
 from rasterio.windows import transform as window_transform
-from rasterio.features import geometry_mask, rasterize
+from rasterio.features import geometry_mask
 import numpy as np
-from shapely.geometry import LineString, Polygon, mapping
+from shapely.geometry import Polygon, mapping
 import structlog
 
 logger = structlog.get_logger(__name__)
@@ -44,6 +43,7 @@ class ElevationProvider:
         self._line_peak_cache = {}
         self._lock = threading.RLock()
         self._data = None  # Lazy-loaded full band array
+        self._masked_data = None  # Lazy-loaded full masked band for batch line scans
         self._nodata = self.dataset.nodata
 
     def _ensure_data(self):
@@ -55,6 +55,20 @@ class ElevationProvider:
                 data = data.astype(np.float32, copy=False)
                 data[data == self._nodata] = 0.0
             self._data = data
+
+    def _ensure_masked_data(self):
+        """Load the full masked raster band into memory on first batch line scan."""
+        if self._masked_data is not None:
+            return
+        lock = getattr(self, "_lock", None)
+        if lock is None:
+            self._masked_data = self.dataset.read(1, masked=True)
+            return
+        try:
+            with lock:
+                self._masked_data = self.dataset.read(1, masked=True)
+        except Exception:
+            self._masked_data = self.dataset.read(1, masked=True)
 
     def get_elevation(self, lat: float, lon: float) -> float:
         """
@@ -262,6 +276,12 @@ class ElevationProvider:
 
     def _read_band_window(self, window: Window) -> np.ma.MaskedArray:
         """Read a masked raster window, guarding against missing lock state."""
+        if self._masked_data is not None:
+            row0 = int(window.row_off)
+            col0 = int(window.col_off)
+            row1 = row0 + int(window.height)
+            col1 = col0 + int(window.width)
+            return self._masked_data[row0:row1, col0:col1]
         lock = getattr(self, "_lock", None)
         if lock is None:
             return self.dataset.read(1, window=window, masked=True)
@@ -289,6 +309,114 @@ class ElevationProvider:
             return 0.0
         frac = (((lon - src_lon) * cos_lat * dx) + ((lat - src_lat) * dy)) / denom
         return float(np.clip(frac, 0.0, 1.0))
+
+    def _endpoint_line_peak_fallback(
+        self,
+        src_lat: float,
+        src_lon: float,
+        dst_lat: float,
+        dst_lon: float,
+    ) -> tuple[float, float, float, float]:
+        elev_a = self.get_elevation(src_lat, src_lon)
+        elev_b = self.get_elevation(dst_lat, dst_lon)
+        if elev_a >= elev_b:
+            return (float(elev_a), float(src_lat), float(src_lon), 0.0)
+        return (float(elev_b), float(dst_lat), float(dst_lon), 1.0)
+
+    def _resolve_line_peak_from_band(
+        self,
+        band: np.ma.MaskedArray,
+        w_transform,
+        src_lat: float,
+        src_lon: float,
+        dst_lat: float,
+        dst_lon: float,
+    ) -> Optional[tuple[float, float, float, float]]:
+        inv = ~w_transform
+        src_col_f, src_row_f = inv * (src_lon, src_lat)
+        dst_col_f, dst_row_f = inv * (dst_lon, dst_lat)
+        steps = max(
+            int(np.ceil(abs(dst_row_f - src_row_f))),
+            int(np.ceil(abs(dst_col_f - src_col_f))),
+            1,
+        ) * 2 + 1
+        rows = np.rint(np.linspace(src_row_f, dst_row_f, num=steps)).astype(np.intp)
+        cols = np.rint(np.linspace(src_col_f, dst_col_f, num=steps)).astype(np.intp)
+        in_bounds = (
+            (rows >= 0)
+            & (rows < band.shape[0])
+            & (cols >= 0)
+            & (cols < band.shape[1])
+        )
+        if not np.any(in_bounds):
+            return None
+
+        rows = rows[in_bounds]
+        cols = cols[in_bounds]
+        if rows.size == 0:
+            return None
+
+        if rows.size > 1:
+            keep = np.ones(rows.size, dtype=bool)
+            keep[1:] = (rows[1:] != rows[:-1]) | (cols[1:] != cols[:-1])
+            rows = rows[keep]
+            cols = cols[keep]
+
+        values = band.data[rows, cols]
+        valid = (~np.ma.getmaskarray(band)[rows, cols]) & np.isfinite(values)
+        if not np.any(valid):
+            return None
+
+        rows = rows[valid]
+        cols = cols[valid]
+        values = values[valid]
+        max_elev = float(np.max(values))
+        max_mask = values == max_elev
+        if not np.any(max_mask):
+            peak_lat = (src_lat + dst_lat) / 2.0
+            peak_lon = (src_lon + dst_lon) / 2.0
+        else:
+            mid_lat = (src_lat + dst_lat) / 2.0
+            mid_lon = (src_lon + dst_lon) / 2.0
+            peak_lat = None
+            peak_lon = None
+            best_d2 = float("inf")
+            for r, c in zip(rows[max_mask], cols[max_mask]):
+                px_lon, px_lat = rasterio.transform.xy(
+                    w_transform, int(r), int(c), offset="center"
+                )
+                d2 = (px_lat - mid_lat) ** 2 + (px_lon - mid_lon) ** 2
+                if d2 < best_d2:
+                    best_d2 = d2
+                    peak_lat = float(px_lat)
+                    peak_lon = float(px_lon)
+            if peak_lat is None or peak_lon is None:
+                peak_lat = (src_lat + dst_lat) / 2.0
+                peak_lon = (src_lon + dst_lon) / 2.0
+
+        frac = self._line_fraction(
+            src_lat, src_lon, dst_lat, dst_lon, peak_lat, peak_lon
+        )
+        return (float(max_elev), float(peak_lat), float(peak_lon), float(frac))
+
+    @staticmethod
+    def _restore_line_peak_orientation(
+        peak: tuple[float, float, float, float],
+        flipped: bool,
+    ) -> tuple[float, float, float, float]:
+        if not flipped:
+            return (
+                float(peak[0]),
+                float(peak[1]),
+                float(peak[2]),
+                float(peak[3]),
+            )
+        return (
+            float(peak[0]),
+            float(peak[1]),
+            float(peak[2]),
+            float(1.0 - peak[3]),
+        )
 
     def get_h3_cell_max_elevation(self, h3_index: str) -> float:
         """Return maximum DEM elevation inside an H3 polygon."""
@@ -514,90 +642,114 @@ class ElevationProvider:
                     elev = self.get_elevation(a_lat, a_lon)
                     cached = (float(elev), float(a_lat), float(a_lon), 0.0)
                 else:
-                    line = LineString([(a_lon, a_lat), (b_lon, b_lat)])
-                    minx, miny, maxx, maxy = line.bounds
+                    minx = min(a_lon, b_lon)
+                    miny = min(a_lat, b_lat)
+                    maxx = max(a_lon, b_lon)
+                    maxy = max(a_lat, b_lat)
                     raw_window = window_from_bounds(
                         minx, miny, maxx, maxy, transform=self.transform
                     )
                     win = self._clip_window(raw_window)
                     if win is None:
-                        elev_a = self.get_elevation(a_lat, a_lon)
-                        elev_b = self.get_elevation(b_lat, b_lon)
-                        if elev_a >= elev_b:
-                            cached = (float(elev_a), float(a_lat), float(a_lon), 0.0)
-                        else:
-                            cached = (float(elev_b), float(b_lat), float(b_lon), 1.0)
+                        cached = self._endpoint_line_peak_fallback(a_lat, a_lon, b_lat, b_lon)
                     else:
                         band = self._read_band_window(win)
                         w_transform = window_transform(win, self.transform)
-                        with warnings.catch_warnings():
-                            warnings.filterwarnings(
-                                "ignore",
-                                category=NotGeoreferencedWarning,
-                            )
-                            line_mask = rasterize(
-                                [(mapping(line), 1)],
-                                out_shape=band.shape,
-                                transform=w_transform,
-                                fill=0,
-                                all_touched=True,
-                                dtype=np.uint8,
-                            )
-                        valid = (line_mask == 1) & (~np.ma.getmaskarray(band))
-                        max_elev = self._safe_max(band, valid)
-                        if max_elev is None:
-                            elev_a = self.get_elevation(a_lat, a_lon)
-                            elev_b = self.get_elevation(b_lat, b_lon)
-                            if elev_a >= elev_b:
-                                cached = (float(elev_a), float(a_lat), float(a_lon), 0.0)
-                            else:
-                                cached = (float(elev_b), float(b_lat), float(b_lon), 1.0)
-                        else:
-                            rows, cols = np.where(valid & (band.data == max_elev))
-                            if len(rows) == 0:
-                                peak_lat = (a_lat + b_lat) / 2.0
-                                peak_lon = (a_lon + b_lon) / 2.0
-                            else:
-                                # Choose max-elevation pixel nearest line midpoint (conservative Fresnel impact).
-                                mid_lat = (a_lat + b_lat) / 2.0
-                                mid_lon = (a_lon + b_lon) / 2.0
-                                peak_lat = None
-                                peak_lon = None
-                                best_d2 = float("inf")
-                                for r, c in zip(rows, cols):
-                                    px_lon, px_lat = rasterio.transform.xy(
-                                        w_transform, int(r), int(c), offset="center"
-                                    )
-                                    d2 = (px_lat - mid_lat) ** 2 + (px_lon - mid_lon) ** 2
-                                    if d2 < best_d2:
-                                        best_d2 = d2
-                                        peak_lat = float(px_lat)
-                                        peak_lon = float(px_lon)
-                                if peak_lat is None or peak_lon is None:
-                                    peak_lat = (a_lat + b_lat) / 2.0
-                                    peak_lon = (a_lon + b_lon) / 2.0
-                            frac = self._line_fraction(
-                                a_lat, a_lon, b_lat, b_lon, peak_lat, peak_lon
-                            )
-                            cached = (float(max_elev), float(peak_lat), float(peak_lon), float(frac))
+                        cached = self._resolve_line_peak_from_band(
+                            band, w_transform, a_lat, a_lon, b_lat, b_lon
+                        )
+                        if cached is None:
+                            cached = self._endpoint_line_peak_fallback(a_lat, a_lon, b_lat, b_lon)
             except Exception as e:
                 logger.warning(
                     "Failed to get line peak elevation",
                     src_lat=src_lat, src_lon=src_lon, dst_lat=dst_lat, dst_lon=dst_lon,
                     error=str(e),
                 )
-                elev_a = self.get_elevation(src_lat, src_lon)
-                elev_b = self.get_elevation(dst_lat, dst_lon)
-                if elev_a >= elev_b:
-                    cached = (float(elev_a), float(src_lat), float(src_lon), 0.0)
-                else:
-                    cached = (float(elev_b), float(dst_lat), float(dst_lon), 1.0)
+                cached = self._endpoint_line_peak_fallback(
+                    src_lat, src_lon, dst_lat, dst_lon
+                )
             self._line_peak_cache[key] = cached
 
-        max_elev, peak_lat, peak_lon, frac = cached
-        if flipped:
-            return float(max_elev), float(peak_lat), float(peak_lon), float(1.0 - frac)
-        return float(max_elev), float(peak_lat), float(peak_lon), float(frac)
+        return self._restore_line_peak_orientation(cached, flipped)
+
+    def get_line_peak_elevation_batch(
+        self,
+        lines: list[tuple[float, float, float, float]],
+    ) -> list[tuple[float, float, float, float]]:
+        """
+        Return line-peak elevations for multiple source/destination lines.
+
+        The caller is expected to pass spatially-local lines in small blocks so
+        the shared DEM window stays tight.
+        """
+        if not lines:
+            return []
+
+        results: list[Optional[tuple[float, float, float, float]]] = [None] * len(lines)
+        missing: list[tuple[int, tuple[float, float, float, float], bool]] = []
+        for idx, (src_lat, src_lon, dst_lat, dst_lon) in enumerate(lines):
+            key, flipped = self._line_cache_key(src_lat, src_lon, dst_lat, dst_lon)
+            cached = self._line_peak_cache.get(key)
+            if cached is not None:
+                results[idx] = self._restore_line_peak_orientation(cached, flipped)
+                continue
+            missing.append((idx, key, flipped))
+
+        if missing:
+            try:
+                self._ensure_masked_data()
+                minx = min(min(key[1], key[3]) for _, key, _ in missing)
+                miny = min(min(key[0], key[2]) for _, key, _ in missing)
+                maxx = max(max(key[1], key[3]) for _, key, _ in missing)
+                maxy = max(max(key[0], key[2]) for _, key, _ in missing)
+                raw_window = window_from_bounds(
+                    minx, miny, maxx, maxy, transform=self.transform
+                )
+                win = self._clip_window(raw_window)
+                if win is None:
+                    for idx, key, flipped in missing:
+                        cached = self._endpoint_line_peak_fallback(*key)
+                        self._line_peak_cache[key] = cached
+                        results[idx] = self._restore_line_peak_orientation(cached, flipped)
+                else:
+                    band = self._read_band_window(win)
+                    w_transform = window_transform(win, self.transform)
+                    for idx, key, flipped in missing:
+                        a_lat, a_lon, b_lat, b_lon = key
+                        if a_lat == b_lat and a_lon == b_lon:
+                            cached = (float(self.get_elevation(a_lat, a_lon)), float(a_lat), float(a_lon), 0.0)
+                        else:
+                            cached = self._resolve_line_peak_from_band(
+                                band, w_transform, a_lat, a_lon, b_lat, b_lon
+                            )
+                            if cached is None:
+                                cached = self._endpoint_line_peak_fallback(
+                                    a_lat, a_lon, b_lat, b_lon
+                                )
+                        self._line_peak_cache[key] = cached
+                        results[idx] = self._restore_line_peak_orientation(cached, flipped)
+            except Exception as e:
+                logger.warning(
+                    "Failed to get batched line peak elevations",
+                    count=len(missing),
+                    error=str(e),
+                )
+                for idx, key, flipped in missing:
+                    cached = self._endpoint_line_peak_fallback(*key)
+                    self._line_peak_cache[key] = cached
+                    results[idx] = self._restore_line_peak_orientation(cached, flipped)
+
+        return [
+            (
+                float(peak[0]),
+                float(peak[1]),
+                float(peak[2]),
+                float(peak[3]),
+            )
+            if peak is not None else self._endpoint_line_peak_fallback(*lines[idx])
+            for idx, peak in enumerate(results)
+        ]
 
     def cache_stats(self) -> dict:
         """

@@ -185,6 +185,45 @@ class TestElevationAnchor(unittest.TestCase):
         self.assertEqual(len(peak), 4)
         self.assertTrue(all(math.isfinite(float(v)) for v in peak))
 
+    def test_batched_line_peak_matches_scalar(self):
+        h3_idx = h3.latlng_to_cell(40.0, 44.0, 10)
+        lat_c, lon_c = h3.cell_to_latlng(h3_idx)
+        neighbors = [nb for nb in h3.grid_disk(h3_idx, 1) if nb != h3_idx][:2]
+        n1_lat, n1_lon = h3.cell_to_latlng(neighbors[0])
+        n2_lat, n2_lon = h3.cell_to_latlng(neighbors[1])
+
+        tif_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tif_dir.cleanup)
+        tif_path = Path(tif_dir.name) / "dem.tif"
+        _make_dem(
+            tif_path,
+            width=1200,
+            height=1200,
+            west=min(lon_c, n1_lon, n2_lon) - 0.03,
+            north=max(lat_c, n1_lat, n2_lat) + 0.03,
+            pixel_deg=0.00005,
+        )
+        _set_pixel(tif_path, (lat_c + n1_lat) / 2.0, (lon_c + n1_lon) / 2.0, 900.0)
+        _set_pixel(tif_path, (lat_c + n2_lat) / 2.0, (lon_c + n2_lon) / 2.0, 800.0)
+
+        provider = ElevationProvider(str(tif_path))
+        self.addCleanup(provider.close)
+
+        lines = [
+            (lat_c, lon_c, n1_lat, n1_lon),
+            (lat_c, lon_c, n2_lat, n2_lon),
+        ]
+        scalar = [provider.get_line_peak_elevation(*line) for line in lines]
+        provider._line_peak_cache.clear()
+        batched = provider.get_line_peak_elevation_batch(lines)
+
+        self.assertEqual(len(scalar), len(batched))
+        for expected, actual in zip(scalar, batched):
+            self.assertAlmostEqual(expected[0], actual[0], places=4)
+            self.assertAlmostEqual(expected[1], actual[1], places=6)
+            self.assertAlmostEqual(expected[2], actual[2], places=6)
+            self.assertAlmostEqual(expected[3], actual[3], places=6)
+
 
 if __name__ == "__main__":
     unittest.main()

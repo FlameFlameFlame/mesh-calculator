@@ -4,12 +4,15 @@ Node placement along corridors with LOS constraints.
 from typing import List, Dict, Optional
 import time
 import h3
+import numpy as np
+from pyproj import Geod
+from scipy.spatial import cKDTree
 
 import structlog
 
 from ..core.grid import H3Cell, resolve_cell_profile
 from ..core.config import MeshConfig
-from ..core.geometry import great_circle_distance
+from ..core.geometry import great_circle_distance, h3_distance
 from ..data.cache import LOSCache, LOSResult
 from ..physics.los import has_los, compute_los
 from ..physics.fresnel import max_allowed_fresnel_obstruction_ratio
@@ -20,6 +23,9 @@ from ..network.graph import MeshSurface, _los_decision_debug
 logger = structlog.get_logger(__name__)
 _GAP_REPAIR_WIGGLE_ROUNDS = 3
 _PARALLEL_HINT_WARNED = False
+_BUFFER_NEAREST_SHORTLIST_K = 8
+_SHADOW_PREFILTER_BLOCK_SIZE = 64
+_geod = Geod(ellps='WGS84')
 
 
 def _warn_if_parallel_hint_requested(value: Optional[int], *, context: str) -> None:
@@ -135,6 +141,107 @@ def _terrain_shadow_prefilter_rejects(
     return geometric_clearance < required_geometric_clearance
 
 
+def _terrain_shadow_prefilter_rejects_batch(
+    h3_src: str,
+    h3_dsts: list[str],
+    distance_m: np.ndarray,
+    cells: Dict[str, H3Cell],
+    config: MeshConfig,
+    elevation_provider,
+) -> np.ndarray:
+    """
+    Batch conservative terrain-block checks for a single source against many destinations.
+
+    Falls back to the scalar helper when the provider lacks a batched line-peak API.
+    """
+    if not h3_dsts:
+        return np.zeros(0, dtype=bool)
+    if elevation_provider is None:
+        return np.zeros(len(h3_dsts), dtype=bool)
+
+    batch_fn = getattr(type(elevation_provider), "get_line_peak_elevation_batch", None)
+    if not callable(batch_fn):
+        return np.asarray([
+            _terrain_shadow_prefilter_rejects(
+                h3_src, h3_dst, cells, config, elevation_provider
+            )
+            for h3_dst in h3_dsts
+        ], dtype=bool)
+
+    src = cells.get(h3_src)
+    if src is None:
+        return np.zeros(len(h3_dsts), dtype=bool)
+
+    src_lat = float(getattr(src, "los_lat", src.lat))
+    src_lon = float(getattr(src, "los_lon", src.lon))
+    src_asl = float(src.elevation) + float(config.mast_height_m) + float(
+        getattr(src, "antenna_height_offset_m", 0.0) or 0.0
+    )
+
+    queries: list[tuple[float, float, float, float]] = []
+    valid_idx: list[int] = []
+    dst_asl = np.zeros(len(h3_dsts), dtype=np.float64)
+    for idx, h3_dst in enumerate(h3_dsts):
+        dst = cells.get(h3_dst)
+        if dst is None:
+            continue
+        queries.append((
+            src_lat,
+            src_lon,
+            float(getattr(dst, "los_lat", dst.lat)),
+            float(getattr(dst, "los_lon", dst.lon)),
+        ))
+        valid_idx.append(idx)
+        dst_asl[idx] = float(dst.elevation) + float(config.mast_height_m) + float(
+            getattr(dst, "antenna_height_offset_m", 0.0) or 0.0
+        )
+
+    out = np.zeros(len(h3_dsts), dtype=bool)
+    if not valid_idx:
+        return out
+
+    try:
+        peaks = elevation_provider.get_line_peak_elevation_batch(queries)
+    except Exception:
+        return np.asarray([
+            _terrain_shadow_prefilter_rejects(
+                h3_src, h3_dst, cells, config, elevation_provider
+            )
+            for h3_dst in h3_dsts
+        ], dtype=bool)
+
+    valid_idx_arr = np.asarray(valid_idx, dtype=np.int64)
+    valid_distance = np.asarray(distance_m, dtype=np.float64)[valid_idx_arr]
+    frac = np.clip(
+        np.asarray([peak[3] for peak in peaks], dtype=np.float64),
+        0.0,
+        1.0,
+    )
+    peak_elev = np.asarray([peak[0] for peak in peaks], dtype=np.float64)
+
+    positive = valid_distance > 0.0
+    d1 = valid_distance * frac
+    d2 = valid_distance - d1
+    line_alt = src_asl + (dst_asl[valid_idx_arr] - src_asl) * frac
+    earth_curv = (d1 * d2) / (2.0 * float(config.effective_earth_radius_m))
+    fresnel_r = np.zeros_like(valid_distance)
+    fresnel_mask = positive & (d1 > 0.0) & (d2 > 0.0)
+    if np.any(fresnel_mask):
+        fresnel_r[fresnel_mask] = np.sqrt(np.maximum(
+            float(config.wavelength_m)
+            * d1[fresnel_mask]
+            * d2[fresnel_mask]
+            / valid_distance[fresnel_mask],
+            0.0,
+        ))
+    required_geometric_clearance = fresnel_r * (
+        1.0 - float(max_allowed_fresnel_obstruction_ratio())
+    )
+    geometric_clearance = line_alt - (peak_elev + earth_curv)
+    out[valid_idx_arr] = geometric_clearance < required_geometric_clearance
+    return out
+
+
 def _effective_initial_search_radius_m(config: MeshConfig) -> float:
     """Resolve planner search radius, preserving backward compatibility."""
     if config.optimizer_search_radius_m is not None:
@@ -190,6 +297,164 @@ def _adaptive_cells_within_radius(
         if candidate_cells is not None:
             return set(candidate_cells)
         return {center_h3}
+
+
+def _to_xyz(lats: np.ndarray, lons: np.ndarray) -> np.ndarray:
+    """Project lat/lon arrays to approximate ECEF xyz for nearest-neighbor search."""
+    earth_r = 6_371_000.0
+    lats_rad = np.radians(lats)
+    lons_rad = np.radians(lons)
+    cos_lat = np.cos(lats_rad)
+    return np.column_stack([
+        cos_lat * np.cos(lons_rad),
+        cos_lat * np.sin(lons_rad),
+        np.sin(lats_rad),
+    ]) * earth_r
+
+
+def _fspl_only_vectorized(distance_m: np.ndarray, frequency_hz: float) -> np.ndarray:
+    """Vectorized FSPL for positive distances in meters."""
+    distance_km = distance_m / 1000.0
+    freq_mhz = frequency_hz / 1_000_000.0
+    return 20.0 * np.log10(distance_km) + 20.0 * np.log10(freq_mhz) + 32.44
+
+
+def _is_valid_h3_index(h3_idx: str) -> bool:
+    """Return whether the input is a real H3 cell id."""
+    try:
+        return bool(h3.is_valid_cell(h3_idx))
+    except Exception:
+        return False
+
+
+def _select_best_buffer_candidates_by_road(
+    candidate_buffer_cells: List[str],
+    corridor_order: List[str],
+    cells: Dict[str, H3Cell],
+    pending_cells: dict[str, tuple[float, float, float, float, float]],
+) -> dict[str, tuple[str, float]]:
+    """
+    Select the highest-elevation buffer candidate nearest to each corridor cell.
+
+    Uses a KD-tree bulk nearest-neighbor query for real H3 ids and falls back
+    to exact scalar distance comparisons for synthetic test ids.
+    """
+    unique_roads = list(dict.fromkeys(corridor_order))
+    unique_candidates = list(dict.fromkeys(candidate_buffer_cells))
+    if not unique_roads or not unique_candidates:
+        return {}
+    exact_h3_metric_available = (
+        all(_is_valid_h3_index(h3_idx) for h3_idx in unique_roads)
+        and all(_is_valid_h3_index(h3_idx) for h3_idx in unique_candidates)
+    )
+
+    def _candidate_elevation(h3_idx: str) -> float | None:
+        cell = cells.get(h3_idx)
+        if cell is not None:
+            return float(cell.elevation)
+        pending = pending_cells.get(h3_idx)
+        if pending is not None:
+            return float(pending[2])
+        return None
+
+    def _coords(h3_idx: str) -> tuple[float, float] | None:
+        cell = cells.get(h3_idx)
+        if cell is not None:
+            return float(cell.lat), float(cell.lon)
+        pending = pending_cells.get(h3_idx)
+        if pending is not None:
+            return float(pending[0]), float(pending[1])
+        try:
+            lat, lon = h3.cell_to_latlng(h3_idx)
+        except Exception:
+            return None
+        return float(lat), float(lon)
+
+    road_coords = {
+        road_h3: _coords(road_h3)
+        for road_h3 in unique_roads
+    }
+    candidate_coords = {
+        candidate_h3: _coords(candidate_h3)
+        for candidate_h3 in unique_candidates
+    }
+    vectorizable = exact_h3_metric_available and all(
+        coord is not None for coord in road_coords.values()
+    ) and all(
+        coord is not None for coord in candidate_coords.values()
+    )
+    scalar_tie_order = {
+        road_h3: idx for idx, road_h3 in enumerate(unique_roads)
+    }
+
+    def _road_distance(candidate_h3: str, road_h3: str) -> float:
+        if _is_valid_h3_index(candidate_h3) and _is_valid_h3_index(road_h3):
+            return h3_distance(candidate_h3, road_h3)
+        candidate_coord = candidate_coords.get(candidate_h3)
+        road_coord = road_coords.get(road_h3)
+        if candidate_coord is None or road_coord is None:
+            return float("inf")
+        return great_circle_distance(
+            candidate_coord[0],
+            candidate_coord[1],
+            road_coord[0],
+            road_coord[1],
+        )
+
+    best_by_road: dict[str, tuple[str, float]] = {}
+    if vectorizable and exact_h3_metric_available:
+        road_arr = np.asarray(
+            [road_coords[road_h3] for road_h3 in unique_roads],
+            dtype=np.float64,
+        )
+        candidate_arr = np.asarray(
+            [candidate_coords[candidate_h3] for candidate_h3 in unique_candidates],
+            dtype=np.float64,
+        )
+        shortlist_k = min(_BUFFER_NEAREST_SHORTLIST_K, len(unique_roads))
+        tree = cKDTree(_to_xyz(road_arr[:, 0], road_arr[:, 1]))
+        _distances, nearest_idx = tree.query(
+            _to_xyz(candidate_arr[:, 0], candidate_arr[:, 1]),
+            k=shortlist_k,
+        )
+        nearest_idx = np.asarray(nearest_idx)
+        if nearest_idx.ndim == 1:
+            nearest_idx = nearest_idx[:, None]
+        for candidate_h3, road_idx_row in zip(unique_candidates, nearest_idx):
+            elev = _candidate_elevation(candidate_h3)
+            if elev is None:
+                continue
+            shortlist = [
+                unique_roads[int(road_idx)]
+                for road_idx in np.atleast_1d(road_idx_row)
+            ]
+            road_h3 = min(
+                shortlist,
+                key=lambda road: (
+                    _road_distance(candidate_h3, road),
+                    scalar_tie_order.get(road, 0),
+                ),
+            )
+            prev = best_by_road.get(road_h3)
+            if prev is None or elev > prev[1] or (elev == prev[1] and candidate_h3 < prev[0]):
+                best_by_road[road_h3] = (candidate_h3, elev)
+        return best_by_road
+
+    for candidate_h3 in candidate_buffer_cells:
+        elev = _candidate_elevation(candidate_h3)
+        if elev is None:
+            continue
+        closest = min(
+            unique_roads,
+            key=lambda road_h3: (
+                _road_distance(candidate_h3, road_h3),
+                scalar_tie_order.get(road_h3, 0),
+            ),
+        )
+        prev = best_by_road.get(closest)
+        if prev is None or elev > prev[1] or (elev == prev[1] and candidate_h3 < prev[0]):
+            best_by_road[closest] = (candidate_h3, elev)
+    return best_by_road
 
 
 def _append_search_debug_records(
@@ -291,23 +556,56 @@ def _dp_place_towers_with_meta(
     reused_from_memo = 0
     total_pairs_upper_bound = (n * (n - 1)) // 2
     memo_keys = set(los_results_by_pair.keys())
-    shadow_prefilter_enabled = True
-    shadow_prefilter_reason = "enabled"
-    if total_pairs_upper_bound > 50_000:
+    shadow_prefilter_batch_available = elevation_provider is not None and callable(
+        getattr(type(elevation_provider), "get_line_peak_elevation_batch", None)
+    )
+    shadow_prefilter_enabled = (elevation_provider is not None)
+    shadow_prefilter_reason = (
+        "batched_provider_available"
+        if shadow_prefilter_batch_available
+        else ("provider_available" if shadow_prefilter_enabled else "provider_unavailable")
+    )
+    if (
+        shadow_prefilter_enabled
+        and not shadow_prefilter_batch_available
+        and total_pairs_upper_bound > 50_000
+    ):
         shadow_prefilter_enabled = False
         shadow_prefilter_reason = "pairs_upper_bound_exceeded"
-    elif attempt_id > 0:
+    elif (
+        shadow_prefilter_enabled
+        and not shadow_prefilter_batch_available
+        and attempt_id > 0
+    ):
         shadow_prefilter_enabled = False
         shadow_prefilter_reason = "fallback_attempt"
     pair_distances = pair_distance_memo if pair_distance_memo is not None else {}
     shadow_rejections = shadow_reject_memo if shadow_reject_memo is not None else {}
     cells_get = cells.get
-    fspl_only_fn = fspl_only
     terrain_shadow_prefilter = _terrain_shadow_prefilter_rejects
     total_sources = max(1, n - 1)
     next_progress_pct = 1
     next_info_progress_pct = 10
     prefilter_workers = _resolve_prefilter_workers(config, los_max_workers)
+    vectorized_row_prefilter = True
+    try:
+        corridor_center_coords = [h3.cell_to_latlng(h3_idx) for h3_idx in corridor]
+        corridor_center_lats = np.asarray(
+            [coord[0] for coord in corridor_center_coords],
+            dtype=np.float64,
+        )
+        corridor_center_lons = np.asarray(
+            [coord[1] for coord in corridor_center_coords],
+            dtype=np.float64,
+        )
+    except Exception:
+        corridor_center_lats = None
+        corridor_center_lons = None
+        vectorized_row_prefilter = False
+    corridor_unfit_mask = np.asarray([
+        bool(getattr(cells_get(h3_idx), 'is_in_unfit_area', False))
+        for h3_idx in corridor
+    ], dtype=bool)
     prefilter_started_at = time.perf_counter()
     logger.info(
         "DP terrain-shadow prefilter mode",
@@ -327,62 +625,195 @@ def _dp_place_towers_with_meta(
     def _scan_source_row(source_i: int) -> dict:
         src_h3 = corridor[source_i]
         row_pairs: list[tuple[int, int, tuple[str, str]]] = []
-        row_forward_pairs = 0
+        dst_indices = np.arange(source_i + 1, n, dtype=np.int64)
+        if dst_indices.size == 0:
+            return {
+                "i": source_i,
+                "pairs": row_pairs,
+                "forward_pairs": 0,
+                "filtered_distance": 0,
+                "filtered_fspl": 0,
+                "filtered_unfit": 0,
+                "filtered_shadow": 0,
+                "reused": 0,
+            }
+        row_forward_pairs = int(dst_indices.size)
         row_filtered_distance = 0
         row_filtered_fspl = 0
         row_filtered_unfit = 0
         row_filtered_shadow = 0
         row_reused = 0
-        for j in range(source_i + 1, n):
-            dst_h3 = corridor[j]
-            pair = (src_h3, dst_h3)
-            row_forward_pairs += 1
-            # Early exit: corridor positions are roughly ordered by distance;
-            # once we exceed max_visibility_m we can stop.
-            dist = pair_distances.get(pair)
-            if dist is None:
-                dist = h3_distance(src_h3, dst_h3)
-                pair_distances[pair] = dist
-            if dist > max_visibility_m:
-                row_filtered_distance += (n - j)
-                break
-            if dist <= 0.0:
+        if vectorized_row_prefilter:
+            row_distances = np.empty(dst_indices.size, dtype=np.float64)
+            missing_pos: list[int] = []
+            missing_js: list[int] = []
+            for pos, j in enumerate(dst_indices.tolist()):
+                pair = (src_h3, corridor[j])
+                dist = pair_distances.get(pair)
+                if dist is None:
+                    missing_pos.append(pos)
+                    missing_js.append(int(j))
+                else:
+                    row_distances[pos] = float(dist)
+            if missing_pos:
+                src_lon = np.full(len(missing_js), corridor_center_lons[source_i], dtype=np.float64)
+                src_lat = np.full(len(missing_js), corridor_center_lats[source_i], dtype=np.float64)
+                dst_lon = corridor_center_lons[np.asarray(missing_js, dtype=np.int64)]
+                dst_lat = corridor_center_lats[np.asarray(missing_js, dtype=np.int64)]
+                _az12, _az21, computed = _geod.inv(src_lon, src_lat, dst_lon, dst_lat)
+                computed = np.asarray(computed, dtype=np.float64)
+                for pos, j, dist in zip(missing_pos, missing_js, computed.tolist()):
+                    row_distances[pos] = dist
+                    pair_distances[(src_h3, corridor[j])] = dist
+
+            over_limit = np.flatnonzero(row_distances > max_visibility_m)
+            if over_limit.size > 0:
+                first_over = int(over_limit[0])
+                row_forward_pairs = first_over + 1
+                row_filtered_distance = int(dst_indices.size - first_over)
+                dst_indices = dst_indices[:first_over]
+                row_distances = row_distances[:first_over]
+            if dst_indices.size == 0:
+                return {
+                    "i": source_i,
+                    "pairs": row_pairs,
+                    "forward_pairs": row_forward_pairs,
+                    "filtered_distance": row_filtered_distance,
+                    "filtered_fspl": row_filtered_fspl,
+                    "filtered_unfit": row_filtered_unfit,
+                    "filtered_shadow": row_filtered_shadow,
+                    "reused": row_reused,
+                }
+
+            nonpositive_mask = row_distances <= 0.0
+            for j in dst_indices[nonpositive_mask].tolist():
+                pair = (src_h3, corridor[int(j)])
                 if pair in memo_keys:
                     row_reused += 1
-                row_pairs.append((source_i, j, pair))
-                continue
+                row_pairs.append((source_i, int(j), pair))
 
-            # Conservative prefilter: if ideal FSPL already fails budget,
-            # the full LOS policy cannot pass this pair.
-            if fspl_only_fn(dist, frequency_hz) > link_budget_db:
-                row_filtered_fspl += 1
-                continue
+            positive_indices = dst_indices[~nonpositive_mask]
+            positive_distances = row_distances[~nonpositive_mask]
+            if positive_indices.size:
+                fspl_mask = np.ones(positive_indices.size, dtype=bool)
+                fspl_vals = _fspl_only_vectorized(positive_distances, frequency_hz)
+                fspl_reject = fspl_vals > link_budget_db
+                row_filtered_fspl = int(np.count_nonzero(fspl_reject))
+                fspl_mask &= ~fspl_reject
 
-            # Skip non-endpoint cells that violate constraints
-            is_endpoint_j = (j == n - 1)
-            if not is_endpoint_j:
-                cell_j = cells_get(dst_h3)
-                if cell_j and getattr(cell_j, 'is_in_unfit_area', False):
-                    row_filtered_unfit += 1
-                    continue
+                non_endpoint_mask = positive_indices != (n - 1)
+                unfit_reject = non_endpoint_mask & corridor_unfit_mask[positive_indices]
+                row_filtered_unfit = int(np.count_nonzero(unfit_reject))
+                survivors = positive_indices[fspl_mask & ~unfit_reject]
+                survivor_distances = positive_distances[fspl_mask & ~unfit_reject]
 
-            if pair in memo_keys:
-                row_reused += 1
-                row_pairs.append((source_i, j, pair))
-                continue
+                uncached_shadow_js: list[int] = []
+                uncached_shadow_distances: list[float] = []
+                uncached_shadow_pairs: list[tuple[str, str]] = []
 
-            if shadow_prefilter_enabled:
-                shadow_rejected = shadow_rejections.get(pair)
-                if shadow_rejected is None:
-                    shadow_rejected = terrain_shadow_prefilter(
-                        src_h3, dst_h3, cells, config, elevation_provider
+                for j, dist in zip(survivors.tolist(), survivor_distances.tolist()):
+                    pair = (src_h3, corridor[int(j)])
+                    if pair in memo_keys:
+                        row_reused += 1
+                        row_pairs.append((source_i, int(j), pair))
+                        continue
+
+                    if shadow_prefilter_enabled:
+                        shadow_rejected = shadow_rejections.get(pair)
+                        if shadow_rejected is None:
+                            uncached_shadow_js.append(int(j))
+                            uncached_shadow_distances.append(float(dist))
+                            uncached_shadow_pairs.append(pair)
+                            continue
+                        if bool(shadow_rejected):
+                            row_filtered_shadow += 1
+                            continue
+
+                    row_pairs.append((source_i, int(j), pair))
+
+                if shadow_prefilter_enabled and uncached_shadow_js:
+                    block_size = (
+                        _SHADOW_PREFILTER_BLOCK_SIZE
+                        if shadow_prefilter_batch_available
+                        else 1
                     )
-                    shadow_rejections[pair] = bool(shadow_rejected)
-                if shadow_rejected:
-                    row_filtered_shadow += 1
+                    for start in range(0, len(uncached_shadow_js), block_size):
+                        block_js = uncached_shadow_js[start:start + block_size]
+                        block_pairs = uncached_shadow_pairs[start:start + block_size]
+                        block_distances = np.asarray(
+                            uncached_shadow_distances[start:start + block_size],
+                            dtype=np.float64,
+                        )
+                        block_dsts = [corridor[j] for j in block_js]
+                        block_shadow = _terrain_shadow_prefilter_rejects_batch(
+                            src_h3,
+                            block_dsts,
+                            block_distances,
+                            cells,
+                            config,
+                            elevation_provider,
+                        )
+                        for j, pair, shadow_rejected in zip(
+                            block_js,
+                            block_pairs,
+                            block_shadow.tolist(),
+                        ):
+                            shadow_rejections[pair] = bool(shadow_rejected)
+                            if shadow_rejected:
+                                row_filtered_shadow += 1
+                                continue
+                            row_pairs.append((source_i, int(j), pair))
+        else:
+            for j in range(source_i + 1, n):
+                dst_h3 = corridor[j]
+                pair = (src_h3, dst_h3)
+                # Early exit: corridor positions are roughly ordered by distance;
+                # once we exceed max_visibility_m we can stop.
+                dist = pair_distances.get(pair)
+                if dist is None:
+                    dist = h3_distance(src_h3, dst_h3)
+                    pair_distances[pair] = dist
+                if dist > max_visibility_m:
+                    row_filtered_distance += (n - j)
+                    row_forward_pairs = (j - source_i)
+                    break
+                if dist <= 0.0:
+                    if pair in memo_keys:
+                        row_reused += 1
+                    row_pairs.append((source_i, j, pair))
                     continue
 
-            row_pairs.append((source_i, j, pair))
+                # Conservative prefilter: if ideal FSPL already fails budget,
+                # the full LOS policy cannot pass this pair.
+                if fspl_only(dist, frequency_hz) > link_budget_db:
+                    row_filtered_fspl += 1
+                    continue
+
+                # Skip non-endpoint cells that violate constraints
+                is_endpoint_j = (j == n - 1)
+                if not is_endpoint_j:
+                    cell_j = cells_get(dst_h3)
+                    if cell_j and getattr(cell_j, 'is_in_unfit_area', False):
+                        row_filtered_unfit += 1
+                        continue
+
+                if pair in memo_keys:
+                    row_reused += 1
+                    row_pairs.append((source_i, j, pair))
+                    continue
+
+                if shadow_prefilter_enabled:
+                    shadow_rejected = shadow_rejections.get(pair)
+                    if shadow_rejected is None:
+                        shadow_rejected = terrain_shadow_prefilter(
+                            src_h3, dst_h3, cells, config, elevation_provider
+                        )
+                        shadow_rejections[pair] = bool(shadow_rejected)
+                    if shadow_rejected:
+                        row_filtered_shadow += 1
+                        continue
+
+                row_pairs.append((source_i, j, pair))
         return {
             "i": source_i,
             "pairs": row_pairs,
@@ -1243,7 +1674,6 @@ def place_nodes_along_corridor(
 
     config = surface.config
     cells = surface.cells
-    from ..core.geometry import h3_distance
     _warn_if_parallel_hint_requested(los_max_workers, context="corridor placement")
     effective_los_workers = 1
     placement_progress = 0.0
@@ -1293,13 +1723,14 @@ def place_nodes_along_corridor(
         working_corridor: List[str],
         search_radius_m: float,
     ) -> tuple[int, List[str], List[str]]:
-        corridor_set = set(working_corridor)
+        corridor_order = list(dict.fromkeys(working_corridor))
+        corridor_set = set(corridor_order)
         search_ring = _radius_to_ring_m(config, search_radius_m, minimum=0)
         if search_ring <= 0:
             return 0, [], []
         candidate_buffer_cells = []
         pending_cells: dict[str, tuple[float, float, float, float, float]] = {}
-        for road_h3 in list(corridor_set):
+        for road_h3 in corridor_order:
             neighbors = _adaptive_cells_within_radius(
                 surface,
                 road_h3,
@@ -1328,18 +1759,12 @@ def place_nodes_along_corridor(
                 except Exception:
                     continue
         all_candidate_cells = sorted(set(candidate_buffer_cells))
-        best_by_road: dict = {}
-        for nb in candidate_buffer_cells:
-            pending = pending_cells.get(nb)
-            if nb in cells:
-                elev = cells[nb].elevation
-            elif pending is not None:
-                elev = pending[2]
-            else:
-                continue
-            closest = min(corridor_set, key=lambda r: h3_distance(nb, r))
-            if closest not in best_by_road or elev > best_by_road[closest][1]:
-                best_by_road[closest] = (nb, elev)
+        best_by_road = _select_best_buffer_candidates_by_road(
+            candidate_buffer_cells,
+            corridor_order,
+            cells,
+            pending_cells,
+        )
 
         max_candidates = getattr(config, "dp_buffer_candidates_max_per_segment", None)
         if max_candidates is not None:

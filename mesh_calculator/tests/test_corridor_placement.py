@@ -14,6 +14,9 @@ clearance.  These tests verify the DP's core behaviours:
 import unittest
 from unittest.mock import patch
 
+import h3
+import numpy as np
+
 from ..core.config import MeshConfig
 from ..core.grid import H3Cell
 from ..data.cache import LOSResult
@@ -40,6 +43,28 @@ def make_cells(n, elevation=100.0):
 def make_corridor(n):
     """Create a corridor: ['cell_0', 'cell_1', ..., 'cell_n-1']."""
     return [f"cell_{i}" for i in range(n)]
+
+
+def make_real_h3_cells_and_corridor(n, resolution=10):
+    """Create a deterministic corridor of real H3 ids for vectorized-path tests."""
+    center = h3.latlng_to_cell(40.0, 44.0, resolution)
+    ring = 1
+    cells_set = set()
+    while len(cells_set) < n:
+        cells_set = set(h3.grid_disk(center, ring))
+        ring += 1
+    corridor = sorted(cells_set)[:n]
+    cells = {}
+    for h3_idx in corridor:
+        lat, lon = h3.cell_to_latlng(h3_idx)
+        cells[h3_idx] = H3Cell(
+            h3_index=h3_idx,
+            lat=lat,
+            lon=lon,
+            elevation=100.0,
+            has_road=True,
+        )
+    return corridor, cells
 
 
 def make_compute_los_func(los_pairs, default_visible=False, clearance=10.0):
@@ -504,6 +529,58 @@ class TestDPBufferCandidateMaterialization(unittest.TestCase):
         self.assertEqual(injected_candidates[0], candidate_b)
 
 
+class TestVectorizedBufferCandidateSelection(unittest.TestCase):
+    """Buffer candidate assignment should use the bulk KD-tree path when possible."""
+
+    @patch('mesh_calculator.optimization.corridor.h3_distance')
+    @patch('mesh_calculator.optimization.corridor.cKDTree')
+    def test_select_best_buffer_candidates_uses_kdtree(self, mock_tree_cls, mock_h3_distance):
+        road_a = h3.latlng_to_cell(40.0000, 44.0000, 11)
+        road_b = h3.latlng_to_cell(40.0100, 44.0100, 11)
+        cand_low = h3.latlng_to_cell(40.0005, 44.0005, 11)
+        cand_high = h3.latlng_to_cell(40.0007, 44.0007, 11)
+        cand_b = h3.latlng_to_cell(40.0105, 44.0105, 11)
+
+        cells = {
+            road_a: H3Cell(h3_index=road_a, lat=40.0000, lon=44.0000, elevation=100.0),
+            road_b: H3Cell(h3_index=road_b, lat=40.0100, lon=44.0100, elevation=110.0),
+            cand_low: H3Cell(h3_index=cand_low, lat=40.0005, lon=44.0005, elevation=120.0),
+            cand_high: H3Cell(h3_index=cand_high, lat=40.0007, lon=44.0007, elevation=250.0),
+            cand_b: H3Cell(h3_index=cand_b, lat=40.0105, lon=44.0105, elevation=180.0),
+        }
+
+        mock_tree = mock_tree_cls.return_value
+        mock_tree.query.return_value = (
+            np.zeros((3, 2), dtype=np.float64),
+            np.array([
+                [1, 0],
+                [1, 0],
+                [0, 1],
+            ], dtype=np.int64),
+        )
+        mock_h3_distance.side_effect = lambda src, dst: {
+            (cand_low, road_a): 10.0,
+            (cand_low, road_b): 30.0,
+            (cand_high, road_a): 5.0,
+            (cand_high, road_b): 25.0,
+            (cand_b, road_a): 20.0,
+            (cand_b, road_b): 8.0,
+        }[(src, dst)]
+
+        result = corridor_mod._select_best_buffer_candidates_by_road(
+            [cand_low, cand_high, cand_b],
+            [road_a, road_b],
+            cells,
+            pending_cells={},
+        )
+
+        mock_tree_cls.assert_called_once()
+        mock_tree.query.assert_called_once()
+        self.assertEqual(mock_h3_distance.call_count, 6)
+        self.assertEqual(result[road_a][0], cand_high)
+        self.assertEqual(result[road_b][0], cand_b)
+
+
 class TestDPParallelDeterminism(unittest.TestCase):
     """Parallel and serial DP runs should produce identical chains."""
 
@@ -648,6 +725,41 @@ class TestDPPrefilterPolicy(unittest.TestCase):
         self.assertEqual(mock_shadow.call_count, 0)
 
     @patch('mesh_calculator.optimization.corridor.compute_los_batch')
+    @patch('mesh_calculator.optimization.corridor._terrain_shadow_prefilter_rejects_batch')
+    def test_large_real_h3_corridor_uses_batched_shadow_prefilter(
+        self,
+        mock_shadow_batch,
+        mock_batch,
+    ):
+        corridor, cells = make_real_h3_cells_and_corridor(317)
+
+        class _BatchProvider:
+            def get_line_peak_elevation_batch(self, lines):
+                return [(0.0, line[0], line[1], 0.5) for line in lines]
+
+        surface = MeshSurface(cells, self.config, elevation_provider=_BatchProvider())
+
+        mock_shadow_batch.side_effect = lambda _src, dsts, *_args, **_kwargs: np.zeros(
+            len(dsts), dtype=bool
+        )
+        mock_batch.side_effect = lambda pairs, *_args, **_kwargs: {
+            pair: LOSResult(
+                clearance_m=10.0,
+                path_loss_db=80.0,
+                distance_m=1000.0,
+                is_visible=True,
+            )
+            for pair in pairs
+        }
+
+        result = corridor_mod._dp_place_towers_with_meta(
+            corridor, surface, None, 4, attempt_id=0, los_max_workers=1
+        )
+
+        self.assertIsNotNone(result)
+        self.assertGreater(mock_shadow_batch.call_count, 0)
+
+    @patch('mesh_calculator.optimization.corridor.compute_los_batch')
     @patch('mesh_calculator.optimization.corridor.fspl_only', return_value=0.0)
     @patch('mesh_calculator.optimization.corridor._terrain_shadow_prefilter_rejects', return_value=False)
     @patch('mesh_calculator.core.geometry.h3_distance', return_value=1000.0)
@@ -680,6 +792,41 @@ class TestDPPrefilterPolicy(unittest.TestCase):
 
         self.assertIsNotNone(result)
         self.assertGreater(mock_shadow.call_count, 0)
+
+    @patch('mesh_calculator.optimization.corridor.compute_los_batch')
+    @patch('mesh_calculator.optimization.corridor._terrain_shadow_prefilter_rejects_batch')
+    def test_fallback_attempt_uses_batched_shadow_prefilter_when_available(
+        self,
+        mock_shadow_batch,
+        mock_batch,
+    ):
+        corridor, cells = make_real_h3_cells_and_corridor(20)
+
+        class _BatchProvider:
+            def get_line_peak_elevation_batch(self, lines):
+                return [(0.0, line[0], line[1], 0.5) for line in lines]
+
+        surface = MeshSurface(cells, self.config, elevation_provider=_BatchProvider())
+
+        mock_shadow_batch.side_effect = lambda _src, dsts, *_args, **_kwargs: np.zeros(
+            len(dsts), dtype=bool
+        )
+        mock_batch.side_effect = lambda pairs, *_args, **_kwargs: {
+            pair: LOSResult(
+                clearance_m=10.0,
+                path_loss_db=80.0,
+                distance_m=1000.0,
+                is_visible=True,
+            )
+            for pair in pairs
+        }
+
+        result = corridor_mod._dp_place_towers_with_meta(
+            corridor, surface, None, 4, attempt_id=1, los_max_workers=1
+        )
+
+        self.assertIsNotNone(result)
+        self.assertGreater(mock_shadow_batch.call_count, 0)
 
     @patch('mesh_calculator.optimization.corridor.compute_los_batch')
     @patch('mesh_calculator.optimization.corridor.fspl_only', return_value=0.0)
